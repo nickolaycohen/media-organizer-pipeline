@@ -7,3 +7,4 @@ scripts/__pycache__/utils.cpython-312.pyc
 db/__pycache__/__init__.cpython-312.pyc
 db/__pycache__/queries.cpython-312.pyc
 token.pickle
+.DS_Store

@@ -64,6 +64,11 @@ def init_schema(cursor):
             executed_at_utc TEXT DEFAULT (datetime('now'))
         );
     """)
+    cursor.execute("""CREATE TABLE IF NOT EXISTS schema_migrations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        migration TEXT NOT NULL UNIQUE,
+        applied_at_utc TEXT
+    );""")
 
     # Drop and rebuild schema_migrations if 'filename' column exists
     cursor.execute("PRAGMA table_info(schema_migrations);")

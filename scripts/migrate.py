@@ -4,11 +4,6 @@ import argparse
 from constants import MEDIA_ORGANIZER_DB_PATH as DB_PATH
 
 def get_applied_migrations(conn):
-    conn.execute("""CREATE TABLE IF NOT EXISTS schema_migrations (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        migration TEXT NOT NULL UNIQUE,
-        applied_at_utc TEXT
-    );""")
     return {row[0] for row in conn.execute("SELECT migration FROM schema_migrations;")}
 
 def apply_migration(conn, migrations_dir, filename):

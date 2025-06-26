@@ -82,12 +82,16 @@ def main():
         print("\nAvailable steps:")
         for idx, (label, _) in enumerate(all_steps):
             print(f"{idx}: {label}")
-        from_index = int(input("\nEnter start step index: "))
+        default_from = 0
+        from_input = input(f"\nEnter start step index [{default_from}]: ").strip()
+        from_index = int(from_input) if from_input else default_from
 
     if "--to" in sys.argv:
         to_index = int(sys.argv[sys.argv.index("--to") + 1])
     else:
-        to_index = int(input("Enter end step index (inclusive): ")) + 1
+        default_to = len(all_steps) - 1
+        to_input = input(f"Enter end step index (inclusive) [{default_to}]: ").strip()
+        to_index = int(to_input) + 1 if to_input else default_to + 1
 
     for i, (label, command) in enumerate(bootstrap_steps):
         if i < from_index or (to_index is not None and i >= to_index):

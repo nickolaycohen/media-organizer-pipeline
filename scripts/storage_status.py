@@ -55,6 +55,16 @@ def init_schema(cursor):
             updated_at_utc TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS pipeline_executions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            label TEXT NOT NULL,
+            status TEXT NOT NULL,
+            executed_at_utc TEXT DEFAULT (datetime('now'))
+        );
+    """)
+
     # Drop and rebuild schema_migrations if 'filename' column exists
     cursor.execute("PRAGMA table_info(schema_migrations);")
     columns = {row[1] for row in cursor.fetchall()}

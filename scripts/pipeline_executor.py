@@ -13,10 +13,11 @@ import sqlite3
 from uuid import uuid4
 
 MODULE_TAG = "run_pipeline"
-logger = setup_logger(LOG_PATH, MODULE_TAG)
 
 # Generate a unique session ID
 session_id = str(uuid4())
+logger = setup_logger(LOG_PATH, MODULE_TAG, extra_fields={"session_id": session_id})
+
 # DB_PATH = os.path.join(os.path.dirname(__file__), "..", "media_organizer.db")
 
 def log_execution(label, status):

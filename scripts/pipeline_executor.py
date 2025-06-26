@@ -79,18 +79,21 @@ def main():
     if "--from" in sys.argv:
         from_index = int(sys.argv[sys.argv.index("--from") + 1])
     else:
-        print("\nAvailable steps:")
+        print("\n📋 Pipeline Step Selection (interactive mode)")
+        print("============================================")
         for idx, (label, _) in enumerate(all_steps):
-            print(f"{idx}: {label}")
+            print(f"  {idx:>2}: {label}")
+        print("============================================")
+
         default_from = 0
-        from_input = input(f"\nEnter start step index [{default_from}]: ").strip()
+        from_input = input(f"\n🔢 Enter START step index [default: {default_from}]: ").strip()
         from_index = int(from_input) if from_input else default_from
 
     if "--to" in sys.argv:
         to_index = int(sys.argv[sys.argv.index("--to") + 1])
     else:
         default_to = len(all_steps) - 1
-        to_input = input(f"Enter end step index (inclusive) [{default_to}]: ").strip()
+        to_input = input(f"🔢 Enter END step index (inclusive) [default: {default_to}]: ").strip()
         to_index = int(to_input) + 1 if to_input else default_to + 1
 
     for i, (label, command) in enumerate(bootstrap_steps):

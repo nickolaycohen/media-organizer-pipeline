@@ -2,19 +2,20 @@ import hashlib
 import os
 import logging
 
-def setup_logger(log_file, module_tag):
+def setup_logger(log_file, module_tag, extra_fields=None):
     # Ensure the log directory exists
     log_dir = os.path.dirname(log_file)
     if log_dir and not os.path.exists(log_dir):
         os.makedirs(log_dir)
 
-    # Create logger
     logger = logging.getLogger(module_tag)
     logger.setLevel(logging.INFO)
 
-    # Prevent duplicate handlers
     if not logger.handlers:
-        formatter = logging.Formatter(f'%(asctime)s [{module_tag}] - %(message)s')
+        if extra_fields and "session_id" in extra_fields:
+            formatter = logging.Formatter(f'%(asctime)s [{module_tag}] [Session: %(session_id)s] - %(message)s')
+        else:
+            formatter = logging.Formatter(f'%(asctime)s [{module_tag}] - %(message)s')
 
         console_handler = logging.StreamHandler()
         console_handler.setFormatter(formatter)
@@ -24,6 +25,15 @@ def setup_logger(log_file, module_tag):
 
         logger.addHandler(console_handler)
         logger.addHandler(file_handler)
+
+    # Attach extra fields to the logger
+    if extra_fields:
+        class ContextFilter(logging.Filter):
+            def filter(self, record):
+                for k, v in extra_fields.items():
+                    setattr(record, k, v)
+                return True
+        logger.addFilter(ContextFilter())
 
     return logger
 

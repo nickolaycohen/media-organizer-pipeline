@@ -24,15 +24,6 @@ def log_execution(label, status):
     conn = sqlite3.connect(MEDIA_ORGANIZER_DB_PATH)
     cursor = conn.cursor()
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS pipeline_executions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            label TEXT NOT NULL,
-            status TEXT NOT NULL,
-            executed_at_utc TEXT DEFAULT (datetime('now'))
-        );
-    """)
-    cursor.execute("""
         INSERT INTO pipeline_executions (session_id, label, status) VALUES (?, ?, ?)
     """, (session_id, label, status))
     conn.commit()

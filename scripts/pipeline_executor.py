@@ -5,28 +5,54 @@ import subprocess
 import platform
 import shutil
 import logging
-from db.queries import get_next_batch
+from db.queries import get_month_batch_added
 from utils.utils import set_batch_status
 from utils.logger import setup_logger
-from constants import LOG_PATH
+from constants import LOG_PATH, MEDIA_ORGANIZER_DB_PATH
+import sqlite3
+from uuid import uuid4
 
 MODULE_TAG = "run_pipeline"
 logger = setup_logger(LOG_PATH, MODULE_TAG)
 
+# Generate a unique session ID
+session_id = str(uuid4())
+# DB_PATH = os.path.join(os.path.dirname(__file__), "..", "media_organizer.db")
+
+def log_execution(label, status):
+    conn = sqlite3.connect(MEDIA_ORGANIZER_DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS pipeline_executions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            label TEXT NOT NULL,
+            status TEXT NOT NULL,
+            executed_at_utc TEXT DEFAULT (datetime('now'))
+        );
+    """)
+    cursor.execute("""
+        INSERT INTO pipeline_executions (session_id, label, status) VALUES (?, ?, ?)
+    """, (session_id, label, status))
+    conn.commit()
+    conn.close()
 
 def run_step(label, command, dry_run=False, month=None):
     logger.info(f"▶️ Starting: {label}")
     if dry_run:
         logger.info(f"[Dry Run] Would run: {' '.join(command)}")
+        log_execution(label, "dry-run")
         return True
     try:
         subprocess.run(command, check=True)
         logger.info(f"✅ Completed: {label}")
+        log_execution(label, "success")
         if month is not None:
             set_batch_status(month, label.split()[0])
         return True
     except subprocess.CalledProcessError as e:
         logger.error(f"❌ Failed: {label} with error: {e}")
+        log_execution(label, "failed")
         return False
 
 def is_applescript_available():
@@ -34,6 +60,8 @@ def is_applescript_available():
 
 def main():
     dry_run = "--dry-run" in sys.argv
+    from_index = 0
+    to_index = None
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
     # Bootstrap: run initial steps before determining which batch to process
@@ -43,34 +71,9 @@ def main():
         ("1.1 Detect Gaps", ["python3", os.path.join(SCRIPT_DIR, "generate_month_batches.py")]),
     ]
 
-    for label, command in bootstrap_steps:
-        if not run_step(label, command, dry_run):
-            return
-
-    month = get_next_batch()
-    if not month:
-        logger.error("No pending batches found.")
-        return
-    logger.info(f"📦 Batch selected: {month}")
-
     steps = [
         ("2.1 Verify Smart Album", ["python3", os.path.join(SCRIPT_DIR, "verify_export_album.py")]),
     ]
-
-    for label, command in steps:
-        if not run_step(label, command, dry_run, month):
-            return
-
-    # Step 2.2: Export Photos via AppleScript
-    label = "2.2 Export Photos"
-    if is_applescript_available():
-        command = ["osascript", "scripts/export_photos_applescript.scpt", month]
-        if run_step(label, command, dry_run, month):
-            set_batch_status(month, label.split()[0])
-        else:
-            return
-    else:
-        logger.warning(f"🚫 Skipped {label} — AppleScript not available on this system.")
 
     remaining_steps = [
         ("2.3 Verify Staging", ["python3", "scripts/verify_staging.py"]),
@@ -80,9 +83,68 @@ def main():
         ("3.3 Rank Assets by Score", ["python3", "scripts/rank_assets_by_score.py"]),
     ]
 
-    for label, command in remaining_steps:
-        if not run_step(label, command, dry_run, month):
+    all_steps = bootstrap_steps + steps + [("2.2 Export Photos", None)] + remaining_steps
+    if "--from" in sys.argv:
+        from_index = int(sys.argv[sys.argv.index("--from") + 1])
+    else:
+        print("\nAvailable steps:")
+        for idx, (label, _) in enumerate(all_steps):
+            print(f"{idx}: {label}")
+        from_index = int(input("\nEnter start step index: "))
+
+    if "--to" in sys.argv:
+        to_index = int(sys.argv[sys.argv.index("--to") + 1])
+    else:
+        to_index = int(input("Enter end step index (inclusive): ")) + 1
+
+    for i, (label, command) in enumerate(bootstrap_steps):
+        if i < from_index or (to_index is not None and i >= to_index):
+            continue
+        if not run_step(label, command, dry_run):
             return
+
+    conn = sqlite3.connect(MEDIA_ORGANIZER_DB_PATH)
+    cursor = conn.cursor()
+    month = get_month_batch_added(cursor)
+    if not month:
+        logger.error("No pending batches found.")
+        conn.close()
+        return
+    logger.info(f"📦 Batch selected: {month}")
+
+    for i, (label, command) in enumerate(steps, start=len(bootstrap_steps)):
+        if i < from_index or (to_index is not None and i >= to_index):
+            continue
+        if not run_step(label, command, dry_run, month):
+            conn.close()
+            return
+
+    # Step 2.2: Export Photos via AppleScript
+    label = "2.2 Export Photos"
+    i = len(bootstrap_steps) + len(steps)
+    if i < from_index or (to_index is not None and i >= to_index):
+        pass
+    else:
+        if is_applescript_available():
+            command = ["osascript", "scripts/export_photos_applescript.scpt", month]
+            if run_step(label, command, dry_run, month):
+                set_batch_status(month, label.split()[0])
+            else:
+                conn.close()
+                return
+        else:
+            logger.warning(f"🚫 Skipped {label} — AppleScript not available on this system.")
+
+    start_index = len(bootstrap_steps) + len(steps) + 1
+    for j, (label, command) in enumerate(remaining_steps):
+        i = start_index + j
+        if i < from_index or (to_index is not None and i >= to_index):
+            continue
+        if not run_step(label, command, dry_run, month):
+            conn.close()
+            return
+
+    conn.close()
 
 if __name__ == "__main__":
     main()

@@ -1,32 +1,39 @@
 import sqlite3
 import os
 import sys
+from datetime import datetime, timezone
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, project_root)
 import logging
-from datetime import datetime
 from utils.logger import setup_logger, close_logger
 from constants import MEDIA_ORGANIZER_DB_PATH, LOG_PATH
 
 MODULE_TAG = 'generate_batches'
 
+def utc_to_local_month(utc_str):
+    if not utc_str:
+        return None
+    dt_utc = datetime.strptime(utc_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    dt_local = dt_utc.astimezone()
+    return dt_local.strftime("%Y-%m")
+
 def get_existing_batches(cursor):
-    """Retrieve months already present in month_batches."""
     cursor.execute("SELECT month, status_code FROM month_batches;")
     return {row[0]: row[1] for row in cursor.fetchall()}
 
 def get_available_months(cursor):
-    """Extract available months from assets view, only include completed months and exclude the current month."""
-    current_month = datetime.now().strftime('%Y-%m')  # Get current month
+    current_month = datetime.now().strftime('%Y-%m')
     cursor.execute('''
-        SELECT DISTINCT strftime('%Y-%m', import_datetime) as month
-        FROM photos_assets_view
-        GROUP BY month
-        HAVING MAX(import_datetime) < datetime('now', 'start of day')  -- Ensure it's a completed month
-        AND strftime('%Y-%m', import_datetime) != ?  -- Exclude the current month
-        ORDER BY month ASC;
-    ''', (current_month,))
-    return [row[0] for row in cursor.fetchall()]
+        SELECT DISTINCT import_datetime_utc FROM photos_assets_view
+        WHERE import_datetime_utc IS NOT NULL
+    ''')
+    all_imports = cursor.fetchall()
+    months = set()
+    for (import_utc,) in all_imports:
+        local_month = utc_to_local_month(import_utc)
+        if local_month and local_month != current_month:
+            months.add(local_month)
+    return sorted(months)
 
 def create_batch(cursor, month):
     """Insert a new batch for the given month."""
@@ -55,7 +62,6 @@ def mark_batch_complete(cursor, month):
 def main_process(logger):
     conn = sqlite3.connect(MEDIA_ORGANIZER_DB_PATH)
     cursor = conn.cursor()
-
     try:
         logger.info("Starting batch generation process...")
 
@@ -65,7 +71,57 @@ def main_process(logger):
         logger.info(f"Available months from assets: {available_months}")
         logger.info(f"Already processed months: {existing_batches}")
 
+        # Fetch all assets with their creation datetime UTC for filtering in Python
+        cursor.execute("""
+            SELECT uuid, import_id, creation_datetime_utc FROM photos_assets_view
+            WHERE creation_datetime_utc IS NOT NULL
+        """)
+        assets = cursor.fetchall()
+
+        # Build a dict month -> list of (uuid, import_id)
+        assets_by_month = {}
+        for uuid, import_id, creation_utc in assets:
+            month = utc_to_local_month(creation_utc)
+            if not month:
+                continue
+            assets_by_month.setdefault(month, []).append((uuid, import_id))
+
         for month in available_months:
+            month_assets = assets_by_month.get(month, [])
+            total_assets = len(month_assets)
+
+            cursor.execute("""
+                SELECT COUNT(*) FROM assets
+                WHERE month = ?
+            """, (month,))
+            uploaded_assets = cursor.fetchone()[0]
+
+            logger.info(f"Month {month}: total assets = {total_assets}, uploaded assets = {uploaded_assets}")
+
+            # Identify missing assets by checking assets not in uploaded assets table
+            cursor.execute("""
+                SELECT asset_id FROM assets WHERE month = ?
+            """, (month,))
+            uploaded_asset_ids = set(row[0] for row in cursor.fetchall())
+
+            missing_assets = [asset for asset in month_assets if asset[0] not in uploaded_asset_ids]
+
+            if len(missing_assets) == 0:
+                logger.info(f"✔️ Skipping {month} — all assets already uploaded.")
+                continue
+
+            max_display = 10
+            count_missing = len(missing_assets)
+            logger.info(f"🔍 {count_missing} missing assets detectaed for {month}.")
+            if count_missing > max_display:
+                logger.info(f"Displaying first {max_display} missing assets:")
+                for uuid, import_id in missing_assets[:max_display]:
+                    logger.info(f"  ↪️ Missing asset: UUID={uuid}, Import ID={import_id}")
+                logger.info(f"  ... {count_missing - max_display} more missing assets not shown.")
+            else:
+                for uuid, import_id in missing_assets:
+                    logger.info(f"  ↪️ Missing asset: UUID={uuid}, Import ID={import_id}")
+
             if month not in existing_batches:
                 logger.info(f"Creating new batch for completed month {month}")
                 create_batch(cursor, month)
@@ -75,11 +131,8 @@ def main_process(logger):
             else:
                 logger.info(f"Skipping month {month} — batch is still incomplete.")
 
-        # Do not mark as completed here anymore
-        # After processing all months, marking of batch completion will be done in the final step of the pipeline
         conn.commit()
         logger.info("Monthly batches created/updated successfully.")
-
     except Exception as e:
         logger.error(f"Error during batch generation: {e}")
         raise

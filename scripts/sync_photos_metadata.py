@@ -51,7 +51,8 @@ def sync_metadata(logger):
                 a.ZFILENAME AS filename,
                 aaa.ZORIGINALFILENAME AS original_filename,
                 a.ZIMPORTSESSION AS import_id,
-                datetime((a.ZADDEDDATE + 978303599.796), 'unixepoch', 'localtime') as import_datetime
+                datetime(a.ZDATECREATED + 978307200, 'unixepoch') AS creation_datetime_utc,
+                datetime(a.ZADDEDDATE + 978307200, 'unixepoch') AS import_datetime_utc
             FROM main.ZASSET a
             LEFT JOIN main.ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK;
         ''')

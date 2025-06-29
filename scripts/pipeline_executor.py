@@ -17,6 +17,7 @@ MODULE_TAG = "run_pipeline"
 # Generate a unique session ID
 session_id = str(uuid4())
 logger = setup_logger(LOG_PATH, MODULE_TAG, extra_fields={"session_id": session_id})
+logger.info(f"🆔 Session ID: {session_id}")
 
 # DB_PATH = os.path.join(os.path.dirname(__file__), "..", "media_organizer.db")
 
@@ -100,6 +101,7 @@ def main():
         if i < from_index or (to_index is not None and i >= to_index):
             continue
         if not run_step(label, command, dry_run):
+            logger.error(f"❌ Pipeline execution halted. Session ID: {session_id}")
             return
 
     conn = sqlite3.connect(MEDIA_ORGANIZER_DB_PATH)
@@ -115,6 +117,7 @@ def main():
         if i < from_index or (to_index is not None and i >= to_index):
             continue
         if not run_step(label, command, dry_run, month):
+            logger.error(f"❌ Pipeline execution halted. Session ID: {session_id}")
             conn.close()
             return
 
@@ -129,6 +132,7 @@ def main():
             if run_step(label, command, dry_run, month):
                 set_batch_status(month, label.split()[0])
             else:
+                logger.error(f"❌ Pipeline execution halted. Session ID: {session_id}")
                 conn.close()
                 return
         else:
@@ -140,6 +144,7 @@ def main():
         if i < from_index or (to_index is not None and i >= to_index):
             continue
         if not run_step(label, command, dry_run, month):
+            logger.error(f"❌ Pipeline execution halted. Session ID: {session_id}")
             conn.close()
             return
 

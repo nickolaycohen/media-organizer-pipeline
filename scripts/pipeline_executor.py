@@ -30,7 +30,7 @@ def log_execution(label, status):
     conn.commit()
     conn.close()
 
-def run_step(label, command, dry_run=False, month=None):
+def run_step(label, batch_status_code, command, dry_run=False, month=None):
     logger.info(f"▶️ Starting: {label}")
     if dry_run:
         logger.info(f"[Dry Run] Would run: {' '.join(command)}")
@@ -41,7 +41,9 @@ def run_step(label, command, dry_run=False, month=None):
         logger.info(f"✅ Completed: {label}")
         log_execution(label, "success")
         if month is not None:
-            set_batch_status(month, label.split()[0])
+            conn = sqlite3.connect(MEDIA_ORGANIZER_DB_PATH)
+            cursor = conn.cursor()
+            set_batch_status(cursor, month, batch_status_code)
         return True
     except subprocess.CalledProcessError as e:
         logger.error(f"❌ Failed: {label} with error: {e}")
@@ -59,13 +61,13 @@ def main():
 
     # Bootstrap: run initial steps before determining which batch to process
     bootstrap_steps = [
-        ("0.1 Storage Status", ["python3", os.path.join(SCRIPT_DIR, "storage_status.py"), "--migrate"]),
-        ("0.3 Sync Metadata from Photos DB", ["python3", os.path.join(SCRIPT_DIR, "sync_photos_metadata.py")]),
-        ("1.1 Detect Gaps", ["python3", os.path.join(SCRIPT_DIR, "generate_month_batches.py")]),
+        ("0.1 Storage Status", "", ["python3", os.path.join(SCRIPT_DIR, "storage_status.py"), "--migrate"]),
+        ("0.3 Sync Metadata from Photos DB", "" ,["python3", os.path.join(SCRIPT_DIR, "sync_photos_metadata.py")]),
+        ("1.1 Detect Gaps", "000", ["python3", os.path.join(SCRIPT_DIR, "generate_month_batches.py")]),
     ]
 
     steps = [
-        ("2.1 Verify Smart Album", ["python3", os.path.join(SCRIPT_DIR, "verify_export_album.py")]),
+        ("2.1 Verify Smart Album", "100", ["python3", os.path.join(SCRIPT_DIR, "verify_export_album.py")]),
     ]
 
     remaining_steps = [
@@ -97,10 +99,10 @@ def main():
         to_input = input(f"🔢 Enter END step index (inclusive) [default: {default_to}]: ").strip()
         to_index = int(to_input) + 1 if to_input else default_to + 1
 
-    for i, (label, command) in enumerate(bootstrap_steps):
+    for i, (label, batch_status_code, command) in enumerate(bootstrap_steps):
         if i < from_index or (to_index is not None and i >= to_index):
             continue
-        if not run_step(label, command, dry_run):
+        if not run_step(label, batch_status_code, command, dry_run):
             logger.error(f"❌ Pipeline execution halted. Session ID: {session_id}")
             return
 
@@ -113,10 +115,10 @@ def main():
         return
     logger.info(f"📦 Batch selected: {month}")
 
-    for i, (label, command) in enumerate(steps, start=len(bootstrap_steps)):
+    for i, (label, batch_status_code, command) in enumerate(steps, start=len(bootstrap_steps)):
         if i < from_index or (to_index is not None and i >= to_index):
             continue
-        if not run_step(label, command, dry_run, month):
+        if not run_step(label, batch_status_code, command, dry_run, month):
             logger.error(f"❌ Pipeline execution halted. Session ID: {session_id}")
             conn.close()
             return

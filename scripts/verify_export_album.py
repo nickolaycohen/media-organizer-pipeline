@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 import subprocess
 from constants import MEDIA_ORGANIZER_DB_PATH, LOG_PATH
 from utils.logger import setup_logger, close_logger
+from utils.utils import set_batch_status
 # from scripts.db.queries import get_month_batch_added as get_next_batch
 from db.queries import get_month_batch_added as get_next_batch
 
@@ -58,9 +59,12 @@ def main_process(logger, dry_run=False):
             logger.info(f"✅ Smart Album '{next_batch}' exists in Media Organizer DB.")
 
             if dry_run:
-                logger.info("Dry run enabled. Skipping AppleScript export.")
+                logger.info("Dry run enabled.")
             else:
-                run_applescript_export(next_batch, logger)
+                logger.info("Smart Album verified. No export performed in this step.")
+
+            set_batch_status(cursor, next_batch, '100')
+            conn.commit()
         else:
             logger.error(f"❌ Smart Album '{next_batch}' does not exist. Please create it manually in Apple Photos.")
             sys.exit(1)  # Block further processing

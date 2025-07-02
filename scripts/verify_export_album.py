@@ -9,7 +9,6 @@ import subprocess
 from constants import MEDIA_ORGANIZER_DB_PATH, LOG_PATH
 from utils.logger import setup_logger, close_logger
 from utils.utils import set_batch_status
-# from scripts.db.queries import get_month_batch_added as get_next_batch
 from db.queries import get_month_batch_added as get_next_batch
 
 
@@ -50,7 +49,7 @@ def main_process(logger, dry_run=False):
     cursor = conn.cursor()
 
     # Get the next batch
-    next_batch = get_next_batch(cursor)
+    next_batch = get_next_batch(cursor, '000)
 
     if next_batch:
         logger.info(f"Next batch is for {next_batch}. Checking Smart Album...")

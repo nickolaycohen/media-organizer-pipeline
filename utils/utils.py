@@ -20,5 +20,18 @@ def set_batch_status(cursor, month, current_code, success=True):
             (next_code, month),
         )
         print(f"[DB] ✅ Updated batch {month} to status {next_code}")
+
+        # Also log this update in the pipeline_executions table
+        cursor.execute(
+            "SELECT id FROM month_batches WHERE month = ?",
+            (month,)
+        )
+        batch_row = cursor.fetchone()
+        if batch_row:
+            batch_month_id = batch_row[0]
+            cursor.execute(
+                "INSERT INTO pipeline_executions (label, status, batch_month_id) VALUES (?, 'success', ?)",
+                (next_code, batch_month_id)
+            )
     except Exception as e:
         print(f"[DB] ❌ Failed to update status for {month}: {e}")

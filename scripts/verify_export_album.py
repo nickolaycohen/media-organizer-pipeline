@@ -9,7 +9,7 @@ import subprocess
 from constants import MEDIA_ORGANIZER_DB_PATH, LOG_PATH
 from utils.logger import setup_logger, close_logger
 from utils.utils import set_batch_status
-from db.queries import get_month_batch_added as get_next_batch
+from db.queries import get_month_batch
 
 
 MODULE_TAG = 'verify_export_album'
@@ -49,7 +49,7 @@ def main_process(logger, dry_run=False):
     cursor = conn.cursor()
 
     # Get the next batch
-    next_batch = get_next_batch(cursor, '000)
+    next_batch = get_month_batch(cursor, '000')
 
     if next_batch:
         logger.info(f"Next batch is for {next_batch}. Checking Smart Album...")
@@ -68,11 +68,10 @@ def main_process(logger, dry_run=False):
             logger.error(f"❌ Smart Album '{next_batch}' does not exist. Please create it manually in Apple Photos.")
             sys.exit(1)  # Block further processing
     else:
-        logger.error("No pending batches found in the database.")
-        sys.exit(1)  # Exit if no pending batches
-
+        logger.info("✅ No pending batches found. Smart albums already verified.")
+        sys.exit(0)
     conn.close()
-
+    
 if __name__ == '__main__':
     logger = setup_logger(LOG_PATH, MODULE_TAG)
     dry_run = '--dry-run' in sys.argv

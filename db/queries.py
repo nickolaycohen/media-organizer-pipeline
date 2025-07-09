@@ -4,7 +4,7 @@ def get_month_batch(cursor, current_code):
         SELECT mb.month
         FROM month_batches mb
         JOIN batch_status bs ON mb.status_code = bs.preceding_code
-        WHERE bs.code = ?
+        WHERE bs.preceding_code = ?
         ORDER BY mb.month DESC
         LIMIT 1;
     ''', (current_code,))

@@ -147,15 +147,16 @@ on run argv
                 logMessage("✅ Export completed successfully for album: " & albumName)
 
                 -- Run the remove_mov.sh cleanup script after export
-                set cleanupScript to "/Users/nickolaycohen/dev/media-organizer-pipeline/scripts/traverse_remove_mov/traverse_remove_mov.sh"
-                set shellCommand to "/bin/zsh " & quoted form of cleanupScript & " " & quoted form of fullDestinationPath
+                -- This fuctionality will be moved to a deduplication step
+                -- set cleanupScript to "/Users/nickolaycohen/dev/media-organizer-pipeline/scripts/traverse_remove_mov/traverse_remove_mov.sh"
+                -- set shellCommand to "/bin/zsh " & quoted form of cleanupScript & " " & quoted form of fullDestinationPath
 
-                try
-                    set cleanupOutput to do shell script shellCommand
-                    logMessage("Post-export cleanup output:\n" & cleanupOutput)
-                on error errMsg
-                    logMessage("⚠️ Error during post-export cleanup:\n" & errMsg)
-                end try
+                -- try
+                    -- set cleanupOutput to do shell script shellCommand
+                    -- logMessage("Post-export cleanup output:\n" & cleanupOutput)
+                -- on error errMsg
+                    -- logMessage("⚠️ Error during post-export cleanup:\n" & errMsg)
+                -- end try
 
                 tell application "System Events"
                     display notification "Export of '" & albumName & "' completed successfully!" with title "Photos Export"

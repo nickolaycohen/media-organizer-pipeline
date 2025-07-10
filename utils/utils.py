@@ -1,7 +1,7 @@
 import sqlite3
 from scripts.constants import MEDIA_ORGANIZER_DB_PATH as DB_PATH
 
-def set_batch_status(cursor, month, current_code, success=True):
+def set_batch_status(cursor, month, current_code, success=True, session_id=None):
     """Update the batch status for the given month based on the outcome of a step."""
     try:
         lookup_field = "code" if success else "error_code"
@@ -30,8 +30,8 @@ def set_batch_status(cursor, month, current_code, success=True):
         if batch_row:
             batch_month_id = batch_row[0]
             cursor.execute(
-                "INSERT INTO pipeline_executions (label, status, batch_month_id) VALUES (?, 'success', ?)",
-                (next_code, batch_month_id)
+                "INSERT INTO pipeline_executions (label, status, batch_month_id, session_id) VALUES (?, 'success', ?, ?)",
+                (next_code, batch_month_id, session_id)
             )
     except Exception as e:
         print(f"[DB] ❌ Failed to update status for {month}: {e}")

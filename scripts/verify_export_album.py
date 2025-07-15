@@ -9,8 +9,6 @@ import subprocess
 from constants import MEDIA_ORGANIZER_DB_PATH, LOG_PATH
 from utils.logger import setup_logger, close_logger
 from utils.utils import set_batch_status
-from db.queries import get_month_batch
-
 
 MODULE_TAG = 'verify_export_album'
 
@@ -40,44 +38,49 @@ def run_applescript_export(album_name, logger):
         logger.error(f"❌ AppleScript export failed: {e}")
         sys.exit(1)
 
-def main_process(logger, dry_run=False):
+def main_process(logger, month=None, dry_run=False):
     """Main logic to verify if a Smart Album exists."""
     logger.info("Connecting to Media Organizer DB...")
+
+    if not month:
+        logger.error("Month parameter is required.")
+        sys.exit(1)
 
     # Connect to the Media Organizer DB
     conn = sqlite3.connect(MEDIA_ORGANIZER_DB_PATH)
     cursor = conn.cursor()
 
-    # Get the next batch
-    next_batch = get_month_batch(cursor, '000')
+    logger.info(f"Next batch is for {month}. Checking Smart Album...")
 
-    if next_batch:
-        logger.info(f"Next batch is for {next_batch}. Checking Smart Album...")
+    if check_smart_album_exists(cursor, month):
+        logger.info(f"✅ Smart Album '{month}' exists in Media Organizer DB.")
 
-        if check_smart_album_exists(cursor, next_batch):
-            logger.info(f"✅ Smart Album '{next_batch}' exists in Media Organizer DB.")
-
-            if dry_run:
-                logger.info("Dry run enabled.")
-            else:
-                logger.info("Smart Album verified. No export performed in this step.")
-
-            set_batch_status(cursor, next_batch, '100')
-            conn.commit()
+        if dry_run:
+            logger.info("Dry run enabled.")
         else:
-            logger.error(f"❌ Smart Album '{next_batch}' does not exist. Please create it manually in Apple Photos.")
-            sys.exit(1)  # Block further processing
+            logger.info("Smart Album verified. No export performed in this step.")
+
+        # set_batch_status(cursor, month, '100')
+        conn.commit()
     else:
-        logger.info("✅ No pending batches found. Smart albums already verified.")
-        sys.exit(0)
+        logger.error(f"❌ Smart Album '{month}' does not exist. Please create it manually in Apple Photos.")
+        sys.exit(1)  # Block further processing
+
     conn.close()
     
 if __name__ == '__main__':
     logger = setup_logger(LOG_PATH, MODULE_TAG)
     dry_run = '--dry-run' in sys.argv
+    month = None
+
+    for arg in sys.argv:
+        if arg.startswith('--month='):
+            month = arg.split('=')[1]
+        elif not arg.startswith('--') and os.path.basename(__file__) not in arg:
+            month = arg
 
     try:
-        main_process(logger, dry_run=dry_run)
+        main_process(logger, month=month, dry_run=dry_run)
         logger.info("Smart Album verification completed successfully.")
     except Exception as e:
         logger.error(f"Verification failed: {e}")

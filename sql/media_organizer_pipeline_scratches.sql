@@ -1,10 +1,146 @@
 -- reversing processing order - newer scripts at the top
+        select  distinct i.import_uuid, a.month
+        from imports i 
+        left join assets a on a.import_id = i.import_uuid
+        left join month_batches m on m.month = a.month
+        where (latest_import_id < i.import_uuid or latest_import_id is null)
+        and m.status_code < (SELECT code
+                                FROM batch_status
+                                WHERE preceding_code IS NOT NULL
+                                    and length(code) = 3
+                                    order by code desc
+                                limit 1) or m.status_code is null
+        order by i.import_uuid desc, a.month desc        
+        limit 1;
+
+
+        SELECT month, status_code
+        FROM month_batches
+
+
+SELECT code, preceding_code, full_description
+FROM batch_status
+WHERE preceding_code IS NOT NULL
+  AND code NOT LIKE '%E'
+
+
+SELECT mb.month, mb.status_code, bs.short_label
+FROM month_batches mb
+LEFT JOIN batch_status bs ON mb.status_code = bs.code
+ORDER BY mb.month
+
+
+select *
+from batch_status b 
+
+select * 
+from planned_execution p 
+
+ALTER TABLE planned_execution ADD COLUMN active INTEGER NOT NULL DEFAULT 0;
+-- find next batch to process
+-- need to find an import that has a month which has latest import smaller than the current import id or none
+select distinct i.import_uuid, a.month, m.latest_import_id, m.status_code
+from imports i 
+left join assets a on a.import_id = i.import_uuid
+left join month_batches m on m.month = a.month
+where latest_import_id < i.import_uuid or latest_import_id is null
+order by i.import_uuid desc, a.month desc
+
+-- code query
+select  distinct i.import_uuid, a.month
+from imports i 
+left join assets a on a.import_id = i.import_uuid
+left join month_batches m on m.month = a.month
+where latest_import_id < i.import_uuid or latest_import_id is null
+and m.status_code < (SELECT code
+						FROM batch_status
+						WHERE preceding_code IS NOT NULL
+							and length(code) = 3
+							order by code desc
+						limit 1)
+order by i.import_uuid desc, a.month desc
+limit 1;
+
+CREATE TABLE IF NOT EXISTS planned_execution (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    planned_month TEXT,
+    set_at_utc TEXT DEFAULT (datetime('now'))
+);
+
+
+select distinct import_id, month
+from assets
+order by import_id desc, month desc
+
+-- get non-error stage transitions
+SELECT code, preceding_code, full_description
+FROM batch_status
+WHERE preceding_code IS NOT NULL
+	and length(code) = 3
+order by code;
+
+-- latest developed stage
+SELECT code
+FROM batch_status
+WHERE preceding_code IS NOT NULL
+	and length(code) = 3
+order by code desc
+limit 1;
+
+-- get batch statuses
+SELECT month, status_code, latest_import_id 
+FROM month_batches
+order by month desc;
+
+-- get latest import and month
+select * 
+from imports
+order by import_uuid desc
+-- import id = 72672
+
+-- find import devices
+select import_uuid, cast(substr(import_name, 26) as text)
+from imports 
+
+--update month_batches
+--set latest_import_id = NULL
+
+
+-- group assets by import and by date created
+select import_id, count(*), SUBSTR(datetime(imported_date_utc, 'localtime'),0,8) as dateImported
+--substr(datetime(imported_date_utc + 978307200, 'unixepoch'),0,8) as dateImported
+from assets
+group by import_id, dateImported
+order by import_id desc, dateImported desc
+
+
+
+-- upload_to_google_photos set score_imported_at_utc timestamp
+select * 
+from assets
+where score_imported_at_utc is null
+order by import_id desc
+
+
+
+
+select b.code
+from batch_status b 
+where b.preceding_code = 100 and length(code) = 3
+
+SELECT mb.month, mb.status_code , bs.code, bs.preceding_code
+FROM month_batches mb
+LEFT JOIN batch_status bs ON mb.status_code = bs.code
+--        WHERE mb.status_code = ?
+ORDER BY mb.month DESC
+
 
 SELECT mb.month, bs.code, bs.preceding_code
 FROM month_batches mb
 JOIN batch_status bs ON mb.status_code = bs.preceding_code
-WHERE bs.preceding_code = '100'
+--WHERE bs.preceding_code = '100'
 ORDER BY mb.month DESC
+
 LIMIT 1;
 
 
@@ -21,13 +157,14 @@ from assets a
 
 SELECT * FROM photos_assets_view
 
-SELECT strftime('%Y-%m', creation_datetime)
+SELECT strftime('%Y- %m', creation_datetime)
 FROM photos_assets_view
 
 WHERE strftime('%Y-%m', creation_datetime) = '2025-05'
 
 select * 
 from pipeline_executions pe 
+order by id desc
 
 SELECT month FROM month_batches
         WHERE status_code = '000'

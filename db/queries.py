@@ -1,11 +1,23 @@
-def get_month_batch(cursor, current_code):
-    """Get the next eligible batch based on the preceding_code for the given status code."""
+# Commenting out below as references to this routine are being depricated
+# def get_month_batch(cursor, current_code):
+#     """Get the next eligible batch based on the preceding_code for the given status code."""
+#     cursor.execute('''
+#         SELECT mb.month
+#         FROM month_batches mb
+#         LEFT JOIN batch_status bs ON mb.status_code = bs.preceding_code
+#         WHERE mb.status_code = ?
+#         ORDER BY mb.month DESC
+#         LIMIT 1;
+#     ''', (current_code,))
+#     row = cursor.fetchone()
+#     return row[0] if row else None
+
+def get_next_code(cursor, current_code):
+    """Get the next code based on the preceding code relation."""
     cursor.execute('''
-        SELECT mb.month
-        FROM month_batches mb
-        JOIN batch_status bs ON mb.status_code = bs.preceding_code
-        WHERE bs.preceding_code = ?
-        ORDER BY mb.month DESC
+        select b.code
+        from batch_status b 
+        where b.preceding_code = ? and length(code) = 3
         LIMIT 1;
     ''', (current_code,))
     row = cursor.fetchone()

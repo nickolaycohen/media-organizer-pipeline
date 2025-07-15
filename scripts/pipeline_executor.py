@@ -5,15 +5,14 @@ import subprocess
 import platform
 import shutil
 import logging
-from db.queries import get_month_batch
+from db.queries import get_next_code
 from utils.utils import set_batch_status
 from utils.logger import setup_logger
-from constants import LOG_PATH, MEDIA_ORGANIZER_DB_PATH
+from constants import LOG_PATH, MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_PATH
 import sqlite3
 from uuid import uuid4
 import time
 from datetime import datetime, timedelta
-import constants
 import tzlocal
 from datetime import timezone
 from dataclasses import dataclass
@@ -71,7 +70,16 @@ def run_regular_steps(bootstrap_steps, steps, from_index, to_index, dry_run, mon
     for i, step in enumerate(steps, start=len(bootstrap_steps)):
         if i < from_index or (to_index is not None and i >= to_index):
             continue
-        if not run_step(conn, step, dry_run, month):
+
+        current_month = month
+        if step.code and not current_month:
+            logger.warning(f"⚠️ No batch found in status {step.code} — skipping step {step.label}")
+            continue
+
+        # Append current_month to the command if available
+        if current_month:
+            step.command = [arg.replace("{month}", current_month) for arg in step.command]
+        if not run_step(conn, step, dry_run, current_month):
             logger.error(f"❌ Pipeline execution halted. Session ID: {session_id}")
             conn.close()
             sys.exit(1)
@@ -97,12 +105,17 @@ def run_step(conn, step: PipelineStep, dry_run=False, month=None):
         log_execution(conn, step.label, "dry-run", batch_month_id)
         return True
     try:
+        # conn.commit()
         subprocess.run(step.command, check=True)
         logger.info(f"✅ Completed: {step.label}")
         log_execution(conn, step.label, "success", batch_month_id)
-        if month is not None and step.code:
-            cursor = conn.cursor()
-            set_batch_status(cursor, month, step.code)
+        # Always update batch status centrally after a successful step with a valid code
+        if step.code:
+            if month is not None:
+                cursor = conn.cursor()
+                next_code = get_next_code(cursor, step.code)
+                set_batch_status(cursor, month, next_code, session_id=session_id)
+                conn.commit()
         return True
     except subprocess.CalledProcessError as e:
         logger.error(f"❌ Failed: {step.label} with error: {e}")
@@ -144,7 +157,7 @@ def should_run_sync_metadata(label):
                 logger.warning(f"⚠️ Failed to convert last_successful_run to local time: {conv_err}")
         db_conn.close()
 
-        photos_db_mtime = os.path.getmtime(constants.APPLE_PHOTOS_DB_PATH)
+        photos_db_mtime = os.path.getmtime(APPLE_PHOTOS_DB_PATH)
         photos_db_mtime_dt = datetime.fromtimestamp(photos_db_mtime, tz=local_tz)
         logger.info(f"Latest Apple Photos DB mtime: {photos_db_mtime_dt}")
 
@@ -187,8 +200,10 @@ def main():
 
     # Bootstrap: run initial steps before determining which batch to process
     bootstrap_steps = [
+        PipelineStep("0.0.5 Pipeline Status Overview", "", ["python3", os.path.join(SCRIPT_DIR, "pipeline_planner.py")]),
         PipelineStep("0.1 Storage Status", "", ["python3", os.path.join(SCRIPT_DIR, "storage_status.py"), "--migrate"]),
         PipelineStep(sync_metadata_label, "", ["python3", os.path.join(SCRIPT_DIR, "sync_photos_metadata.py")]),
+        PipelineStep("0.4 Sync Assets from Photos DB", "", ["python3", os.path.join(SCRIPT_DIR, "sync_photos_assets.py")]),
         # PipelineStep("1.1 Detect Gaps", "000", ["python3", os.path.join(SCRIPT_DIR, "generate_month_batches.py")]),
     ]
 
@@ -201,16 +216,25 @@ def main():
     """)
     for pipeline_stage, full_description, code, script_name in cursor.fetchall():
         label = f"{pipeline_stage} {full_description}"
-        cmd = ["python3", os.path.join(SCRIPT_DIR, script_name)]
+        script_path = os.path.join(SCRIPT_DIR, script_name.split()[0])  # Strip {month} if present
+        cmd = ["python3", script_path]
+
+        # Append any extra arguments (like {month}) dynamically during execution
+        if "{month}" in script_name:
+            cmd.append("{month}")  # Placeholder to be replaced at execution time
+
         steps.append(PipelineStep(label, code, cmd))
 
     all_steps = bootstrap_steps.copy()
     all_steps.extend(steps)
 
-    if "--from" in sys.argv:
-        from_index = int(sys.argv[sys.argv.index("--from") + 1])
-    elif "--to" in sys.argv:
-        to_index = int(sys.argv[sys.argv.index("--to") + 1])
+    # Check for planned execution before interactive mode
+    cursor.execute("SELECT planned_month FROM planned_execution WHERE active = 1 LIMIT 1")
+    planned_row = cursor.fetchone()
+    if planned_row:
+        month = planned_row[0]
+        logger.info(f"📋 Planned execution found. Using batch: {month}")
+        from_index, to_index = 0, len(all_steps)
     else:
         from_index, to_index = interactive_mode(all_steps, len(bootstrap_steps))
 
@@ -221,7 +245,7 @@ def main():
     cur_err.execute("SELECT month, status_code FROM month_batches WHERE status_code LIKE '%E'")
     error_batches = cur_err.fetchall()
 
-    month = None
+    # month = None
     # Determine if any selected step requires a batch status code (non-empty code)
     requires_batch = any(step.code for step in selected_steps)
 
@@ -240,13 +264,11 @@ def main():
         if month is None:
             # Extract first step that requires a batch code
             first_code_step = next((step for step in selected_steps if step.code), None)
-            month = None
+            # month = None
             if first_code_step:
                 step_code = first_code_step.code
                 if step_code == '000':
                     logger.info(f"ℹ️ Step {first_code_step.label} (code {step_code}) has no prerequisites and will run unconditionally.")
-                else:
-                    month = get_month_batch(cursor, step_code)
             if not month:
                 if first_code_step and first_code_step.code == '000':
                     logger.info("ℹ️ Proceeding without batch for step 000.")
@@ -273,6 +295,11 @@ def main():
 
     run_bootstrap_steps(bootstrap_steps, from_index, to_index, dry_run, sync_metadata_label, conn, month)
     run_regular_steps(bootstrap_steps, steps, from_index, to_index, dry_run, month, conn)
+
+    # If a planned execution was used, mark it as inactive
+    if planned_row:
+        cursor.execute("UPDATE planned_execution SET active = 0 WHERE planned_month = ?", (month,))
+        conn.commit()
 
     start_index = len(bootstrap_steps) + len(steps)
     conn.close()

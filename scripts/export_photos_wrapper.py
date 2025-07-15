@@ -6,15 +6,9 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from constants import MEDIA_ORGANIZER_DB_PATH, LOG_PATH
 from utils.logger import setup_logger, close_logger
-from db.queries import get_month_batch
 from utils.utils import set_batch_status
 
 MODULE_TAG = 'export_wrapper'
-
-def get_batch_status(cursor, month):
-    cursor.execute("SELECT status_code FROM month_batches WHERE month = ?", (month,))
-    row = cursor.fetchone()
-    return row[0] if row else None
 
 def run_applescript_export(month, logger, dry_run=False):
     script_path = os.path.join(os.path.dirname(__file__), "export_photos_applescript.scpt")
@@ -30,26 +24,28 @@ def run_applescript_export(month, logger, dry_run=False):
         logger.error(f"❌ AppleScript export failed: {e}")
         return False
 
-def main(dry_run=False):
+def main(month, dry_run=False, session_id=None):
     logger = setup_logger(LOG_PATH, MODULE_TAG)
     conn = sqlite3.connect(MEDIA_ORGANIZER_DB_PATH)
     cursor = conn.cursor()
 
     try:
-        month = get_month_batch(cursor, '100')
+        if not month:
+            logger.error("❌ No month provided. Please specify the month using --month.")
+            return
+
         logger.info(f"📦 Selected batch: {month}")
 
-        current_status = get_month_batch(cursor, month)
-        if not month:
-            logger.info(f"✅ No eligible batch found in status '100'. Nothing to export.")
-            return
+        current_status = '100'  # Assume correct status is passed via --month param
+
+        # We assume the caller has validated the correct month; this check is no longer needed
 
         success = run_applescript_export(month, logger, dry_run)
 
-        if success and not dry_run:
-            set_batch_status(cursor, month, '200')
-            conn.commit()
-            logger.info(f"📦 Batch '{month}' status updated to '200' (exported).")
+        # if success and not dry_run:
+        #     set_batch_status(cursor, month, '200', session_id=session_id)
+        #     conn.commit()
+        #     logger.info(f"📦 Batch '{month}' status updated to '200' (exported).")
 
     except Exception as e:
         logger.error(f"❌ Unexpected error: {e}")
@@ -60,7 +56,9 @@ def main(dry_run=False):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("month", help="Batch month in YYYY-MM format")
     parser.add_argument("--dry-run", action="store_true", help="Log actions without running AppleScript")
+    parser.add_argument("--session-id", help="Pipeline session ID")
     args = parser.parse_args()
 
-    main(dry_run=args.dry_run)
+    main(month=args.month, dry_run=args.dry_run, session_id=args.session_id)

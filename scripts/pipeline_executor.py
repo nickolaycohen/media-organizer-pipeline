@@ -76,10 +76,10 @@ def run_regular_steps(bootstrap_steps, steps, from_index, to_index, dry_run, mon
             logger.warning(f"⚠️ No batch found in status {step.code} — skipping step {step.label}")
             continue
 
-        # Append current_month to the command if available
-        if current_month:
-            step.command = [arg.replace("{month}", current_month) for arg in step.command]
-        if not run_step(conn, step, dry_run, current_month):
+        # Prepare command with current_month replaced if available
+        command = [arg.replace("{month}", current_month) if current_month else arg for arg in step.command]
+
+        if not run_step(conn, step, dry_run, current_month, command):
             logger.error(f"❌ Pipeline execution halted. Session ID: {session_id}")
             conn.close()
             sys.exit(1)
@@ -91,7 +91,7 @@ def log_execution(conn, label, status, batch_month_id=None):
     """, (session_id, label, status, batch_month_id))
     conn.commit()
 
-def run_step(conn, step: PipelineStep, dry_run=False, month=None):
+def run_step(conn, step: PipelineStep, dry_run=False, month=None, command=None):
     logger.info(f"▶️ Starting: {step.label}")
     batch_month_id = None
     if month is not None:
@@ -101,12 +101,13 @@ def run_step(conn, step: PipelineStep, dry_run=False, month=None):
         if row:
             batch_month_id = row[0]
     if dry_run:
-        logger.info(f"[Dry Run] Would run: {' '.join(step.command)}")
+        cmd_str = ' '.join(command if command else step.command)
+        logger.info(f"[Dry Run] Would run: {cmd_str}")
         log_execution(conn, step.label, "dry-run", batch_month_id)
         return True
     try:
-        # conn.commit()
-        subprocess.run(step.command, check=True)
+        cmd_to_run = command if command else step.command
+        subprocess.run(cmd_to_run, check=True)
         logger.info(f"✅ Completed: {step.label}")
         log_execution(conn, step.label, "success", batch_month_id)
         # Always update batch status centrally after a successful step with a valid code
@@ -114,8 +115,12 @@ def run_step(conn, step: PipelineStep, dry_run=False, month=None):
             if month is not None:
                 cursor = conn.cursor()
                 next_code = get_next_code(cursor, step.code)
-                set_batch_status(cursor, month, next_code, session_id=session_id)
-                conn.commit()
+                if next_code is not None:
+                    set_batch_status(cursor, month, next_code, session_id=session_id)
+                    conn.commit()
+                else:
+                    logger.info(f"🎯 Final step reached for month {month}, no status transition needed.")
+                    conn.commit()
         return True
     except subprocess.CalledProcessError as e:
         logger.error(f"❌ Failed: {step.label} with error: {e}")
@@ -200,10 +205,10 @@ def main():
 
     # Bootstrap: run initial steps before determining which batch to process
     bootstrap_steps = [
-        PipelineStep("0.0.5 Pipeline Status Overview", "", ["python3", os.path.join(SCRIPT_DIR, "pipeline_planner.py")]),
-        PipelineStep("0.1 Storage Status", "", ["python3", os.path.join(SCRIPT_DIR, "storage_status.py"), "--migrate"]),
-        PipelineStep(sync_metadata_label, "", ["python3", os.path.join(SCRIPT_DIR, "sync_photos_metadata.py")]),
-        PipelineStep("0.4 Sync Assets from Photos DB", "", ["python3", os.path.join(SCRIPT_DIR, "sync_photos_assets.py")]),
+        #PipelineStep("0.0.5 Pipeline Status Overview", "", ["python3", os.path.join(SCRIPT_DIR, "pipeline_planner.py")]),
+        #PipelineStep("0.1 Storage Status", "", ["python3", os.path.join(SCRIPT_DIR, "storage_status.py"), "--migrate"]),
+        #PipelineStep(sync_metadata_label, "", ["python3", os.path.join(SCRIPT_DIR, "sync_photos_metadata.py")]),
+        # PipelineStep("0.4 Sync Assets from Photos DB", "", ["python3", os.path.join(SCRIPT_DIR, "sync_photos_assets.py")]),
         # PipelineStep("1.1 Detect Gaps", "000", ["python3", os.path.join(SCRIPT_DIR, "generate_month_batches.py")]),
     ]
 
@@ -236,7 +241,9 @@ def main():
         logger.info(f"📋 Planned execution found. Using batch: {month}")
         from_index, to_index = 0, len(all_steps)
     else:
-        from_index, to_index = interactive_mode(all_steps, len(bootstrap_steps))
+        logger.error("🚫 No active planned execution found. Please run pipeline_planner first.")
+        conn.close()
+        sys.exit(1)
 
     selected_steps = all_steps[from_index:to_index]
 

@@ -1,4 +1,4 @@
 google-auth 
 google-auth-oauthlib 
 google-auth-httplib2
-tzlocal
+tzlocal>=5.2

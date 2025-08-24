@@ -1,4 +1,12 @@
 -- reversing processing order - newer scripts at the top
+
+select *
+from imports i
+
+select * 
+from batch_status b 
+
+
         select  distinct i.import_uuid, a.month
         from imports i 
         left join assets a on a.import_id = i.import_uuid
@@ -23,12 +31,10 @@ FROM batch_status
 WHERE preceding_code IS NOT NULL
   AND code NOT LIKE '%E'
 
-
 SELECT mb.month, mb.status_code, bs.short_label
 FROM month_batches mb
 LEFT JOIN batch_status bs ON mb.status_code = bs.code
 ORDER BY mb.month
-
 
 select *
 from batch_status b 

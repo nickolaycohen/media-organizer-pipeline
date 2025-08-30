@@ -47,17 +47,15 @@ def run_bootstrap_steps(auto_apply, logger):
     Run the bootstrap steps: check_storage_status.py, sync_photos_metadata.py, and pipeline_planner.py itself.
     """
     steps = [
-        ("0.0.0 Copy all media DB", "copy_all_media_db.py"),
-        ("0.0.1 Check storage status", "storage_status.py"),
-        ("0.0.3 Sync metadata", "sync_photos_metadata.py"),
+        ("0.0.0 Copy all media DB", "copy_all_media_db.py", []),
+        ("0.0.1 Check storage status", "storage_status.py", ["--migrate"]),
+        ("0.0.3 Sync metadata", "sync_photos_metadata.py", []),
     ]
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    for step_name, script_file in steps:
+    for step_name, script_file, step_args in steps:
         script_path = os.path.join(script_dir, script_file)
         logger.info(f"🔧 Running bootstrap step: {step_name} ({script_file})")
         try:
-            # Removed self-invocation step; no need to skip itself anymore
-            pass
             if script_file == "sync_photos_metadata.py":
                 conn = None
                 try:
@@ -71,12 +69,11 @@ def run_bootstrap_steps(auto_apply, logger):
                 finally:
                     if conn:
                         conn.close()
-            subprocess.run(["python3", script_path], check=True)
+            subprocess.run(["python3", script_path] + step_args, check=True)
             logger.info(f"✅ Completed: {step_name}")
         except subprocess.CalledProcessError as e:
             logger.error(f"❌ Error in bootstrap step {step_name}: {e}")
             sys.exit(1)
-
 import argparse
 import sqlite3
 from constants import MEDIA_ORGANIZER_DB_PATH

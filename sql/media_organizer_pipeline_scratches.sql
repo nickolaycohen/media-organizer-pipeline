@@ -1,4 +1,24 @@
 -- reversing processing order - newer scripts at the top
+select * from assets a
+order by a.aesthetic_score desc
+
+select  distinct i.import_uuid, a.month
+from imports i 
+left join assets a on a.import_id = i.import_uuid
+left join month_batches m on m.month = a.month
+where latest_import_id < i.import_uuid or latest_import_id is null
+and m.status_code < (SELECT code
+                        FROM batch_status
+                        WHERE preceding_code IS NOT NULL
+                            and length(code) = 3
+                            order by code desc
+                        limit 1) or m.status_code is null
+order by i.import_uuid desc, a.month desc
+limit 1;
+
+
+SELECT * FROM planned_execution 
+WHERE active = 1;
 
 select *
 from imports i
@@ -22,8 +42,8 @@ from batch_status b
         limit 1;
 
 
-        SELECT month, status_code
-        FROM month_batches
+SELECT month, status_code, *
+FROM month_batches
 
 
 SELECT code, preceding_code, full_description

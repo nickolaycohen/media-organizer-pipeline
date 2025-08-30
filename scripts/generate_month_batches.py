@@ -88,31 +88,29 @@ def main_process(logger):
 
         for month in available_months:
             month_assets = assets_by_month.get(month, [])
-            total_assets = len(month_assets)
+            total_assets_count = len(month_assets)
 
+            # Fetch uploaded assets for this month using the same UTC-to-local-month conversion
             cursor.execute("""
-                SELECT COUNT(*) FROM assets
-                WHERE month = ?
-            """, (month,))
-            uploaded_assets = cursor.fetchone()[0]
+                SELECT asset_id, creation_datetime_utc FROM assets
+                WHERE creation_datetime_utc IS NOT NULL
+            """)
+            uploaded_ids = set()
+            for asset_id, creation_utc in cursor.fetchall():
+                asset_month = utc_to_local_month(creation_utc)
+                if asset_month == month:
+                    uploaded_ids.add(asset_id)
 
-            logger.info(f"Month {month}: total assets = {total_assets}, uploaded assets = {uploaded_assets}")
+            missing_assets = [asset for asset in month_assets if asset[0] not in uploaded_ids]
 
-            # Identify missing assets by checking assets not in uploaded assets table
-            cursor.execute("""
-                SELECT asset_id FROM assets WHERE month = ?
-            """, (month,))
-            uploaded_asset_ids = set(row[0] for row in cursor.fetchall())
-
-            missing_assets = [asset for asset in month_assets if asset[0] not in uploaded_asset_ids]
-
-            if len(missing_assets) == 0:
+            logger.info(f"Month {month}: total assets = {total_assets_count}, uploaded assets = {len(uploaded_ids)}")
+            count_missing = len(missing_assets)
+            if count_missing == 0:
                 logger.info(f"✔️ Skipping {month} — all assets already uploaded.")
                 continue
 
             max_display = 10
-            count_missing = len(missing_assets)
-            logger.info(f"🔍 {count_missing} missing assets detectaed for {month}.")
+            logger.info(f"🔍 {count_missing} missing assets detected for {month}.")
             if count_missing > max_display:
                 logger.info(f"Displaying first {max_display} missing assets:")
                 for uuid, import_id in missing_assets[:max_display]:

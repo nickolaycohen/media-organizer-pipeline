@@ -125,6 +125,17 @@ def run_step(conn, step: PipelineStep, dry_run=False, month=None, command=None):
     except subprocess.CalledProcessError as e:
         logger.error(f"❌ Failed: {step.label} with error: {e}")
         log_execution(conn, step.label, "failed", batch_month_id)
+        if step.code is not None and month is not None:
+            cursor = conn.cursor()
+            error_code = None
+            cursor.execute("SELECT code FROM batch_status WHERE code = ?", (step.code + 'E',))
+            row = cursor.fetchone()
+            if row:
+                error_code = row[0]
+            if error_code:
+                set_batch_status(cursor, month, error_code, session_id=session_id)
+                conn.commit()
+                logger.info(f"⚠️ Batch {month} moved to error state {error_code} due to failure in step {step.label}.")
         return False
 
 def is_applescript_available():

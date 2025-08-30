@@ -16,7 +16,31 @@ def get_migration_status(cursor):
     name = cursor.fetchone()
     if name:
         logger.info("✅ schema_migrations table exists.")
-        cursor.execute("SELECT migration, applied_at_utc FROM schema_migrations ORDER BY applied_at_utc DESC LIMIT 1")
+        # List migration files in migrations/ folder
+        migrations_folder = os.path.join(project_root, "migrations")
+        migration_files = []
+        if os.path.isdir(migrations_folder):
+            migration_files = sorted(f for f in os.listdir(migrations_folder) if f.endswith(".py"))
+        else:
+            logger.warning(f"⚠️ Migrations folder not found at {migrations_folder}")
+
+        # Get existing migrations from DB
+        cursor.execute("SELECT migration FROM schema_migrations")
+        existing_migrations = {row[0] for row in cursor.fetchall()}
+
+        # Insert missing migrations as pending
+        new_pending = []
+        for filename in migration_files:
+            if filename not in existing_migrations:
+                cursor.execute("INSERT INTO schema_migrations (migration, status, description) VALUES (?, 'pending', ?)",
+                               (filename, "Detected in folder"))
+                new_pending.append(filename)
+        if new_pending:
+            logger.info("🆕 Detected new migration files added to folder and marked as pending:")
+            for fn in new_pending:
+                logger.info(f" - {fn}")
+
+        cursor.execute("SELECT migration, applied_at_utc FROM schema_migrations WHERE status='applied' ORDER BY applied_at_utc DESC LIMIT 1")
         latest = cursor.fetchone()
         if latest:
             from datetime import datetime, timezone
@@ -113,17 +137,35 @@ def main():
     cursor = conn.cursor()
     get_migration_status(cursor)
     conn.commit()
-    conn.close()
     if "--migrate" in sys.argv:
-        import subprocess
-        migration_script = os.path.join(os.path.dirname(__file__), "migrate.py")
-        logger.info("🔍 Checking for unapplied migrations...")
-        result = subprocess.run([sys.executable, migration_script, "--dry-run"], capture_output=True, text=True)
-        if "No pending migrations" in result.stdout:
+        import importlib.util
+        from datetime import datetime
+        migrations_folder = os.path.join(project_root, "migrations")
+        cursor.execute("SELECT migration FROM schema_migrations WHERE status='pending'")
+        pending_migrations = cursor.fetchall()
+        if not pending_migrations:
             logger.info("✅ No unapplied migrations to run.")
         else:
             logger.info("🔧 Running pending migrations...")
-            subprocess.run([sys.executable, migration_script])
+            for (migration,) in pending_migrations:
+                mig_path = os.path.join(migrations_folder, migration)
+                try:
+                    logger.info(f"▶️ Applying migration: {migration}")
+                    spec = importlib.util.spec_from_file_location("migration", mig_path)
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+                    module.run(conn)
+                    cursor.execute("""
+                        UPDATE schema_migrations
+                        SET status='applied', applied_at_utc=datetime('now')
+                        WHERE migration = ?
+                    """, (migration,))
+                    conn.commit()
+                    logger.info(f"✅ Successfully applied migration: {migration}")
+                except Exception as e:
+                    logger.error(f"❌ Failed to apply migration {migration}: {e}")
+                    break
+    conn.close()
 
 if __name__ == "__main__":
     main()

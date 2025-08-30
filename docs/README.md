@@ -216,3 +216,4 @@ Activate virtual environment:
 > pip3 install -r requirements.txt
 
 TODO: Start to think how to handle the reupload of the same month - either because assets count has been changed or because more space is availble on the drive
+- in upload scropt - if current status is 399 need to reset the list of uploaded files like 2025-05

@@ -1,3 +1,14 @@
+
+select *
+from assets a 
+where month = '2025-05'
+and a.uploaded_to_google = 1
+order by a.updated_at_utc 
+
+--
+select * 
+from schema_migrations sm 
+
 -- reversing processing order - newer scripts at the top
 select * from assets a
 order by a.aesthetic_score desc

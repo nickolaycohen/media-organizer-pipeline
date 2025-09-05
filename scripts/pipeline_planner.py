@@ -5,8 +5,24 @@ import subprocess
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import logging
 from utils.logger import setup_logger
-from constants import LOG_PATH
+from constants import LOG_PATH, STAGING_ROOT
 from utils.utils import get_full_transition_path
+from upload_to_google_photos import check_google_quota
+import argparse
+import sqlite3
+from constants import MEDIA_ORGANIZER_DB_PATH
+
+
+def human_readable_size(size_bytes):
+    if size_bytes == 0:
+        return "0B"
+    size_name = ("B", "KB", "MB", "GB", "TB")
+    i = 0
+    p = 1024
+    while size_bytes >= p and i < len(size_name)-1:
+        size_bytes /= p
+        i += 1
+    return f"{size_bytes:.2f}{size_name[i]}"
 
 def set_planned_month(cursor, month):
     cursor.execute("DELETE FROM planned_execution")
@@ -44,7 +60,7 @@ def should_run_sync_metadata(cursor):
 # Helper to run bootstrap steps
 def run_bootstrap_steps(auto_apply, logger):
     """
-    Run the bootstrap steps: check_storage_status.py, sync_photos_metadata.py, and pipeline_planner.py itself.
+    Run the bootstrap steps: copy_all_media_db.py, storage_status.py, sync_photos_metadata.py.
     """
     steps = [
         ("0.0.0 Copy all media DB", "copy_all_media_db.py", []),
@@ -74,9 +90,6 @@ def run_bootstrap_steps(auto_apply, logger):
         except subprocess.CalledProcessError as e:
             logger.error(f"❌ Error in bootstrap step {step_name}: {e}")
             sys.exit(1)
-import argparse
-import sqlite3
-from constants import MEDIA_ORGANIZER_DB_PATH
 
 def get_stage_transitions(cursor):
     cursor.execute("""
@@ -133,11 +146,71 @@ def display_summary(transitions, batches, latest_import, latest_month):
 
 def main(auto_apply):
     logger = setup_logger(LOG_PATH, "pipeline_planner")
-    # Run bootstrap steps before proceeding
-    run_bootstrap_steps(auto_apply, logger)
 
     conn = sqlite3.connect(MEDIA_ORGANIZER_DB_PATH)
     cursor = conn.cursor()
+
+    # Run bootstrap steps before proceeding
+    run_bootstrap_steps(auto_apply, logger)
+
+    # Check for months with status_code 399
+    cursor.execute("SELECT month FROM month_batches WHERE status_code = 399 ORDER BY month DESC")
+    months_399 = cursor.fetchall()
+    if months_399:
+        latest_399_month = months_399[0][0]
+        free_space = check_google_quota()
+        import glob
+
+        # base_staging_dir = os.path.expanduser("~/staging")÷
+        matched_folders = glob.glob(os.path.join(STAGING_ROOT, f"*{latest_399_month}*"))
+        if matched_folders:
+            staging_folder = matched_folders[0]
+            staging_size = 0
+            for root, dirs, files in os.walk(staging_folder):
+                for f in files:
+                    fp = os.path.join(root, f)
+                    staging_size += os.path.getsize(fp)
+            logger.info(f"Detected staging folder for month {latest_399_month}: {staging_folder}, size: {human_readable_size(staging_size)}")
+        else:
+            staging_folder = None
+            staging_size = 0
+            logger.warning(f"No staging folder found for month {latest_399_month}")
+
+        # Fetch list of uploaded assets for the month from assets table
+        cursor.execute("""
+            SELECT original_filename
+            FROM assets
+            WHERE month = ?
+              AND uploaded_to_google = 1
+            ORDER BY updated_at_utc
+        """, (latest_399_month,))
+        uploaded_assets = cursor.fetchall()
+
+        latest_upload_size = 0
+        if uploaded_assets and staging_folder:
+            for filename_tuple in uploaded_assets:
+                filename = filename_tuple[0]
+                file_path = os.path.join(staging_folder, filename)
+                if os.path.exists(file_path):
+                    file_size = os.path.getsize(file_path)
+                    latest_upload_size += file_size
+                    logger.info(f"Found uploaded asset: {file_path}, size: {human_readable_size(file_size)}")
+        logger.info(f"Total latest upload size for month {latest_399_month}: {human_readable_size(latest_upload_size)}")
+
+        if free_space >= staging_size:
+            logger.info(f"Enough Google Drive space available to transition month {latest_399_month} from 399 to 400. Free space: {human_readable_size(free_space)}, Staging size: {human_readable_size(staging_size)}, Latest upload size: {human_readable_size(latest_upload_size)}")
+            if auto_apply:
+                proceed_transition = True
+            else:
+                proceed_input = input(f"Transition month {latest_399_month} from status 399 to 400? [y/N]: ")
+                proceed_transition = proceed_input.strip().lower() == 'y'
+            if proceed_transition:
+                cursor.execute("UPDATE month_batches SET status_code = 400 WHERE month = ?", (latest_399_month,))
+                conn.commit()
+                logger.info(f"Month {latest_399_month} status updated to 400.")
+        else:
+            logger.warning(f"Not enough Google Drive space to transition month {latest_399_month} from 399 to 400. Free space: {human_readable_size(free_space)}, Staging size: {human_readable_size(staging_size)}, Latest upload size: {human_readable_size(latest_upload_size)}")
+    # End of added logic
 
     transitions = get_stage_transitions(cursor)
     batches = get_batch_statuses(cursor)

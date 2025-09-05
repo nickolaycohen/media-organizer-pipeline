@@ -41,11 +41,36 @@ on run argv
 		if targetAlbum is missing value then return
 		
 		-- ========================================
+		-- Validate Staging vs Album Counts
+		-- ========================================
+		tell application "Photos"
+			set albumCount to count of media items of targetAlbum
+		end tell
+		set fileCountCmd to "ls -1 " & quoted form of fullDestinationPath & " | wc -l"
+		set stagingCount to (do shell script fileCountCmd) as integer
+		
+		if albumCount < stagingCount then
+			my logMessage("⚠️ Album count (" & albumCount & ") is smaller than staging count (" & stagingCount & "). Resetting staging folder.")
+			do shell script "rm -rf " & quoted form of fullDestinationPath & "/*"
+		else
+			my logMessage("ℹ️ Album count (" & albumCount & ") >= staging count (" & stagingCount & "). Using incremental export logic.")
+		end if
+		
+		-- ========================================
 		-- Export Media Items in Batches
 		-- ========================================
 		tell application "Photos"
 			set mediaItems to media items of targetAlbum
 		end tell
+		set fileCountCmd to "ls -1 " & quoted form of fullDestinationPath & " | wc -l"
+		set stagingCount to (do shell script fileCountCmd) as integer
+		
+		if albumCount < stagingCount then
+			my logMessage("⚠️ Album count (" & albumCount & ") is smaller than staging count (" & stagingCount & "). Resetting staging folder.")
+			do shell script "rm -rf " & quoted form of fullDestinationPath & "/*"
+		else
+			my logMessage("ℹ️ Album count (" & albumCount & ") >= staging count (" & stagingCount & "). Using incremental export logic.")
+		end if
 		
 		if (count of mediaItems) = 0 then
 			my logMessage("⚠️ No media items found in album '" & albumName & "'.")

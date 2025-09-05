@@ -14,6 +14,19 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+import google.auth.exceptions
+
+def human_readable_size(size_bytes):
+    if size_bytes == 0:
+        return "0B"
+    size_name = ("B", "KB", "MB", "GB", "TB", "PB")
+    i = 0
+    p = 1024
+    while size_bytes >= p and i < len(size_name)-1:
+        size_bytes /= p
+        i += 1
+    return f"{size_bytes:.2f} {size_name[i]}"
+
 def get_google_storage_quota(creds):
     """
     Uses Google Drive API to retrieve storage quota (used, total, remaining in bytes).
@@ -30,11 +43,20 @@ def get_google_storage_quota(creds):
         remaining = (reported_remaining - SAFETY_BUFFER) if reported_remaining is not None else None
         if remaining is not None and remaining < 0:
             remaining = 0
-        logger.info(f"Google Storage Quota - Used: {used} bytes, Total: {total} bytes, Reported Remaining: {reported_remaining} bytes, Usable Remaining (with buffer): {remaining} bytes")
+        logger.info(f"Google Storage Quota - Used: {human_readable_size(used)}, Total: {human_readable_size(total)}, Reported Remaining: {human_readable_size(reported_remaining) if reported_remaining is not None else 'Unlimited or unknown'}, Usable Remaining (with buffer): {human_readable_size(remaining) if remaining is not None else 'Unlimited or unknown'}")
         return {"used": used, "total": total, "remaining": remaining}
     except Exception as e:
         logger.error(f"Failed to retrieve Google storage quota: {e}")
         return None
+
+def check_google_quota():
+    """
+    Retrieves the remaining Google Drive quota using current credentials.
+    Returns the usable remaining quota in bytes (int), or 0 if retrieval fails.
+    """
+    creds = ensure_google_photos_credentials()
+    quota = get_google_storage_quota(creds)
+    return quota.get("remaining", 0) if quota is not None else 0
 
 MODULE_TAG = 'upload_to_google_photos'
 logger = setup_logger(LOG_PATH, MODULE_TAG)
@@ -58,7 +80,14 @@ def ensure_google_photos_credentials(force_refresh=False):
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+            try:
+                creds.refresh(Request())
+            except google.auth.exceptions.RefreshError:
+                logger.warning("[Google Photos] Token expired or revoked. Removing token and re-authenticating.")
+                if os.path.exists(TOKEN_FILE):
+                    os.remove(TOKEN_FILE)
+                flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_FILE, SCOPES)
+                creds = flow.run_local_server(port=0, access_type='offline', prompt='consent')
         else:
             flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_FILE, SCOPES)
             creds = flow.run_local_server(port=0, access_type='offline', prompt='consent')

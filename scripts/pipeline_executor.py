@@ -116,7 +116,13 @@ def run_step(conn, step: PipelineStep, dry_run=False, month=None, command=None):
                 cursor = conn.cursor()
                 next_code = get_next_code(cursor, step.code)
                 if next_code is not None:
-                    set_batch_status(cursor, month, next_code, session_id=session_id)
+                    # Check if next_code is a manual type
+                    cursor.execute("SELECT transition_type FROM batch_status WHERE code = ?", (next_code,))
+                    row = cursor.fetchone()
+                    if row and row[0] == 'manual':
+                        logger.info(f"⏸️ Skipping automatic transition to manual status {next_code} for month {month}")
+                    else:
+                        set_batch_status(cursor, month, next_code, session_id=session_id)
                     conn.commit()
                 else:
                     logger.info(f"🎯 Final step reached for month {month}, no status transition needed.")
@@ -225,21 +231,23 @@ def main():
 
     steps = []
     cursor.execute("""
-        SELECT pipeline_stage, full_description, code, script_name
+        SELECT pipeline_stage, full_description, code, script_name, transition_type
         FROM batch_status
         WHERE code GLOB '[0-9][0-9][0-9]'
         ORDER BY code
     """)
-    for pipeline_stage, full_description, code, script_name in cursor.fetchall():
+    rows = cursor.fetchall()
+    for pipeline_stage, full_description, code, script_name, transition_type in rows:
         label = f"{pipeline_stage} {full_description}"
-        script_path = os.path.join(SCRIPT_DIR, script_name.split()[0])  # Strip {month} if present
-        cmd = ["python3", script_path]
-
-        # Append any extra arguments (like {month}) dynamically during execution
-        if "{month}" in script_name:
-            cmd.append("{month}")  # Placeholder to be replaced at execution time
-
+        if script_name:
+            script_path = os.path.join(SCRIPT_DIR, script_name.split()[0])
+            cmd = ["python3", script_path]
+            if "{month}" in script_name:
+                cmd.append("{month}")
+        else:
+            cmd = []
         steps.append(PipelineStep(label, code, cmd))
+    steps = [step for step, (_, _, _, _, ttype) in zip(steps, rows) if ttype == 'pipeline']
 
     all_steps = bootstrap_steps.copy()
     all_steps.extend(steps)

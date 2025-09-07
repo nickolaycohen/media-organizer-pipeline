@@ -1,3 +1,31 @@
+SELECT *
+FROM assets
+WHERE strftime('%Y-%m', datetime(strftime('%s', date_created_utc), 'unixepoch', 'localtime')) != month
+order by assets.date_created_utc desc
+
+        DELETE FROM assets
+        WHERE strftime('%Y-%m', datetime(strftime('%s', date_created_utc), 'unixepoch', 'localtime')) != month
+
+
+
+SELECT 
+            a.ZUUID, 
+            a.ZOVERALLAESTHETICSCORE, 
+            aaa.ZORIGINALFILENAME, 
+            datetime(a.ZDATECREATED + 978307200, 'unixepoch'),
+            datetime(a.ZADDEDDATE + 978307200, 'unixepoch'),
+            a.ZIMPORTSESSION,
+            strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) as month
+        FROM ZASSET a
+        LEFT JOIN ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK
+        WHERE a.ZOVERALLAESTHETICSCORE IS NOT NULL
+        AND a.ZIMPORTSESSION >= 72678
+
+-- assets in a month
+SELECT COUNT(*) FROM assets WHERE month = '2025-08'
+SELECT date_created_utc, *  FROM assets WHERE month = '2025-08' 
+AND (date_captured IS NOT NULL AND date_captured != '')
+
 
 select *
 from assets a 

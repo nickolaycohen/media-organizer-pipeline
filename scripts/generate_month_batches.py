@@ -92,8 +92,8 @@ def main_process(logger):
 
             # Fetch uploaded assets for this month using the same UTC-to-local-month conversion
             cursor.execute("""
-                SELECT asset_id, creation_datetime_utc FROM assets
-                WHERE creation_datetime_utc IS NOT NULL
+                SELECT asset_id, created_at_utc FROM assets
+                WHERE created_at_utc IS NOT NULL
             """)
             uploaded_ids = set()
             for asset_id, creation_utc in cursor.fetchall():

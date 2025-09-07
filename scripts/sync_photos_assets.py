@@ -32,7 +32,7 @@ def sync_assets(logger):
             datetime(a.ZDATECREATED + 978307200, 'unixepoch'),
             datetime(a.ZADDEDDATE + 978307200, 'unixepoch'),
             a.ZIMPORTSESSION,
-            strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch')) as month
+            strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) as month
         FROM ZASSET a
         LEFT JOIN ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK
         WHERE a.ZOVERALLAESTHETICSCORE IS NOT NULL

@@ -44,7 +44,7 @@ def get_full_transition_path(transitions, current_status):
     path = []
     status = current_status
     while True:
-        next_steps = [code for code, prev, _ in transitions if prev == status]
+        next_steps = [code for code, prev, *_ in transitions if prev == status]
         if not next_steps:
             break
         # assume linear pipeline (one valid next step at a time)

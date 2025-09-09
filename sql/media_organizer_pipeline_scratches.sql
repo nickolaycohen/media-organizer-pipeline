@@ -1,3 +1,49 @@
+SELECT DISTINCT i.import_uuid, a.month
+FROM imports i
+LEFT JOIN assets a ON a.import_id = i.import_uuid
+LEFT JOIN month_batches m ON m.month = a.month
+WHERE (latest_import_id < i.import_uuid OR latest_import_id IS NULL)
+AND (m.status_code < (
+        SELECT code
+        FROM batch_status
+        WHERE preceding_code IS NOT NULL
+          AND LENGTH(code) = 3
+          AND transition_type = ?
+        ORDER BY code DESC
+        LIMIT 1
+    ) OR m.status_code IS NULL)
+  -- exclude current month to avoid incomplete batch
+  AND a.month < strftime('%Y-%m', 'now')
+ORDER BY i.import_uuid DESC, a.month DESC
+LIMIT 1;
+
+SELECT month FROM month_batches WHERE status_code = 399 ORDER BY month DESC
+
+SELECT album_name FROM smart_albums
+
+        
+SELECT month, status_code FROM month_batches ORDER BY month;
+
+--  get latest import and month
+SELECT DISTINCT i.import_uuid, a.month
+FROM imports i
+LEFT JOIN assets a ON a.import_id = i.import_uuid
+LEFT JOIN month_batches m ON m.month = a.month
+WHERE (latest_import_id < i.import_uuid OR latest_import_id IS NULL)
+
+AND (m.status_code < ( -- we want the code to be smaller than the largest code - this means incomplete batch
+        SELECT code
+        FROM batch_status
+        WHERE preceding_code IS NOT NULL
+        AND LENGTH(code) = 3
+        ORDER BY code DESC
+        LIMIT 1
+    ) OR m.status_code IS NULL)
+-- exclude current month to avoid incomplete batch
+AND a.month < strftime('%Y-%m', 'now')
+ORDER BY i.import_uuid DESC, a.month DESC
+LIMIT 1;
+
 SELECT *
 FROM assets
 WHERE strftime('%Y-%m', datetime(strftime('%s', date_created_utc), 'unixepoch', 'localtime')) != month

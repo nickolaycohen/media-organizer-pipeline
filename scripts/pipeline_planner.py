@@ -151,7 +151,11 @@ def display_summary(transitions, batches):
     # print(f"Latest Complete Month: {latest_month}")
 
 def main(auto_apply):
+    # Set up logger with line number in format
+    import logging
     logger = setup_logger(LOG_PATH, "pipeline_planner")
+    for handler in logger.handlers:
+        handler.setFormatter(logging.Formatter('%(asctime)s [%(name)s:%(lineno)d] - %(levelname)s - %(message)s'))
 
     conn = sqlite3.connect(MEDIA_ORGANIZER_DB_PATH)
     cursor = conn.cursor()
@@ -194,63 +198,90 @@ def main(auto_apply):
         """, (month_status,))
         transitions_for_month = cursor.fetchall()
 
+        logger.debug(f"Inspecting transitions for month {month} with status {month_status}")
         for t in transitions_for_month:
             if t[3] == 'manual':
+                logger.info(f"Found manual transition candidate for month {month}: {t[2]} (code {t[1]}) -> (code {t[0]})")
                 manual_candidates.append((month, t))
             elif t[3] == 'retryable':
+                logger.info(f"Found retryable transition candidate for month {month}: {t[2]} (code {t[1]}) -> (code {t[0]})")
                 retryable_candidates.append((month, t))
             elif t[3] == 'pipeline':
+                logger.info(f"Found pipeline transition candidate for month {month}: {t[2]} (code {t[1]}) -> (code {t[0]})")
                 pipeline_candidates.append((month, t))
 
     def pick_latest(candidates):
         # Ensure months are compared as YYYY-MM strings correctly
         return max(candidates, key=lambda x: (x[0], x[1][0]))
 
-    if manual_candidates:
-        selected_month, selected_transition = pick_latest(manual_candidates)
-    elif retryable_candidates:
-        selected_month, selected_transition = pick_latest(retryable_candidates)
-    elif pipeline_candidates:
-        selected_month, selected_transition = pick_latest(pipeline_candidates)
-    else:
-        logger.info("No eligible month found with available transitions. Exiting.")
-        conn.close()
-        sys.exit(0)
-
-    if selected_month and selected_transition:
-        selected_code, selected_prev, selected_desc, selected_type, short_label = selected_transition
-        current_status = selected_prev
-        latest_month = selected_month
-    else:
-        logger.info("No eligible month found with available transitions. Exiting.")
-        conn.close()
-        sys.exit(0)
-
-    if selected_type == 'manual':
-        logger.info(f"Month {latest_month} is waiting for manual transition ({selected_desc}, status {current_status}).")
-        if not auto_apply:
-            proceed_input = input(f"Please confirm that the '{short_label}' task has been completed so I can move month {latest_month} to the next phase? [y/N]: ")
-            if proceed_input.strip().lower() == 'y':
-                # Find next status code for this manual transition
-                next_status = None
-                for code, prev, desc, ttype, label in transitions:
-                    if prev == current_status and ttype == 'manual':
-                        next_status = code
-                        break
-                if next_status is not None:
-                    cursor.execute("UPDATE month_batches SET status_code = ? WHERE month = ?", (next_status, latest_month))
-                    conn.commit()
-                    logger.info(f"Month {latest_month} status forcibly updated to {next_status}.")
-                else:
-                    logger.warning("No manual transition found from current status.")
-            else:
-                logger.info("Manual transition aborted by user.")
-                conn.close()
-                sys.exit(0)
+    # Loop to allow retryable transitions if manual is not performed or not scheduled
+    selected_month = None
+    selected_transition = None
+    selected_type = None
+    current_status = None
+    latest_month = None
+    considered_manual = False
+    while True:
+        # Choose transition in order: manual, retryable, pipeline
+        if not considered_manual and manual_candidates:
+            selected_month, selected_transition = pick_latest(manual_candidates)
+            considered_manual = True
+        elif retryable_candidates:
+            selected_month, selected_transition = pick_latest(retryable_candidates)
+        elif pipeline_candidates:
+            selected_month, selected_transition = pick_latest(pipeline_candidates)
         else:
-            logger.info("Auto-apply enabled, skipping manual transition prompt.")
+            logger.info("No eligible month found with available transitions. Exiting.")
+            conn.close()
+            sys.exit(0)
 
-    elif selected_type == 'retryable':
+        if selected_month and selected_transition:
+            selected_code, selected_prev, selected_desc, selected_type, short_label = selected_transition
+            current_status = selected_prev
+            latest_month = selected_month
+        else:
+            logger.info("No eligible month found with available transitions. Exiting.")
+            conn.close()
+            sys.exit(0)
+
+        logger.info("🔍 Checking for manual transition candidates...")
+        if selected_type == 'manual':
+            logger.info(f"Month {latest_month} is waiting for manual transition ({selected_desc}, status {current_status}).")
+            if not auto_apply:
+                proceed_input = input(f"Please confirm that the '{short_label}' task has been completed so I can move month {latest_month} to the next phase? [y/N]: ")
+                if proceed_input.strip().lower() == 'y':
+                    # Find next status code for this manual transition
+                    next_status = None
+                    for code, prev, desc, ttype, label in transitions:
+                        if prev == current_status and ttype == 'manual':
+                            next_status = code
+                            break
+                    if next_status is not None:
+                        cursor.execute("UPDATE month_batches SET status_code = ? WHERE month = ?", (next_status, latest_month))
+                        conn.commit()
+                        logger.info(f"Month {latest_month} status forcibly updated to {next_status}.")
+                        break  # Manual transition completed, exit loop
+                    else:
+                        logger.warning("No manual transition found from current status.")
+                        # Could retry, but break for now
+                        break
+                else:
+                    logger.info("Manual transition aborted by user.")
+                    # Instead of exiting, reset selected_type and allow retryable transitions to be considered
+                    # Remove this manual candidate and continue loop to try retryable
+                    manual_candidates = [c for c in manual_candidates if c[0] != latest_month]
+                    selected_type = None
+                    selected_month = None
+                    selected_transition = None
+                    continue
+            else:
+                logger.info("Auto-apply enabled, skipping manual transition prompt.")
+                break
+        else:
+            break  # Not manual, proceed to retryable or pipeline
+
+    logger.info("🔍 Checking for retryable transition candidates...")
+    if selected_type == 'retryable':
         logger.info(f"Handling retryable transition for month with current status {current_status}.")
         # Existing quota logic for 399->400 transition
         cursor.execute("SELECT month FROM month_batches WHERE status_code = 399 ORDER BY month DESC")
@@ -309,23 +340,7 @@ def main(auto_apply):
             else:
                 logger.warning(f"Not enough Google Drive space to transition month {latest_399_month} from 399 to 400. Free space: {human_readable_size(free_space)}, Staging size: {human_readable_size(staging_size)}, Latest upload size: {human_readable_size(latest_upload_size)}")
                 # Instead of exiting or skipping, check if pipeline transitions exist for current_status
-                # TODO - makes no sense to check for pipeline type here 
-                # cursor.execute("""
-                #     SELECT code, preceding_code, full_description, transition_type, short_label
-                #     FROM batch_status
-                #     WHERE preceding_code = ?
-                #       AND transition_type = 'pipeline'
-                # """, (current_status,))
-                # pipeline_transitions = cursor.fetchall()
-                # logger.info(f"Pipeline transitions available from DB query: {pipeline_transitions}")
-                # if pipeline_transitions:
-                #     selected_transition = pipeline_transitions[0]
-                #     selected_code, selected_prev, selected_desc, selected_type, short_label = selected_transition
-                #     logger.info(f"Falling back to pipeline transition: {selected_desc} (status {selected_code})")
-                # else:
-                #     logger.info("No pipeline transitions available to fall back to after quota check failure.")
-                #     conn.close()
-                #     sys.exit(0)
+                # (no-op; just continue)
         else:
             logger.info("No months with status 399 found to retry transition.")
 

@@ -18,92 +18,127 @@ def sync_metadata(logger):
 
     try:
         logger.info("Connected to Media Organizer DB.")
-        
+
+        # Create metadata_sync_log table if it doesn't exist
+        cursor_media.execute('''
+            CREATE TABLE IF NOT EXISTS metadata_sync_log (
+                id INTEGER PRIMARY KEY,
+                synced_at_utc TEXT NOT NULL
+            );
+        ''')
+        conn_media.commit()
+
+        # Get last copy_all_media_db timestamp from db_updates
+        cursor_media.execute('''
+            SELECT MAX(updated_at_utc) FROM db_updates WHERE update_type = 'copy_all_media_db';
+        ''')
+        last_copy_all_media_db = cursor_media.fetchone()[0]
+
+        # Get last successful sync timestamp from metadata_sync_log
+        cursor_media.execute('''
+            SELECT MAX(synced_at_utc) FROM metadata_sync_log;
+        ''')
+        last_sync_time = cursor_media.fetchone()[0]
+
+        needs_refresh = True
+        if last_copy_all_media_db and last_sync_time:
+            if last_copy_all_media_db <= last_sync_time:
+                needs_refresh = False
+
+        if not needs_refresh:
+            logger.info("No new copy_all_media_db update detected since last sync. Skipping metadata sync.")
+            return
+
         # Attach the Apple Photos database
         cursor_media.execute(f"ATTACH DATABASE '{APPLE_PHOTOS_DB_PATH}' AS photos_db;")
         logger.info("Attached Photos.sqlite database.")
 
-        # Drop local copies if they exist
-        logger.info("Dropping old local copies of ZASSET, ZIMPORTSESSION and ZADDITIONALASSETATTRIBUTES if exist...")
-        cursor_media.execute("DROP TABLE IF EXISTS main.ZASSET;")
-        cursor_media.execute("DROP TABLE IF EXISTS main.ZIMPORTSESSION;")
-        cursor_media.execute("DROP TABLE IF EXISTS main.ZADDITIONALASSETATTRIBUTES;")
-        conn_media.commit()
+        if needs_refresh:
+            # Drop local copies if they exist
+            logger.info("Dropping old local copies of ZASSET, ZIMPORTSESSION and ZADDITIONALASSETATTRIBUTES if exist...")
+            cursor_media.execute("DROP TABLE IF EXISTS main.ZASSET;")
+            cursor_media.execute("DROP TABLE IF EXISTS main.ZIMPORTSESSION;")
+            cursor_media.execute("DROP TABLE IF EXISTS main.ZADDITIONALASSETATTRIBUTES;")
+            conn_media.commit()
 
-        # Create fresh local copies
-        logger.info("Copying ZASSET from Apple Photos...")
-        cursor_media.execute("CREATE TABLE main.ZASSET AS SELECT * FROM photos_db.ZASSET;")
-        
-        logger.info("Copying ZADDITIONALASSETATTRIBUTES from Apple Photos...")
-        cursor_media.execute("CREATE TABLE main.ZADDITIONALASSETATTRIBUTES AS SELECT * FROM photos_db.ZADDITIONALASSETATTRIBUTES;")
-        conn_media.commit()
+            # Create fresh local copies
+            logger.info("Copying ZASSET from Apple Photos...")
+            cursor_media.execute("CREATE TABLE main.ZASSET AS SELECT * FROM photos_db.ZASSET;")
 
-        logger.info("Copied tables successfully.")
+            logger.info("Copying ZADDITIONALASSETATTRIBUTES from Apple Photos...")
+            cursor_media.execute("CREATE TABLE main.ZADDITIONALASSETATTRIBUTES AS SELECT * FROM photos_db.ZADDITIONALASSETATTRIBUTES;")
+            conn_media.commit()
 
-        # Drop and recreate the photos_assets_view
-        logger.info("Dropping and recreating photos_assets_view...")
-        cursor_media.execute("DROP VIEW IF EXISTS main.photos_assets_view;")
-        
-        cursor_media.execute('''
-            CREATE VIEW main.photos_assets_view AS
-            SELECT 
-                a.ZUUID AS uuid,
-                a.ZFILENAME AS filename,
-                aaa.ZORIGINALFILENAME AS original_filename,
-                a.ZIMPORTSESSION AS import_id,
-                datetime(a.ZDATECREATED + 978307200, 'unixepoch') AS creation_datetime_utc,
-                datetime(a.ZADDEDDATE + 978307200, 'unixepoch') AS import_datetime_utc
-            FROM main.ZASSET a
-            LEFT JOIN main.ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK;
-        ''')
-        conn_media.commit()
+            logger.info("Copied tables successfully.")
 
-        logger.info("View photos_assets_view recreated successfully.")
+            # Drop and recreate the photos_assets_view
+            logger.info("Dropping and recreating photos_assets_view...")
+            cursor_media.execute("DROP VIEW IF EXISTS main.photos_assets_view;")
 
-        # Clear and repopulate smart_albums
-        logger.info("Clearing existing smart_albums entries...")
-        cursor_media.execute("DELETE FROM smart_albums;")
-        
-        logger.info("Populating smart_albums from Apple Photos DB...")
-        cursor_media.execute('''
-            INSERT INTO smart_albums (album_pk, album_name, parent_folder_pk, parent_folder_name)
-            SELECT 
-                a.Z_PK, 
-                a.ZTITLE, 
-                a.ZPARENTFOLDER, 
-                p.ZTITLE
-            FROM photos_db.ZGENERICALBUM a
-            LEFT JOIN photos_db.ZGENERICALBUM p ON a.ZPARENTFOLDER = p.Z_PK
-            WHERE a.ZKIND = 1507
-              AND (p.ZTITLE = 'MonthlyExports' OR a.ZPARENTFOLDER = 72235)
-            ORDER BY a.ZTITLE;
-        ''')
-        conn_media.commit()
-        
-        logger.info("Smart albums synced successfully.")
+            cursor_media.execute('''
+                CREATE VIEW main.photos_assets_view AS
+                SELECT 
+                    a.ZUUID AS uuid,
+                    a.ZFILENAME AS filename,
+                    aaa.ZORIGINALFILENAME AS original_filename,
+                    a.ZIMPORTSESSION AS import_id,
+                    datetime(a.ZDATECREATED + 978307200, 'unixepoch') AS creation_datetime_utc,
+                    datetime(a.ZADDEDDATE + 978307200, 'unixepoch') AS import_datetime_utc
+                FROM main.ZASSET a
+                LEFT JOIN main.ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK;
+            ''')
+            conn_media.commit()
 
-        # Clear and repopulate imports table
-        logger.info("Clearing existing import session entries...")
-        cursor_media.execute("DELETE FROM imports;")
+            logger.info("View photos_assets_view recreated successfully.")
 
-        logger.info("Populating imports table from ZIMPORTSESSION...")
-        cursor_media.execute('''
-            INSERT INTO imports (import_uuid, import_name, import_timestamp_utc, album, assets_count)
-            SELECT
-                ZIMPORTSESSION,  -- used as a stand-in for import_uuid
-                datetime((z.ZADDEDDATE + 978307200), 'unixepoch') || ' UTC - ' || ea.ZCAMERAMAKE || '-' || ea.ZCAMERAMODEL,
-                datetime((z.ZADDEDDATE + 978307200), 'unixepoch'),
-                NULL,
-                COUNT(z.Z_ENT)
-            FROM photos_db.ZASSET z
-            LEFT JOIN photos_db.ZEXTENDEDATTRIBUTES ea ON ea.ZASSET = z.Z_PK
-            WHERE z.ZIMPORTSESSION IS NOT NULL
-            GROUP BY z.ZIMPORTSESSION
-            ORDER BY z.ZIMPORTSESSION DESC, z.ZADDEDDATE DESC;
-        ''')
-        conn_media.commit()
+            # Clear and repopulate smart_albums
+            logger.info("Clearing existing smart_albums entries...")
+            cursor_media.execute("DELETE FROM smart_albums;")
 
-        logger.info("Import sessions synced successfully.")
+            logger.info("Populating smart_albums from Apple Photos DB...")
+            cursor_media.execute('''
+                INSERT INTO smart_albums (album_pk, album_name, parent_folder_pk, parent_folder_name)
+                SELECT 
+                    a.Z_PK, 
+                    a.ZTITLE, 
+                    a.ZPARENTFOLDER, 
+                    p.ZTITLE
+                FROM photos_db.ZGENERICALBUM a
+                LEFT JOIN photos_db.ZGENERICALBUM p ON a.ZPARENTFOLDER = p.Z_PK
+                WHERE a.ZKIND = 1507
+                  AND (p.ZTITLE = 'MonthlyExports' OR a.ZPARENTFOLDER = 72235)
+                ORDER BY a.ZTITLE;
+            ''')
+            conn_media.commit()
+
+            logger.info("Smart albums synced successfully.")
+
+            # Clear and repopulate imports table
+            logger.info("Clearing existing import session entries...")
+            cursor_media.execute("DELETE FROM imports;")
+
+            logger.info("Populating imports table from ZIMPORTSESSION...")
+            cursor_media.execute('''
+                INSERT INTO imports (import_uuid, import_name, import_timestamp_utc, album, assets_count)
+                SELECT
+                    ZIMPORTSESSION,  -- used as a stand-in for import_uuid
+                    datetime((z.ZADDEDDATE + 978307200), 'unixepoch') || ' UTC - ' || ea.ZCAMERAMAKE || '-' || ea.ZCAMERAMODEL,
+                    datetime((z.ZADDEDDATE + 978307200), 'unixepoch'),
+                    NULL,
+                    COUNT(z.Z_ENT)
+                FROM photos_db.ZASSET z
+                LEFT JOIN photos_db.ZEXTENDEDATTRIBUTES ea ON ea.ZASSET = z.Z_PK
+                WHERE z.ZIMPORTSESSION IS NOT NULL
+                GROUP BY z.ZIMPORTSESSION
+                ORDER BY z.ZIMPORTSESSION DESC, z.ZADDEDDATE DESC;
+            ''')
+            conn_media.commit()
+
+            logger.info("Import sessions synced successfully.")
+
+            # Insert sync timestamp into metadata_sync_log
+            cursor_media.execute("INSERT INTO metadata_sync_log (synced_at_utc) VALUES (datetime('now'));")
+            conn_media.commit()
 
         # Detach Photos DB
         cursor_media.execute("DETACH DATABASE photos_db;")

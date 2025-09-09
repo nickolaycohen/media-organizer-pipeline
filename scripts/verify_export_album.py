@@ -15,13 +15,12 @@ MODULE_TAG = 'verify_export_album'
 def check_smart_album_exists(cursor, album_name):
     """Check if the Smart Album exists in the Media Organizer DB."""
     cursor.execute('''
-        SELECT 1 FROM smart_albums
-        WHERE album_name = ?
-        LIMIT 1;
-    ''', (album_name,))
-    
-    result = cursor.fetchone()
-    return result is not None
+        SELECT album_name FROM smart_albums
+    ''')
+    albums = [row[0].strip().lower() for row in cursor.fetchall()]
+    logger = logging.getLogger(MODULE_TAG)
+    logger.debug(f"Albums in DB: {albums}")
+    return album_name.strip().lower() in albums
 
 def run_applescript_export(album_name, logger):
     """Run AppleScript export if album exists."""

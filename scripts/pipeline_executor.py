@@ -285,6 +285,16 @@ def main():
             if choice == "y":
                 month = error_batches[0][0]
                 logger.info(f"🔁 Retrying failed batch: {month}")
+                # Reset the batch status to the previous valid code (strip 'E')
+                prev_code = error_batches[0][1]
+                if prev_code and prev_code.endswith('E'):
+                    clean_code = prev_code[:-1]
+                    cursor.execute(
+                        "UPDATE month_batches SET status_code = ? WHERE month = ?",
+                        (clean_code, month)
+                    )
+                    conn.commit()
+                    logger.info(f"♻️ Reset batch {month} status from {prev_code} to {clean_code}")
             else:
                 logger.info("➡️ Proceeding with next eligible batch.")
         if month is None:

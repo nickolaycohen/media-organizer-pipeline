@@ -120,14 +120,14 @@ def main_process(logger):
                 for uuid, import_id in missing_assets:
                     logger.info(f"  ↪️ Missing asset: UUID={uuid}, Import ID={import_id}")
 
-            if month not in existing_batches:
-                logger.info(f"Creating new batch for completed month {month}")
+            if month not in existing_batches or existing_batches[month] is None:
+                logger.info(f"Creating new batch for unprocessed month {month}")
                 create_batch(cursor, month)
             elif existing_batches[month] == 'completed':
                 logger.info(f"Merging new assets for completed batch month {month}")
                 merge_batch(cursor, month)
             else:
-                logger.info(f"Skipping month {month} — batch is still incomplete.")
+                logger.info(f"Skipping month {month} — batch is still incomplete with status {existing_batches[month]}.")
 
         conn.commit()
         logger.info("Monthly batches created/updated successfully.")

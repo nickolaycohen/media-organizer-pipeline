@@ -63,9 +63,10 @@ def run_bootstrap_steps(auto_apply, logger):
     Run the bootstrap steps: copy_all_media_db.py, storage_status.py, sync_photos_metadata.py.
     """
     steps = [
-        ("0.0.0 Copy all media DB", "copy_all_media_db.py", []),
-        ("0.0.1 Check storage status", "storage_status.py", ["--migrate"]),
-        ("0.0.3 Sync metadata", "sync_photos_metadata.py", []),
+        ("0.0 Copy all media DB", "copy_all_media_db.py", []),
+        ("0.1 Check storage status", "storage_status.py", ["--migrate"]),
+        ("0.3 Sync metadata", "sync_photos_metadata.py", []),
+        ("1.0 Generate Batches", "generate_month_batches.py", [])
     ]
     script_dir = os.path.dirname(os.path.abspath(__file__))
     for step_name, script_file, step_args in steps:
@@ -107,9 +108,12 @@ def get_batch_statuses(cursor):
     """)
     return cursor.fetchall()
 
-def get_latest_import_and_month(cursor):
-    # Placeholder: replace with actual logic to fetch latest import and complete month
-    cursor.execute("""
+def get_latest_import_and_month(cursor, transition_type="pipeline"):
+    """
+    Fetch the latest import and complete month for a given transition type.
+    Default is 'pipeline'.
+    """
+    cursor.execute(f"""
         SELECT DISTINCT i.import_uuid, a.month
         FROM imports i
         LEFT JOIN assets a ON a.import_id = i.import_uuid
@@ -119,19 +123,20 @@ def get_latest_import_and_month(cursor):
                 SELECT code
                 FROM batch_status
                 WHERE preceding_code IS NOT NULL
-                AND LENGTH(code) = 3
+                  AND LENGTH(code) = 3
+                  AND transition_type = ?
                 ORDER BY code DESC
                 LIMIT 1
             ) OR m.status_code IS NULL)
-        -- exclude current month to avoid incomplete batch
-        AND a.month < strftime('%Y-%m', 'now')
+          -- exclude current month to avoid incomplete batch
+          AND a.month < strftime('%Y-%m', 'now')
         ORDER BY i.import_uuid DESC, a.month DESC
         LIMIT 1;
-    """)
+    """, (transition_type,))
     return cursor.fetchone()
 
 
-def display_summary(transitions, batches, latest_import, latest_month):
+def display_summary(transitions, batches):
     print("\n=== 📊 Stage Transitions ===")
     for code, prev, desc, ttype, label in transitions:
         print(f"{prev} ➜ {code}: {desc} (Type: {ttype})")
@@ -140,9 +145,10 @@ def display_summary(transitions, batches, latest_import, latest_month):
     for month, status in batches:
         print(f"Month: {month}, Status: {status}")
 
-    print("\n=== 🗓️ Latest Info ===")
-    print(f"Latest Import Month: {latest_import}")
-    print(f"Latest Complete Month: {latest_month}")
+    # TODO - Cannot determine below without knowing the transition type
+    # print("\n=== 🗓️ Latest Info ===")
+    # print(f"Latest Import Month: {latest_import}")
+    # print(f"Latest Complete Month: {latest_month}")
 
 def main(auto_apply):
     logger = setup_logger(LOG_PATH, "pipeline_planner")
@@ -155,13 +161,16 @@ def main(auto_apply):
 
     transitions = get_stage_transitions(cursor)
     batches = get_batch_statuses(cursor)
-    latest_import, latest_month = get_latest_import_and_month(cursor)
+    # TODO - need to fix this - those latest values make sense only when transition type is known
+    # TODO - unless we filtered right here by pipeline type
+    # latest_import, latest_month = get_latest_import_and_month(cursor)
 
-    display_summary(transitions, batches, latest_import, latest_month)
+    display_summary(transitions, batches)
 
     logger.info("=== ✅ Suggested Action ===")
 
     # Fetch all months in descending order
+    # TODO - month selection also should be done after the transition type is determined 
     cursor.execute("SELECT DISTINCT month FROM month_batches ORDER BY month DESC")
     months_descending = [row[0] for row in cursor.fetchall()]
 
@@ -193,12 +202,16 @@ def main(auto_apply):
             elif t[3] == 'pipeline':
                 pipeline_candidates.append((month, t))
 
+    def pick_latest(candidates):
+        # Ensure months are compared as YYYY-MM strings correctly
+        return max(candidates, key=lambda x: (x[0], x[1][0]))
+
     if manual_candidates:
-        selected_month, selected_transition = max(manual_candidates, key=lambda x: x[0])
+        selected_month, selected_transition = pick_latest(manual_candidates)
     elif retryable_candidates:
-        selected_month, selected_transition = max(retryable_candidates, key=lambda x: x[0])
+        selected_month, selected_transition = pick_latest(retryable_candidates)
     elif pipeline_candidates:
-        selected_month, selected_transition = max(pipeline_candidates, key=lambda x: x[0])
+        selected_month, selected_transition = pick_latest(pipeline_candidates)
     else:
         logger.info("No eligible month found with available transitions. Exiting.")
         conn.close()
@@ -296,69 +309,73 @@ def main(auto_apply):
             else:
                 logger.warning(f"Not enough Google Drive space to transition month {latest_399_month} from 399 to 400. Free space: {human_readable_size(free_space)}, Staging size: {human_readable_size(staging_size)}, Latest upload size: {human_readable_size(latest_upload_size)}")
                 # Instead of exiting or skipping, check if pipeline transitions exist for current_status
-                cursor.execute("""
-                    SELECT code, preceding_code, full_description, transition_type, short_label
-                    FROM batch_status
-                    WHERE preceding_code = ?
-                      AND transition_type = 'pipeline'
-                """, (current_status,))
-                pipeline_transitions = cursor.fetchall()
-                logger.info(f"Pipeline transitions available from DB query: {pipeline_transitions}")
-                if pipeline_transitions:
-                    selected_transition = pipeline_transitions[0]
-                    selected_code, selected_prev, selected_desc, selected_type, short_label = selected_transition
-                    logger.info(f"Falling back to pipeline transition: {selected_desc} (status {selected_code})")
-                else:
-                    logger.info("No pipeline transitions available to fall back to after quota check failure.")
-                    conn.close()
-                    sys.exit(0)
+                # TODO - makes no sense to check for pipeline type here 
+                # cursor.execute("""
+                #     SELECT code, preceding_code, full_description, transition_type, short_label
+                #     FROM batch_status
+                #     WHERE preceding_code = ?
+                #       AND transition_type = 'pipeline'
+                # """, (current_status,))
+                # pipeline_transitions = cursor.fetchall()
+                # logger.info(f"Pipeline transitions available from DB query: {pipeline_transitions}")
+                # if pipeline_transitions:
+                #     selected_transition = pipeline_transitions[0]
+                #     selected_code, selected_prev, selected_desc, selected_type, short_label = selected_transition
+                #     logger.info(f"Falling back to pipeline transition: {selected_desc} (status {selected_code})")
+                # else:
+                #     logger.info("No pipeline transitions available to fall back to after quota check failure.")
+                #     conn.close()
+                #     sys.exit(0)
         else:
             logger.info("No months with status 399 found to retry transition.")
 
-    if selected_type == 'pipeline':
-        # Filter only pipeline transitions for display
-        pipeline_transitions = [t for t in transitions if (t[3] == 'pipeline' ) and t[1] == current_status]
+    # if selected_type == 'pipeline':
+    # Ensure we have the latest import/month for pipeline type if selected_type is pipeline
+    latest_import, latest_month = get_latest_import_and_month(cursor, "pipeline") or (None, latest_month)
 
-        if not pipeline_transitions:
-            # Try other months in batches ordered descending, excluding current month
-            other_months = sorted([m for m, s in batches if m != latest_month], reverse=True)
-            found = False
-            for month in other_months:
-                status = None
-                for m, s in batches:
-                    if m == month:
-                        status = s
-                        break
-                if status is None:
-                    continue
-                pt = [t for t in transitions if t[3] == 'pipeline' and t[1] == status]
-                if pt:
-                    pipeline_transitions = pt
-                    latest_month = month
-                    current_status = status
-                    found = True
+    # Filter only pipeline transitions for display
+    pipeline_transitions = [t for t in transitions if (t[3] == 'pipeline' )]
+
+    if not pipeline_transitions:
+        # Try other months in batches ordered descending, excluding current month
+        other_months = sorted([m for m, s in batches if m != latest_month], reverse=True)
+        found = False
+        for month in other_months:
+            status = None
+            for m, s in batches:
+                if m == month:
+                    status = s
                     break
-            if not found:
-                logger.info("No pipeline transitions available for any month. Exiting.")
-                conn.close()
-                sys.exit(0)
+            if status is None:
+                continue
+            pt = [t for t in transitions if t[3] == 'pipeline' and t[1] == status]
+            if pt:
+                pipeline_transitions = pt
+                latest_month = month
+                current_status = status
+                found = True
+                break
+        if not found:
+            logger.info("No pipeline transitions available for any month. Exiting.")
+            conn.close()
+            sys.exit(0)
 
-        transitions_str = get_full_transition_path(pipeline_transitions, current_status)
-        logger.info(f"Run pipeline for: Month={latest_month}, Transitions={transitions_str}")
+    transitions_str = get_full_transition_path(pipeline_transitions, current_status)
+    logger.info(f"Run pipeline for: Month={latest_month}, Transitions={transitions_str}")
 
-        if not auto_apply:
-            proceed = input("Proceed with this plan? [y/N]: ")
-            if proceed.strip().lower() != 'y':
-                logger.info("Aborted by user.")
-                conn.close()
-                sys.exit(0)
+    if not auto_apply:
+        proceed = input("Proceed with this plan? [y/N]: ")
+        if proceed.strip().lower() != 'y':
+            logger.info("Aborted by user.")
+            conn.close()
+            sys.exit(0)
 
-        logger.info("🚀 Executing planned steps...")
-        set_planned_month(cursor, latest_month)
-        conn.commit()
-        logger.info(f"📌 Month {latest_month} recorded in planned_execution for next pipeline run.")
+    logger.info("🚀 Executing planned steps...")
+    set_planned_month(cursor, latest_month)
+    conn.commit()
+    logger.info(f"📌 Month {latest_month} recorded in planned_execution for next pipeline run.")
 
-    elif selected_type not in ['manual', 'retryable', 'pipeline']:
+    if selected_type not in ['manual', 'retryable', 'pipeline']:
         logger.warning(f"Unknown transition type '{selected_type}' for current status {current_status}.")
 
     # TODO: trigger executor or store plan

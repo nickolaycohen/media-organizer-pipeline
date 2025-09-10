@@ -164,7 +164,9 @@ def main():
                     logger.info(f"✅ Successfully applied migration: {migration}")
                 except Exception as e:
                     logger.error(f"❌ Failed to apply migration {migration}: {e}")
-                    break
+                    logger.error("💥 Migration failed — exiting storage_status to prevent further actions.")
+                    conn.close()
+                    sys.exit(1)
     conn.close()
 
 if __name__ == "__main__":

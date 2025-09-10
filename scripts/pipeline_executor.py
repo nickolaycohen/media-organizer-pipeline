@@ -76,6 +76,22 @@ def run_regular_steps(bootstrap_steps, steps, from_index, to_index, dry_run, mon
             logger.warning(f"⚠️ No batch found in status {step.code} — skipping step {step.label}")
             continue
 
+        # --- Begin status check logic ---
+        if current_month and step.code:
+            cur_status = conn.cursor()
+            cur_status.execute("SELECT status_code FROM month_batches WHERE month = ?", (current_month,))
+            row = cur_status.fetchone()
+            if row:
+                batch_status_code = row[0]
+                cursor = conn.cursor()
+                cursor.execute("SELECT preceding_code FROM batch_status WHERE code = ?", (step.code,))
+                expected_prev = cursor.fetchone()
+                expected_prev_code = expected_prev[0] if expected_prev else None
+                if expected_prev_code and batch_status_code != expected_prev_code:
+                    logger.info(f"⏭️ Skipping step {step.label} for month {current_month} as current status {batch_status_code} does not match expected preceding code {expected_prev_code}")
+                    continue
+        # --- End status check logic ---
+
         # Prepare command with current_month replaced if available
         command = [arg.replace("{month}", current_month) if current_month else arg for arg in step.command]
 

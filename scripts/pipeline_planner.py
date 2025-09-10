@@ -90,7 +90,11 @@ def run_bootstrap_steps(auto_apply, logger):
             logger.info(f"✅ Completed: {step_name}")
         except subprocess.CalledProcessError as e:
             logger.error(f"❌ Error in bootstrap step {step_name}: {e}")
-            sys.exit(1)
+            if script_file == "storage_status.py":
+                logger.error("Storage status check failed. Exiting planner due to migration failure.")
+                sys.exit(1)
+            else:
+                sys.exit(1)
 
 def get_stage_transitions(cursor):
     cursor.execute("""

@@ -234,6 +234,7 @@ def main():
         SELECT pipeline_stage, full_description, code, script_name, transition_type
         FROM batch_status
         WHERE code GLOB '[0-9][0-9][0-9]'
+          AND script_name NOT LIKE '%generate_month_batches.py%'
         ORDER BY code
     """)
     rows = cursor.fetchall()

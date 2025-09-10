@@ -1,3 +1,7 @@
+SELECT month, status_code, *
+FROM month_batches
+order by status_code desc, month desc
+
 SELECT (
     SELECT i.import_uuid
     FROM assets a
@@ -160,8 +164,7 @@ from batch_status b
         limit 1;
 
 
-SELECT month, status_code, *
-FROM month_batches
+
 
 
 SELECT code, preceding_code, full_description

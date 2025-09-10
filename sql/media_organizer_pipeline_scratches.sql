@@ -1,4 +1,37 @@
-SELECT DISTINCT i.import_uuid, a.month
+SELECT (
+    SELECT i.import_uuid
+    FROM assets a
+    JOIN imports i ON a.import_id = i.import_uuid
+    WHERE a.month = mb2.month
+    ORDER BY i.import_uuid DESC
+    LIMIT 1
+) AS latest_import,
+mb2.month
+FROM month_batches mb2
+WHERE mb2.month < strftime('%Y-%m', 'now')
+  AND mb2.status_code IS NOT NULL
+  AND EXISTS (
+    SELECT 1 FROM batch_status bs
+    WHERE bs.preceding_code = mb2.status_code
+      AND bs.transition_type = "pipeline"
+      AND bs.code NOT LIKE '%E'
+  )
+ORDER BY mb2.month DESC
+LIMIT 1;
+
+select *
+from batch_status
+
+SELECT code
+FROM batch_status
+WHERE preceding_code IS NOT NULL
+  AND LENGTH(code) = 3
+  AND transition_type = 'pipeline'
+ORDER BY code DESC
+LIMIT 1
+
+
+SELECT DISTINCT i.import_uuid, a.month, a.original_filename 
 FROM imports i
 LEFT JOIN assets a ON a.import_id = i.import_uuid
 LEFT JOIN month_batches m ON m.month = a.month
@@ -8,7 +41,7 @@ AND (m.status_code < (
         FROM batch_status
         WHERE preceding_code IS NOT NULL
           AND LENGTH(code) = 3
-          AND transition_type = ?
+          AND transition_type = 'pipeline'
         ORDER BY code DESC
         LIMIT 1
     ) OR m.status_code IS NULL)

@@ -10,7 +10,8 @@ from utils.utils import get_full_transition_path
 from upload_to_google_photos import check_google_quota
 import argparse
 import sqlite3
-from constants import MEDIA_ORGANIZER_DB_PATH
+from constants import MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_COPY_PATH
+from db.connections import get_connection, get_cursor, commit, close as close_conn
 
 
 def human_readable_size(size_bytes):
@@ -43,11 +44,11 @@ def should_run_sync_metadata(cursor):
     last_sync_time = last_sync[0] if last_sync else None
 
     # Get Apple Photos DB modification time
-    apple_photos_db_path = os.path.expanduser("~/Pictures/Photos Library.photoslibrary/database/Photos.sqlite")
-    if not os.path.exists(apple_photos_db_path):
+    # APPLE_PHOTOS_DB_COPY_PATH = os.path.expanduser("~/Pictures/Photos Library.photoslibrary/database/Photos.sqlite")
+    if not os.path.exists(APPLE_PHOTOS_DB_COPY_PATH):
         return True  # If DB does not exist, better to run sync
 
-    db_mod_time = os.path.getmtime(apple_photos_db_path)
+    db_mod_time = os.path.getmtime(APPLE_PHOTOS_DB_COPY_PATH)
 
     if last_sync_time is None:
         return True
@@ -63,9 +64,10 @@ def run_bootstrap_steps(auto_apply, logger):
     Run the bootstrap steps: copy_all_media_db.py, storage_status.py, sync_photos_metadata.py.
     """
     steps = [
-        ("0.0 Copy all media DB", "copy_all_media_db.py", []),
-        ("0.1 Check storage status", "storage_status.py", ["--migrate"]),
-        ("0.3 Sync metadata", "sync_photos_metadata.py", []),
+        ("0.0 Copy all media DB", "copy_all_media_photos_db.py", []),
+        ("0.1 Run storage manager", "storage_manager_main.py", ["--migrate"]),
+        ("0.2 Sync assets", "sync_photos_raw.py", []),
+        ("0.3 Sync metadata", "sync_photos_derived.py", []),
         ("1.0 Generate Batches", "generate_month_batches.py", [])
     ]
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -85,7 +87,7 @@ def run_bootstrap_steps(auto_apply, logger):
                         continue
                 finally:
                     if conn:
-                        conn.close()
+                        close_conn()
             subprocess.run(["python3", script_path] + step_args, check=True)
             logger.info(f"✅ Completed: {step_name}")
         except subprocess.CalledProcessError as e:
@@ -109,6 +111,7 @@ def get_batch_statuses(cursor):
     cursor.execute("""
         SELECT month, status_code
         FROM month_batches
+        ORDER BY month DESC
     """)
     return cursor.fetchall()
 
@@ -163,8 +166,8 @@ def main(auto_apply):
     for handler in logger.handlers:
         handler.setFormatter(logging.Formatter('%(asctime)s [%(name)s:%(lineno)d] - %(levelname)s - %(message)s'))
 
-    conn = sqlite3.connect(MEDIA_ORGANIZER_DB_PATH)
-    cursor = conn.cursor()
+    conn = get_connection()
+    cursor = get_cursor()
 
     # Run bootstrap steps before proceeding
     run_bootstrap_steps(auto_apply, logger)
@@ -236,7 +239,7 @@ def main(auto_apply):
         selected_month, selected_transition = pick_latest(pipeline_candidates)
     else:
         logger.info("No eligible month found with available transitions. Exiting.")
-        conn.close()
+        close_conn()
         sys.exit(0)
 
     if selected_month and selected_transition:
@@ -245,7 +248,7 @@ def main(auto_apply):
         latest_month = selected_month
     else:
         logger.info("No eligible month found with available transitions. Exiting.")
-        conn.close()
+        close_conn()
         sys.exit(0)
 
     # Handle manual transition logic
@@ -267,7 +270,7 @@ def main(auto_apply):
                     logger.info(f"Month {latest_month} status forcibly updated to {next_status}.")
                 else:
                     logger.warning("No manual transition found from current status.")
-                conn.close()
+                close_conn()
                 sys.exit(0)
             else:
                 logger.info("Manual transition aborted by user. Falling back to retryable or pipeline transitions.")
@@ -291,7 +294,7 @@ def main(auto_apply):
             latest_month = selected_month
         else:
             logger.info("No eligible month found with available transitions after manual transition fallback. Exiting.")
-            conn.close()
+            close_conn()
             sys.exit(0)
 
     if selected_type == 'retryable':
@@ -382,7 +385,7 @@ def main(auto_apply):
 
         if not latest_pipeline_candidate:
             logger.info("No pipeline transitions available for any month. Exiting.")
-            conn.close()
+            close_conn()
             sys.exit(0)
 
         latest_month, current_status = latest_pipeline_candidate
@@ -393,12 +396,46 @@ def main(auto_apply):
         )
         logger.info(f"Run pipeline for: Month={latest_month}, Transitions={full_transition_list}")
 
+        # --- Begin Google quota check for upload transitions ---
+        # Determine if any transition in the pipeline represents an upload to Google (e.g., '210->399')
+        quota_check_needed = any(
+            isinstance(transition, str) and '210->399' in transition
+            or (isinstance(transition, (list, tuple)) and len(transition) >= 1 and '210->399' in str(transition))
+            for transition in full_transition_list
+        )
+        # --- End Google quota check (defer actual check to after user confirmation) ---
+
         if not auto_apply:
             proceed = input("Proceed with this plan? [y/N]: ")
             if proceed.strip().lower() != 'y':
                 logger.info("Aborted by user.")
-                conn.close()
+                close_conn()
                 sys.exit(0)
+
+        # Now, if quota check is needed, perform the actual quota check before executing
+        if quota_check_needed:
+            import glob
+            matched_folders = glob.glob(os.path.join(STAGING_ROOT, f"*{latest_month}*"))
+            if matched_folders:
+                staging_folder = matched_folders[0]
+                staging_size = 0
+                for root, dirs, files in os.walk(staging_folder):
+                    for f in files:
+                        fp = os.path.join(root, f)
+                        staging_size += os.path.getsize(fp)
+                logger.info(f"Detected staging folder for month {latest_month}: {staging_folder}, size: {human_readable_size(staging_size)}")
+            else:
+                staging_folder = None
+                staging_size = 0
+                logger.warning(f"No staging folder found for month {latest_month}")
+            free_space = check_google_quota()
+            if free_space < staging_size:
+                logger.warning(f"Not enough Google Drive space to upload month {latest_month}. Free space: {human_readable_size(free_space)}, Staging size: {human_readable_size(staging_size)}")
+                logger.info("Pipeline transition aborted due to insufficient Google quota.")
+                close_conn()
+                sys.exit(0)
+            else:
+                logger.info(f"Enough Google Drive space available for upload. Free space: {human_readable_size(free_space)}, Staging size: {human_readable_size(staging_size)}")
 
         logger.info("🚀 Executing planned steps...")
         set_planned_month(cursor, latest_month)
@@ -412,7 +449,7 @@ def main(auto_apply):
     # TODO: Decide whether to implement quota filler strategy (partial month uploads).
     # Current pipeline assumes full-month atomicity (399 -> 400).
 
-    conn.close()
+    close_conn()
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()

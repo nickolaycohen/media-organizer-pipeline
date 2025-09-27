@@ -8,7 +8,7 @@ import logging
 from db.queries import get_next_code
 from utils.utils import set_batch_status
 from utils.logger import setup_logger
-from constants import LOG_PATH, MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_PATH
+from constants import LOG_PATH, APPLE_PHOTOS_DB_COPY_PATH
 import sqlite3
 from uuid import uuid4
 import time
@@ -17,6 +17,8 @@ import tzlocal
 from datetime import timezone
 from dataclasses import dataclass
 from typing import List
+from db.connections import get_connection, get_cursor, commit, close as close_conn
+
 
 @dataclass
 class PipelineStep:
@@ -53,14 +55,14 @@ MODULE_TAG = "run_pipeline"
 session_id = str(uuid4())
 logger = setup_logger(LOG_PATH, MODULE_TAG, extra_fields={"session_id": session_id})
 logger.info(f"🆔 Session ID: {session_id}")
+for handler in logger.handlers:
+    handler.setFormatter(logging.Formatter('%(asctime)s [%(name)s:%(lineno)d] - %(levelname)s - %(message)s'))
+
 
 def run_bootstrap_steps(bootstrap_steps, from_index, to_index, dry_run, sync_metadata_label, conn, month):
     for i, step in enumerate(bootstrap_steps):
         if i < from_index or (to_index is not None and i >= to_index):
             continue
-        if step.label == sync_metadata_label:
-            if not should_run_sync_metadata(step.label):
-                continue
         if not run_step(conn, step, dry_run):
             logger.error(f"❌ Pipeline execution halted. Session ID: {session_id}")
             conn.close()
@@ -127,22 +129,47 @@ def run_step(conn, step: PipelineStep, dry_run=False, month=None, command=None):
         logger.info(f"✅ Completed: {step.label}")
         log_execution(conn, step.label, "success", batch_month_id)
         # Always update batch status centrally after a successful step with a valid code
-        if step.code:
-            if month is not None:
-                cursor = conn.cursor()
-                next_code = get_next_code(cursor, step.code)
-                if next_code is not None:
-                    # Check if next_code is a manual type
-                    cursor.execute("SELECT transition_type FROM batch_status WHERE code = ?", (next_code,))
-                    row = cursor.fetchone()
-                    if row and row[0] == 'manual':
-                        logger.info(f"⏸️ Skipping automatic transition to manual status {next_code} for month {month}")
-                    else:
-                        set_batch_status(cursor, month, next_code, session_id=session_id)
+        if step.code and month is not None:
+            cursor = conn.cursor()
+            next_code = get_next_code(cursor, step.code)
+
+            if not next_code:
+                # Look for any pipeline step that has current step as preceding_code (even if added later)
+                cursor.execute("""
+                    SELECT code FROM batch_status
+                    WHERE preceding_code = ? AND transition_type = 'pipeline'
+                    ORDER BY code ASC
+                    LIMIT 1
+                """, (step.code,))
+                row = cursor.fetchone()
+                if row:
+                    next_code = row[0]
+
+            if next_code:
+                cursor.execute("SELECT transition_type FROM batch_status WHERE code = ?", (next_code,))
+                row = cursor.fetchone()
+                transition_type = row[0] if row else None
+                if transition_type != 'manual':
+                    set_batch_status(cursor, month, step.code, session_id=session_id)
+                    logger.info(f"✅ Batch {month} status updated to {next_code}")
+                    # Update imports table with execution_id and status_code
+                    cursor.execute("""
+                        UPDATE imports
+                        SET execution_id = ?, status_code = ?
+                        WHERE import_uuid IN (
+                            SELECT DISTINCT a.import_id
+                            FROM assets a
+                            JOIN month_batches mb ON a.month = mb.month
+                            WHERE mb.month = ?
+                        )
+                    """, (session_id, step.code, month))
+                    logger.info(f"📌 Updated imports for month {month} with execution_id={session_id}, status_code={step.code}")
                     conn.commit()
                 else:
-                    logger.info(f"🎯 Final step reached for month {month}, no status transition needed.")
-                    conn.commit()
+                    logger.info(f"⏸️ Skipping manual transition {step.code}")
+                conn.commit()
+            else:
+                logger.info(f"🎯 Step {step.label} completed; no further pipeline steps for month {month}")
         return True
     except subprocess.CalledProcessError as e:
         logger.error(f"❌ Failed: {step.label} with error: {e}")
@@ -175,48 +202,6 @@ def get_current_quarter_start(dt):
     return dt.replace(minute=minute, second=0, microsecond=0)
 
 
-def should_run_sync_metadata(label):
-    try:
-        db_conn = sqlite3.connect(MEDIA_ORGANIZER_DB_PATH)
-        db_cursor = db_conn.cursor()
-        db_cursor.execute("""
-            SELECT MAX(executed_at_utc) FROM pipeline_executions
-            WHERE label = ? AND status = 'success'
-        """, (label,))
-        result = db_cursor.fetchone()
-        last_successful_run = result[0] if result and result[0] else None
-        if last_successful_run:
-            try:
-                utc_dt = datetime.strptime(last_successful_run, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
-                local_tz = tzlocal.get_localzone()
-                local_dt = utc_dt.astimezone(local_tz)
-                logger.info(f"*** last_successful_run (converted to Local): {local_dt}")
-            except Exception as conv_err:
-                logger.warning(f"⚠️ Failed to convert last_successful_run to local time: {conv_err}")
-        db_conn.close()
-
-        photos_db_mtime = os.path.getmtime(APPLE_PHOTOS_DB_PATH)
-        photos_db_mtime_dt = datetime.fromtimestamp(photos_db_mtime, tz=local_tz)
-        logger.info(f"Latest Apple Photos DB mtime: {photos_db_mtime_dt}")
-
-        now_dt = datetime.now(local_tz)
-        quarter_start = get_current_quarter_start(now_dt.replace(tzinfo=local_tz))
-
-        logger.debug(f"📁 Evaluating whether to run: {label}")
-        logger.debug(f"🕒 Now: {now_dt}")
-        logger.debug(f"🕒 Current 15-min interval start: {quarter_start}")
-        # if local_dt and local_dt >= photos_db_mtime_dt:
-        minutes_since_last_sync = (now_dt - local_dt).total_seconds() / 60
-        logger.info(f"⏱️ Minutes since last sync: {minutes_since_last_sync:.1f}")
-        if minutes_since_last_sync < 15:
-            logger.info(f"Decision: Skipping 0.3 Sync Metadata - last sync was {minutes_since_last_sync:.1f} minutes ago.")
-            return False
-        else:
-            logger.info("Decision: Running 0.3 Sync Metadata.")
-            return True
-    except Exception as e:
-        logger.warning(f"⚠️ Could not evaluate last sync time: {e}")
-        return True
 
 def main():
     dry_run = "--dry-run" in sys.argv
@@ -225,22 +210,13 @@ def main():
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
     # Open a single SQLite connection to be used throughout
-    conn = sqlite3.connect(MEDIA_ORGANIZER_DB_PATH)
-    cursor = conn.cursor()
-
-    # Lookup label for sync_photos_metadata.py step dynamically
-    cursor.execute("""
-        SELECT code, short_label FROM batch_status WHERE script_name LIKE '%sync_photos_metadata.py%'
-    """)
-    row = cursor.fetchone()
-    sync_metadata_label = f"*** sync_metadata_label: {row[0]} {row[1]}" if row else "0.3 Sync Metadata from Photos DB"
-    logger.info(sync_metadata_label)
+    conn = get_connection()
+    cursor = get_cursor()
 
     # Bootstrap: run initial steps before determining which batch to process
     bootstrap_steps = [
         #PipelineStep("0.0.5 Pipeline Status Overview", "", ["python3", os.path.join(SCRIPT_DIR, "pipeline_planner.py")]),
         #PipelineStep("0.1 Storage Status", "", ["python3", os.path.join(SCRIPT_DIR, "storage_status.py"), "--migrate"]),
-        #PipelineStep(sync_metadata_label, "", ["python3", os.path.join(SCRIPT_DIR, "sync_photos_metadata.py")]),
         # PipelineStep("0.4 Sync Assets from Photos DB", "", ["python3", os.path.join(SCRIPT_DIR, "sync_photos_assets.py")]),
         # PipelineStep("1.1 Detect Gaps", "000", ["python3", os.path.join(SCRIPT_DIR, "generate_month_batches.py")]),
     ]
@@ -346,7 +322,7 @@ def main():
                     return 
             logger.info(f"📦 Batch selected: {month}")
 
-    run_bootstrap_steps(bootstrap_steps, from_index, to_index, dry_run, sync_metadata_label, conn, month)
+    run_bootstrap_steps(bootstrap_steps, from_index, to_index, dry_run, None, conn, month)
     run_regular_steps(bootstrap_steps, steps, from_index, to_index, dry_run, month, conn)
 
     # If a planned execution was used, mark it as inactive

@@ -4,37 +4,34 @@ import logging
 import sqlite3
 from datetime import datetime
 
-SOURCE = "/Volumes/Extreme Pro/Photos Library/All-Media.photoslibrary/database/Photos.sqlite"
-DEST = "/Volumes/Macintosh HD/Users/nickolaycohen/Photos Library DB/All-Media-Extreme/database/Photos.sqlite"
-MARKER = DEST + ".lastcopy"
-from constants import MEDIA_ORGANIZER_DB_PATH 
+from constants import MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_PATH, APPLE_PHOTOS_DB_COPY_PATH, APPLE_PHOTOS_DB_MARKER
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [copy_all_media_db] - %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [copy_all_media_photos_db] - %(message)s")
 
 def read_marker():
-    if not os.path.exists(MARKER):
+    if not os.path.exists(APPLE_PHOTOS_DB_MARKER):
         return 0
-    with open(MARKER, "r") as f:
+    with open(APPLE_PHOTOS_DB_MARKER, "r") as f:
         return float(f.read().strip())
 
 def write_marker(src_time):
-    with open(MARKER, "w") as f:
+    with open(APPLE_PHOTOS_DB_MARKER, "w") as f:
         f.write(str(src_time))
 
 def main():
-    if not os.path.exists(SOURCE):
-        logging.error(f"Source DB not found: {SOURCE}")
+    if not os.path.exists(APPLE_PHOTOS_DB_PATH):
+        logging.error(f"Source DB not found: {APPLE_PHOTOS_DB_PATH}")
         return 1
-    if not os.path.exists(os.path.dirname(DEST)):
-        logging.error(f"Destination folder missing: {os.path.dirname(DEST)}")
+    if not os.path.exists(os.path.dirname(APPLE_PHOTOS_DB_COPY_PATH)):
+        logging.error(f"Destination folder missing: {os.path.dirname(APPLE_PHOTOS_DB_COPY_PATH)}")
         return 1
 
-    src_time = os.path.getmtime(SOURCE)
+    src_time = os.path.getmtime(APPLE_PHOTOS_DB_PATH)
 
     last_copied = read_marker()
     if src_time > last_copied:
-        logging.info(f"Copying newer DB from {SOURCE} to {DEST}")
-        shutil.copy2(SOURCE, DEST)
+        logging.info(f"Copying newer DB from {APPLE_PHOTOS_DB_PATH} to {APPLE_PHOTOS_DB_COPY_PATH}")
+        shutil.copy2(APPLE_PHOTOS_DB_PATH, APPLE_PHOTOS_DB_COPY_PATH)
         write_marker(src_time)
         logging.info("✅ Copy complete.")
 
@@ -54,7 +51,7 @@ def main():
             cursor.execute("""
                 INSERT INTO db_updates (update_type, notes)
                 VALUES (?, ?)
-            """, ("copy_all_media_db", f"Copied from {SOURCE}"))
+            """, ("copy_all_media_photos_db", f"Copied from {APPLE_PHOTOS_DB_PATH}"))
             conn.commit()
             logging.info("📒 Recorded DB update in db_updates table.")
         except Exception as e:

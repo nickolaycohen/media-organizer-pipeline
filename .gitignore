@@ -14,3 +14,5 @@ __pycache__
 *.*~
 *~.*
 migrations/.DS_Store
+check_quota/client_secret.json
+media_organizer.sqlite

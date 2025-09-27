@@ -10,6 +10,7 @@ from constants import MEDIA_ORGANIZER_DB_PATH, STAGING_ROOT, LOG_PATH
 from db.queries import get_planned_month
 from utils.logger import setup_logger, compute_file_hash
 from google_photos import create_or_get_album, upload_media
+# from pull_google_favorites import get_album_id
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -203,8 +204,13 @@ def main(args):
                     logger.info(f"Batch {month} marked as partial upload (399) due to Google Drive quota limits.")
 
         album_title = f"Currently Curating - {month}"
-        album_id = create_or_get_album(service, album_title)
-        logger.info(f"Using album: {album_title}")
+        existing_album_id = create_or_get_album(service, album_title)
+        if existing_album_id:
+            album_id = existing_album_id
+            logger.info(f"Using existing album: {album_title} (ID: {album_id})")
+        else:
+            album_id = create_or_get_album(service, album_title)
+            logger.info(f"Created new album: {album_title} (ID: {album_id})")
 
     total_files = len(files)
     for idx, (file_path, file_size) in enumerate(files, start=1):

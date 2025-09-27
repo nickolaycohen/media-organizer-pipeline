@@ -1,3 +1,247 @@
+--update imports 
+--set execution_id = null 
+--where import_uuid = '72720';
+--update imports 
+--set status_code = null 
+--where import_uuid = '72720';
+--update month_batches 
+--set status_code = '000'
+--where "month" = '2025-08';
+
+
+select * 
+from batch_status bs 
+order by bs.code 
+
+select *
+from imports i 
+order by i.import_uuid desc
+
+select * 
+from month_batches mb 
+order by mb."month" desc
+
+select distinct a."month", i2.import_uuid, i2.execution_id, i2.status_code 
+from assets a
+join imports i2 on i2.import_uuid = a.import_id 
+order by a."month" desc
+
+-- inverse query
+-- find for each month how many imports with not null status code
+select distinct a."month"
+from assets a
+join imports i2 on i2.import_uuid = a.import_id 
+where i2.status_code is null
+order by a."month" desc
+--2025-08	1
+--2025-07	1
+--2025-06	4
+--2025-05	4
+--2025-04	3
+--2025-03	1
+--2025-02	2
+--2025-01	7
+--2024-12	28
+
+
+-- inverse query
+-- find for each month how many imports with not null status code
+select distinct a."month", count(distinct i2.import_uuid)
+from assets a
+join imports i2 on i2.import_uuid = a.import_id 
+group by a."month" 
+order by a."month" desc
+
+-- which assets creation months are included in the import
+select distinct i.import_uuid, a."month", i.status_code  
+from imports i
+join assets a on a.import_id = i.import_uuid 
+order by cast(i.import_uuid as integer) desc, a."month" 
+
+
+-- batch manager refactor
+-- find latest import
+select import_uuid, * 
+from imports
+order by import_uuid desc
+-- latest import in 72720
+
+-- which months are included in this import?
+select distinct month 
+from assets a 
+where a.import_id = 72720
+-- 2025-08
+
+
+
+
+SELECT DISTINCT import_datetime_utc FROM photos_assets_view
+WHERE import_datetime_utc IS NOT NULL
+
+
+-- which import id are included in the month
+-- these are months that executor need to update execution_id field 
+SELECT DISTINCT pav.import_id, 
+	(select count(*) from assets a where a.import_id = pav.import_id )
+FROM photos_assets_view pav
+order by import_id desc
+
+
+
+SELECT DISTINCT strftime('%Y-%m', pav.creation_datetime_utc , 'localtime') as month, pav.import_id, 
+	(select count(*) from assets a where a.import_id = pav.import_id ) as count_assets
+--	,(select mb.assets_count from month_batches mb where mb."month" = strftime('%Y-%m', pav.creation_datetime_utc , 'localtime'))
+FROM photos_assets_view pav
+--group by strftime('%Y-%m', pav.creation_datetime_utc , 'localtime')
+order by strftime('%Y-%m', pav.creation_datetime_utc , 'localtime') desc, pav.import_id 
+
+-- which import id are included in the month
+-- these are months that executor need to update execution_id field 
+SELECT DISTINCT pav.import_id, 
+	(select count(*) from assets a where a."month" = '2025-05' and a.import_id = pav.import_id )
+FROM photos_assets_view pav
+WHERE strftime('%Y-%m', import_datetime_utc, 'localtime') = '2025-05'
+
+select mb."month", mb.latest_import_id , *
+from pipeline_executions pe 
+join month_batches mb on mb.id = pe.batch_month_id 
+order by executed_at_utc desc
+
+elect z.ZALLOWEDFORANALYSIS, z.ZIMPORTEDBY, z.ZFACEANALYSISVERSION, z.ZFACEREGIONS
+from ZADDITIONALASSETATTRIBUTES z 
+
+select z.ZMEDIAANALYSISATTRIBUTES, z.ZMOMENT, z.ZPHOTOANALYSISATTRIBUTES 
+from ZASSET z 
+order by 2 desc
+
+select distinct a.month, 
+	(select max(a2.import_id) from assets a2 where a2.month = a.month)
+from assets a 
+order by a."month" desc
+
+-- photo batches script
+select distinct a.month, a.import_id, count(*) as asset_count, 
+	(select i.assets_count from month_batches mb where mb.month = a.month) as mb_asset_count
+from assets a
+join imports i on i.import_uuid = a.import_id  
+group by "month" , a.import_id 
+order by "month" desc, cast(a.import_id as integer) desc
+
+select *
+from imports i 
+order by cast(import_uuid as integer) desc
+
+
+select * 
+from month_batches mb 
+
+SELECT 
+        a.ZUUID AS uuid,
+        a.ZFILENAME AS filename,
+        aaa.ZORIGINALFILENAME AS original_filename,
+        a.ZIMPORTSESSION AS import_id,
+        datetime(a.ZDATECREATED + 978307200, 'unixepoch') AS creation_datetime_utc,
+        datetime(a.ZADDEDDATE + 978307200, 'unixepoch') AS import_datetime_utc
+    FROM main.ZASSET a
+    LEFT JOIN main.ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK;
+
+
+SELECT 
+    a.ZUUID, 
+    a.ZOVERALLAESTHETICSCORE, assets.aesthetic_score,
+    aaa.ZORIGINALFILENAME, 
+    datetime(a.ZDATECREATED + 978307200, 'unixepoch'),
+    datetime(a.ZADDEDDATE + 978307200, 'unixepoch'),
+    a.ZIMPORTSESSION,
+    strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) as month
+FROM ZASSET a
+LEFT JOIN ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK
+LEFT JOIN assets ON assets.asset_id = a.ZUUID
+WHERE a.ZOVERALLAESTHETICSCORE IS NOT NULL
+AND a.ZOVERALLAESTHETICSCORE != 0.5
+AND (
+    a.ZIMPORTSESSION > ?
+    OR a.ZOVERALLAESTHETICSCORE != assets.aesthetic_score
+)
+order by datetime(a.ZDATECREATED + 978307200, 'unixepoch') desc
+
+
+select * 
+from assets a 
+where "month" = '2025-07'
+order by a.imported_date_utc desc
+
+-- get the assets from 72720 import
+select *
+from assets a
+where a.import_id = '72720'
+
+-- 
+delete FROM assets 
+where import_id = '72720'
+
+--  remove assets from the latest import with score 0.5
+select distinct cast(a.import_id as integer)
+from assets a 
+where a.aesthetic_score = 0.5
+order by a.import_id desc, a.imported_date_utc desc
+-- 72720
+-- 72678
+-- 72672
+
+-- find assets with default score
+select a.original_filename, a.import_id, a.imported_date_utc, a.uploaded_to_google, a.google_favorite
+from assets a 
+where a.aesthetic_score = 0.5
+order by a.import_id desc, a.imported_date_utc desc
+
+-- find out what is in latest import
+select *
+from imports 
+order by 2 desc
+-- 145751	2025-09-18 02:55:16	72720	2025-09-18 02:55:16 UTC - Apple-iPhone 13 Pro Max		328
+
+select * 
+from assets
+order by imported_date_utc desc
+
+select datetime(ZADDEDDATE + 978307200, 'unixepoch'), z.ZIMPORTSESSION, z.ZCURATIONSCORE, z.ZOVERALLAESTHETICSCORE, z2.ZORIGINALFILENAME,  * 
+from ZASSET z 
+join ZADDITIONALASSETATTRIBUTES z2 on z2.ZASSET = z.Z_PK 
+where z.ZIMPORTSESSION = 72720
+order by z.ZOVERALLAESTHETICSCORE desc
+
+select datetime(ZADDEDDATE + 978307200, 'unixepoch'), *
+from ZASSET
+order by 1 desc
+
+select count(*)
+from ZADDITIONALASSETATTRIBUTES
+
+select count(*)
+from ZIMPORTSESSION
+
+select *
+from imports 
+order by 2 desc
+
+update db_updates
+set raw_synced = 0
+where id = 14
+
+select *
+from schema_migrations sm 
+
+select * 
+from db_updates
+
+-- check if google_favorites are added to the assets table
+select a.google_favorite, *
+from assets a
+where "month" = "2025-07" and a.google_favorite 
+order by a.aesthetic_score desc
+
+
 SELECT month, status_code, *
 FROM month_batches
 order by status_code desc, month desc

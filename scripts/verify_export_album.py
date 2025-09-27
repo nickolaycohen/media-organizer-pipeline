@@ -6,9 +6,11 @@ import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import subprocess
-from constants import MEDIA_ORGANIZER_DB_PATH, LOG_PATH
+from constants import LOG_PATH
 from utils.logger import setup_logger, close_logger
 from utils.utils import set_batch_status
+from db.connections import get_connection, get_cursor, commit, close as close_conn
+
 
 MODULE_TAG = 'verify_export_album'
 
@@ -46,8 +48,8 @@ def main_process(logger, month=None, dry_run=False):
         sys.exit(1)
 
     # Connect to the Media Organizer DB
-    conn = sqlite3.connect(MEDIA_ORGANIZER_DB_PATH)
-    cursor = conn.cursor()
+    conn = get_connection()
+    cursor = get_cursor()
 
     logger.info(f"Next batch is for {month}. Checking Smart Album...")
 

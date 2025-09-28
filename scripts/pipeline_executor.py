@@ -152,6 +152,15 @@ def run_step(conn, step: PipelineStep, dry_run=False, month=None, command=None):
                 if transition_type != 'manual':
                     set_batch_status(cursor, month, step.code, session_id=session_id)
                     logger.info(f"✅ Batch {month} status updated to {next_code}")
+                    # Log which import_uuids will be updated
+                    cursor.execute("""
+                        SELECT DISTINCT a.import_id
+                        FROM assets a
+                        JOIN month_batches mb ON a.month = mb.month
+                        WHERE mb.month = ?
+                    """, (month,))
+                    import_uuids = [row[0] for row in cursor.fetchall()]
+                    logger.info(f"🔎 Imports to update for month {month}: {import_uuids}")
                     # Update imports table with execution_id and status_code
                     cursor.execute("""
                         UPDATE imports
@@ -169,7 +178,30 @@ def run_step(conn, step: PipelineStep, dry_run=False, month=None, command=None):
                     logger.info(f"⏸️ Skipping manual transition {step.code}")
                 conn.commit()
             else:
-                logger.info(f"🎯 Step {step.label} completed; no further pipeline steps for month {month}")
+                # Final step reached for this month, set batch status and update imports
+                set_batch_status(cursor, month, step.code, session_id=session_id)
+                # Log which import_uuids will be updated
+                cursor.execute("""
+                    SELECT DISTINCT a.import_id
+                    FROM assets a
+                    JOIN month_batches mb ON a.month = mb.month
+                    WHERE mb.month = ?
+                """, (month,))
+                import_uuids = [row[0] for row in cursor.fetchall()]
+                logger.info(f"🔎 Imports to update for month {month}: {import_uuids}")
+                # Update imports table with execution_id and status_code
+                cursor.execute("""
+                    UPDATE imports
+                    SET execution_id = ?, status_code = ?
+                    WHERE import_uuid IN (
+                        SELECT DISTINCT a.import_id
+                        FROM assets a
+                        JOIN month_batches mb ON a.month = mb.month
+                        WHERE mb.month = ?
+                    )
+                """, (session_id, step.code, month))
+                conn.commit()
+                logger.info(f"🏁 Final step reached for month {month}; batch status set and imports updated with execution_id={session_id}, status_code={step.code}")
         return True
     except subprocess.CalledProcessError as e:
         logger.error(f"❌ Failed: {step.label} with error: {e}")

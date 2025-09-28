@@ -16,6 +16,8 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 import google.auth.exceptions
+from datetime import datetime
+
 
 def human_readable_size(size_bytes):
     if size_bytes == 0:
@@ -67,9 +69,7 @@ SUPPORTED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.heic', '.mov', '.mp4'}
 CLIENT_SECRET_FILE = 'secrets/client_secret.json'
 TOKEN_FILE = 'secrets/token.json'
 SCOPES = [
-    'https://www.googleapis.com/auth/photoslibrary.appendonly',
-    'https://www.googleapis.com/auth/photoslibrary.readonly',
-    'https://www.googleapis.com/auth/drive.readonly'
+    'https://www.googleapis.com/auth/photoslibrary.readonly.appcreateddata',
 ]
 def ensure_google_photos_credentials(force_refresh=False):
     creds = None
@@ -280,7 +280,6 @@ def main(args):
     conn.commit()
     conn.close()
 
-    from datetime import datetime
     logger.info(f"✅ Upload process completed at {datetime.utcnow().isoformat()}Z")
 
 def parse_args():

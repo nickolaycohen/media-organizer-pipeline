@@ -6,13 +6,10 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from google.oauth2.credentials import Credentials
 
 SCOPES = [
-    "https://www.googleapis.com/auth/photoslibrary",
-    "https://www.googleapis.com/auth/photoslibrary.readonly"
+    'https://www.googleapis.com/auth/photoslibrary.readonly.appcreateddata',
 ]
 
-
 TOKEN_PATH = 'token.pickle'
-# CREDENTIALS_PATH = 'credentials.json'
 CREDENTIALS_PATH = os.path.join(os.path.dirname(__file__), '../secrets/client_secret.json')
 API_BASE_URL = 'https://photoslibrary.googleapis.com/v1'
 
@@ -58,6 +55,30 @@ def create_or_get_album(creds, album_title):
         return response.json()['id']
     raise Exception(f'Failed to create album: {response.text}')
 
+def get_album_favorites(creds):
+    headers = {'Authorization': f'Bearer {creds.token}', 'Content-type': 'application/json'}
+    url = 'https://photoslibrary.googleapis.com/v1/mediaItems:search'
+    #body = {'albumId': album_id, 'pageSize': 100}
+    body = {'filters': {'featureFilter': {'includedFeatures': ['FAVORITES']}}, 'pageSize': 100}
+
+    favorites = []
+    while True:
+        response = requests.post(url, headers=headers, json=body)
+        if response.status_code != 200:
+            #logger.error(f"Failed to fetch favorites: {response.text}")
+            break
+        data = response.json()
+        # Only keep items marked as favorite
+        for item in data.get('mediaItems', []):
+            if item.get('favorite', False):
+                favorites.append(item)
+        next_page_token = data.get('nextPageToken')
+        if not next_page_token:
+            break
+        body['pageToken'] = next_page_token
+    return favorites
+
+
 def upload_media(creds, file_path, album_id):
     if creds.expired and creds.refresh_token:
         creds.refresh(Request())
@@ -92,3 +113,26 @@ def upload_media(creds, file_path, album_id):
     }, json=create_body)
     if create_response.status_code != 200:
         raise Exception(f'Failed to create media item: {create_response.text}')
+
+def get_all_favorites(creds):
+    #logger.info("📥 Fetching all favorite media items globally...")
+    headers = {'Authorization': f'Bearer {creds.token}', 'Content-type': 'application/json'}
+    url = 'https://photoslibrary.googleapis.com/v1/mediaItems:search'
+    body = {'filters': {'featureFilter': {'includedFeatures': ['FAVORITES']}}, 'pageSize': 100}
+
+    favorites = []
+    while True:
+        response = requests.post(url, headers=headers, json=body)
+        if response.status_code != 200:
+            logger.error(f"Failed to fetch favorites: {response.text}")
+            break
+        data = response.json()
+        favorites.extend(data.get('mediaItems', []))
+        next_page_token = data.get('nextPageToken')
+        if not next_page_token:
+            break
+        body['pageToken'] = next_page_token
+
+    #logger.info(f"✅ Retrieved {len(favorites)} favorite media items globally.")
+
+    return favorites

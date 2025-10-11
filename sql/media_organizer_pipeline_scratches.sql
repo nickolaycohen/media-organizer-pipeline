@@ -8,6 +8,45 @@
 --set status_code = '000'
 --where "month" = '2025-08';
 
+-- let see how many favotires are per month
+
+update assets 
+set uploaded_to_google = 0
+where "month" = '2025-04'
+
+
+select *
+from assets a
+where a.uploaded_to_google =1 and "month" = '2025-03'
+order by a.updated_at_utc desc
+
+
+select count(), a."month" 
+from assets a 
+where a.google_favorite = 1
+group by a."month" 
+order by a."month" desc
+
+select *
+from assets a 
+
+select * 
+from planned_execution pe 
+
+select max(a.updated_at_utc)
+from assets a 
+where a.uploaded_to_google = 1
+and a."month" = '2025-08'
+
+
+select *
+from pipeline_executions pe 
+order by executed_at_utc desc
+
+select * 
+from assets a 
+where a.google_favorite = 1
+order by a.updated_at_utc desc
 
 select * 
 from batch_status bs 
@@ -15,7 +54,9 @@ order by bs.code
 
 select *
 from imports i 
+--where i.execution_id  = 'f4ccf14a-c7dd-4d50-b0e1-b1d9fd8748f8'
 order by i.import_uuid desc
+
 
 select * 
 from month_batches mb 

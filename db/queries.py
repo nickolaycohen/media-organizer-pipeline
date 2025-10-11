@@ -32,12 +32,12 @@ def get_planned_month(cursor):
     """)
     row = cursor.fetchone()
     if not row:
-        logger.info("No active planned month found. Exiting.")
-        conn.close()
+        #logger.info("No active planned month found. Exiting.")
+        #conn.close()
         exit(0)
 
     month = row[0]
-    logger.info(f"Using planned month: {month}")
+    #logger.info(f"Using planned month: {month}")
     return month
 
 # def get_month_batch_album_verified(cursor):

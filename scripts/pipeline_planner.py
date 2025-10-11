@@ -7,11 +7,29 @@ import logging
 from utils.logger import setup_logger
 from constants import LOG_PATH, STAGING_ROOT
 from utils.utils import get_full_transition_path
-from upload_to_google_photos import check_google_quota
+from google_photos import check_google_quota
 import argparse
 import sqlite3
-from constants import MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_COPY_PATH
+from constants import MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_COPY_PATH, LOG_PATH
 from db.connections import get_connection, get_cursor, commit, close as close_conn
+import logging
+import requests
+
+
+SCOPES = [
+    "https://www.googleapis.com/auth/photoslibrary",
+    'https://www.googleapis.com/auth/drive.readonly'
+]
+
+#     "https://www.googleapis.com/auth/photoslibrary.readonly"
+#    'https://www.googleapis.com/auth/photoslibrary.readonly.appcreateddata',
+
+
+
+logger = setup_logger(LOG_PATH, "pipeline_planner")
+for handler in logger.handlers:
+    handler.setFormatter(logging.Formatter('%(asctime)s [%(name)s:%(lineno)d] - %(levelname)s - %(message)s'))
+
 
 
 def human_readable_size(size_bytes):
@@ -161,10 +179,6 @@ def display_summary(transitions, batches):
 
 def main(auto_apply):
     # Set up logger with line number in format
-    import logging
-    logger = setup_logger(LOG_PATH, "pipeline_planner")
-    for handler in logger.handlers:
-        handler.setFormatter(logging.Formatter('%(asctime)s [%(name)s:%(lineno)d] - %(levelname)s - %(message)s'))
 
     conn = get_connection()
     cursor = get_cursor()
@@ -217,7 +231,7 @@ def main(auto_apply):
                 logger.info(f"Found retryable transition candidate for month {month}: {t[2]} (code {t[1]}) -> (code {t[0]})")
                 retryable_candidates.append((month, t))
             elif t[3] == 'pipeline':
-                logger.info(f"Found pipeline transition candidate for month {month}: {t[2]} (code {t[1]}) -> (code {t[0]})")
+                logger.debug(f"Found pipeline transition candidate for month {month}: {t[2]} (code {t[1]}) -> (code {t[0]})")
                 pipeline_candidates.append((month, t))
 
     def pick_latest(candidates):
@@ -255,29 +269,55 @@ def main(auto_apply):
     if selected_type == 'manual':
         logger.info("🔍 Checking for manual transition candidates...")
         logger.info(f"Month {latest_month} is waiting for manual transition ({selected_desc}, status {current_status}).")
-        if not auto_apply:
-            proceed_input = input(f"Please confirm that the '{short_label}' task has been completed so I can move month {latest_month} to the next phase? [y/N]: ")
-            if proceed_input.strip().lower() == 'y':
-                # Find next status code for this manual transition
-                next_status = None
-                for code, prev, desc, ttype, label in transitions:
-                    if prev == current_status and ttype == 'manual':
-                        next_status = code
-                        break
-                if next_status is not None:
-                    cursor.execute("UPDATE month_batches SET status_code = ? WHERE month = ?", (next_status, latest_month))
-                    conn.commit()
-                    logger.info(f"Month {latest_month} status forcibly updated to {next_status}.")
-                else:
-                    logger.warning("No manual transition found from current status.")
-                close_conn()
-                sys.exit(0)
-            else:
-                logger.info("Manual transition aborted by user. Falling back to retryable or pipeline transitions.")
-                selected_type = None
-        else:
-            logger.info("Auto-apply enabled, skipping manual transition prompt. Falling back to retryable or pipeline transitions.")
+        # --- Check how long ago the upload for this month was done ---
+        import datetime
+        # Use the latest updated_at_utc from assets where uploaded_to_google = 1 for this month
+        cursor.execute("""
+            SELECT MAX(a.updated_at_utc)
+            FROM assets a
+            WHERE a.uploaded_to_google = 1
+              AND a.month = ?
+        """, (latest_month,))
+        result = cursor.fetchone()
+        last_completed_at = result[0] if result else None
+        elapsed_days = None
+        if last_completed_at:
+            try:
+                # Assume updated_at_utc is in format 'YYYY-MM-DD HH:MM:SS'
+                last_completed_dt = datetime.datetime.strptime(last_completed_at, "%Y-%m-%d %H:%M:%S")
+                now_utc = datetime.datetime.utcnow()
+                elapsed = now_utc - last_completed_dt
+                elapsed_days = elapsed.total_seconds() / (60 * 60 * 24)
+            except Exception as e:
+                logger.warning(f"Could not parse updated_at_utc ({last_completed_at}): {e}")
+        if elapsed_days is not None and elapsed_days < 3:
+            logger.info(f"Too soon for manual transition: Only {elapsed_days:.2f} days since upload for month {latest_month}. Minimum is 3 days. Skipping manual transition prompt.")
+            # Skip suggesting manual transition, fall back to retryable or pipeline
             selected_type = None
+        else:
+            if not auto_apply:
+                proceed_input = input(f"Please confirm that the '{short_label}' task has been completed so I can move month {latest_month} to the next phase? [y/N]: ")
+                if proceed_input.strip().lower() == 'y':
+                    # Find next status code for this manual transition
+                    next_status = None
+                    for code, prev, desc, ttype, label in transitions:
+                        if prev == current_status and ttype == 'manual':
+                            next_status = code
+                            break
+                    if next_status is not None:
+                        cursor.execute("UPDATE month_batches SET status_code = ? WHERE month = ?", (next_status, latest_month))
+                        conn.commit()
+                        logger.info(f"Month {latest_month} status forcibly updated to {next_status}.")
+                    else:
+                        logger.warning("No manual transition found from current status.")
+                    close_conn()
+                    sys.exit(0)
+                else:
+                    logger.info("Manual transition aborted by user. Falling back to retryable or pipeline transitions.")
+                    selected_type = None
+            else:
+                logger.info("Auto-apply enabled, skipping manual transition prompt. Falling back to retryable or pipeline transitions.")
+                selected_type = None
 
     # If manual transition was not performed, or if we are now at retryable
     if selected_type is None:
@@ -340,7 +380,7 @@ def main(auto_apply):
                     if os.path.exists(file_path):
                         file_size = os.path.getsize(file_path)
                         latest_upload_size += file_size
-                        logger.info(f"Found uploaded asset: {file_path}, size: {human_readable_size(file_size)}")
+                        logger.debug(f"Found uploaded asset: {file_path}, size: {human_readable_size(file_size)}")
             logger.info(f"Total latest upload size for month {latest_399_month}: {human_readable_size(latest_upload_size)}")
 
             if free_space >= staging_size:
@@ -452,6 +492,7 @@ def main(auto_apply):
     close_conn()
 
 if __name__ == '__main__':
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--auto-apply", action="store_true", help="Skip confirmation and apply plan immediately")
     args = parser.parse_args()

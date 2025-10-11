@@ -8,8 +8,9 @@ import argparse
 import hashlib
 from constants import MEDIA_ORGANIZER_DB_PATH, STAGING_ROOT, LOG_PATH
 from db.queries import get_planned_month
+from db.connections import get_connection, get_cursor, commit, close as close_conn
 from utils.logger import setup_logger, compute_file_hash
-from google_photos import create_or_get_album, upload_media
+from google_photos import create_or_get_album, upload_media, human_readable_size, get_google_storage_quota, ensure_google_photos_credentials
 # from pull_google_favorites import get_album_id
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
@@ -17,49 +18,14 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 import google.auth.exceptions
 from datetime import datetime
+import logging
 
 
-def human_readable_size(size_bytes):
-    if size_bytes == 0:
-        return "0B"
-    size_name = ("B", "KB", "MB", "GB", "TB", "PB")
-    i = 0
-    p = 1024
-    while size_bytes >= p and i < len(size_name)-1:
-        size_bytes /= p
-        i += 1
-    return f"{size_bytes:.2f} {size_name[i]}"
-
-def get_google_storage_quota(creds):
-    """
-    Uses Google Drive API to retrieve storage quota (used, total, remaining in bytes).
-    Returns a dict with keys: used, total, remaining (all in bytes).
-    """
-    try:
-        drive_service = build('drive', 'v3', credentials=creds)
-        about = drive_service.about().get(fields='storageQuota').execute()
-        quota = about.get('storageQuota', {})
-        used = int(quota.get('usage', 0))
-        total = int(quota.get('limit', 0))
-        SAFETY_BUFFER = 100 * 1024 * 1024
-        reported_remaining = (total - used) if total > 0 else None
-        remaining = (reported_remaining - SAFETY_BUFFER) if reported_remaining is not None else None
-        if remaining is not None and remaining < 0:
-            remaining = 0
-        logger.info(f"Google Storage Quota - Used: {human_readable_size(used)}, Total: {human_readable_size(total)}, Reported Remaining: {human_readable_size(reported_remaining) if reported_remaining is not None else 'Unlimited or unknown'}, Usable Remaining (with buffer): {human_readable_size(remaining) if remaining is not None else 'Unlimited or unknown'}")
-        return {"used": used, "total": total, "remaining": remaining}
-    except Exception as e:
-        logger.error(f"Failed to retrieve Google storage quota: {e}")
-        return None
-
-def check_google_quota():
-    """
-    Retrieves the remaining Google Drive quota using current credentials.
-    Returns the usable remaining quota in bytes (int), or 0 if retrieval fails.
-    """
-    creds = ensure_google_photos_credentials()
-    quota = get_google_storage_quota(creds)
-    return quota.get("remaining", 0) if quota is not None else 0
+#SCOPES = [
+#    "https://www.googleapis.com/auth/photoslibrary",
+#    "https://www.googleapis.com/auth/photoslibrary.readonly"
+#    'https://www.googleapis.com/auth/photoslibrary.readonly.appcreateddata',
+#]
 
 MODULE_TAG = 'upload_to_google_photos'
 logger = setup_logger(LOG_PATH, MODULE_TAG)
@@ -67,37 +33,15 @@ logger = setup_logger(LOG_PATH, MODULE_TAG)
 SUPPORTED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.heic', '.mov', '.mp4'}
 
 CLIENT_SECRET_FILE = 'secrets/client_secret.json'
-TOKEN_FILE = 'secrets/token.json'
 SCOPES = [
-    'https://www.googleapis.com/auth/photoslibrary.readonly.appcreateddata',
+    "https://www.googleapis.com/auth/photoslibrary.readonly",
 ]
-def ensure_google_photos_credentials(force_refresh=False):
-    creds = None
-    if force_refresh and os.path.exists(TOKEN_FILE):
-        os.remove(TOKEN_FILE)
 
-    if os.path.exists(TOKEN_FILE):
-        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
 
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(Request())
-            except google.auth.exceptions.RefreshError:
-                logger.warning("[Google Photos] Token expired or revoked. Removing token and re-authenticating.")
-                if os.path.exists(TOKEN_FILE):
-                    os.remove(TOKEN_FILE)
-                flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_FILE, SCOPES)
-                creds = flow.run_local_server(port=0, access_type='offline', prompt='consent')
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_FILE, SCOPES)
-            creds = flow.run_local_server(port=0, access_type='offline', prompt='consent')
-        with open(TOKEN_FILE, 'w') as token:
-            token.write(creds.to_json())
-        logger.info(f"[Google Photos] New credentials saved to {TOKEN_FILE}")
 
-    logger.info("[Google Photos] Authentication ready")
-    return creds
+
+
+
 
 def get_files_to_upload(folder_path):
     files = []
@@ -111,10 +55,14 @@ def get_files_to_upload(folder_path):
 
 def main(args):
     logger.info(f"📤 Starting upload to Google Photos for month: {args.month}")
+    for handler in logger.handlers:
+        handler.setFormatter(logging.Formatter('%(asctime)s [%(name)s:%(lineno)d] - %(levelname)s - %(message)s'))
+
 
     month = args.month
-    conn = sqlite3.connect(MEDIA_ORGANIZER_DB_PATH)
-    cursor = conn.cursor()
+    conn = get_connection()
+    cursor = get_cursor()
+
 
     album_path = os.path.join(STAGING_ROOT, month)
     if not os.path.exists(album_path):
@@ -146,7 +94,7 @@ def main(args):
     if args.dry_run:
         logger.info("Dry run enabled. Skipping authentication and upload.")
     else:
-        service = ensure_google_photos_credentials()
+        service = ensure_google_photos_credentials(SCOPES)
         # Retrieve and log Google storage quota
         quota_info = get_google_storage_quota(service)
         if quota_info:
@@ -278,7 +226,7 @@ def main(args):
     #     WHERE month = ?
     # """, (month,))
     conn.commit()
-    conn.close()
+    #conn.close()
 
     logger.info(f"✅ Upload process completed at {datetime.utcnow().isoformat()}Z")
 

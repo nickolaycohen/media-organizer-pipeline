@@ -9,7 +9,7 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
 from constants import LOG_PATH, MEDIA_ORGANIZER_DB_PATH
-from google_photos import create_or_get_album, upload_media, get_all_favorites
+from google_photos import create_or_get_album, get_all_favorites, authenticate
 from utils.logger import setup_logger
 from db.connections import get_connection, get_cursor, commit, close as close_conn
 from upload_to_google_photos import ensure_google_photos_credentials
@@ -24,29 +24,33 @@ for handler in logger.handlers:
 # -------------------- Pull-specific authentication --------------------
 CLIENT_SECRET_FILE = 'secrets/client_secret.json'
 TOKEN_FILE = 'secrets/token.json'
-SCOPES = [
+ALBUM_SCOPES = [
     'https://www.googleapis.com/auth/photoslibrary.readonly.appcreateddata',
 ]
+ALBUM_EDIT_SCOPES = [
+    'https://www.googleapis.com/auth/photoslibrary.edit.appcreateddata',
+]
 
-def ensure_google_photos_credentials1(force_refresh=False):
-    creds = None
-    if force_refresh and os.path.exists(TOKEN_FILE):
-        os.remove(TOKEN_FILE)
 
-    if os.path.exists(TOKEN_FILE):
-        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+# def ensure_google_photos_credentials(force_refresh=False):
+#     creds = None
+#     if force_refresh and os.path.exists(TOKEN_FILE):
+#         os.remove(TOKEN_FILE)
 
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-            logger.info(f"Granted scopes after refresh: {getattr(creds, 'scopes', None)}")
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_FILE, SCOPES)
-            creds = flow.run_local_server(port=0, access_type='offline', prompt='consent')
-        with open(TOKEN_FILE, 'w') as token:
-            token.write(creds.to_json())
-        logger.info(f"Granted scopes after flow: {getattr(creds, 'scopes', None)}")
-    return creds
+#     if os.path.exists(TOKEN_FILE):
+#         creds = Credentials.from_authorized_user_file(TOKEN_FILE, ALBUM_SCOPES)
+
+#     if not creds or not creds.valid:
+#         if creds and creds.expired and creds.refresh_token:
+#             creds.refresh(Request())
+#             logger.info(f"Granted scopes after refresh: {getattr(creds, 'scopes', None)}")
+#         else:
+#             flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_FILE, ALBUM_SCOPES)
+#             creds = flow.run_local_server(port=0, access_type='offline', prompt='consent')
+#         with open(TOKEN_FILE, 'w') as token:
+#             token.write(creds.to_json())
+#         logger.info(f"Granted scopes after flow: {getattr(creds, 'scopes', None)}")
+#     return creds
 
 # -------------------- Existing pull logic --------------------
 
@@ -95,9 +99,7 @@ def get_album_items(creds, album_id):
     return items
 
 
-def get_uploaded_batch_month():
-    #conn = get_connection()
-    cursor = get_cursor()
+def get_uploaded_batch_month(cursor):
     cursor.execute("""
         SELECT planned_month 
         FROM planned_execution 
@@ -108,14 +110,21 @@ def get_uploaded_batch_month():
 
 
 def main():
-    creds = ensure_google_photos_credentials()
-    logger.info("Authenticated with Google Photos (using pull auth flow).")
-    logger.info(f"Granted scopes: {getattr(creds, 'scopes', None)}")
 
-    album_month = get_uploaded_batch_month()
+    # DB calls
+    conn = get_connection()
+    cursor = get_cursor()
+
+    album_month = get_uploaded_batch_month(cursor)
     if not album_month:
         logger.error("No uploaded batch found.")
         return
+
+    # Google API calls
+    # creds = ensure_google_photos_credentials(SCOPES)
+    creds = authenticate(scopes=ALBUM_SCOPES, force_refresh=True)
+    logger.info("Authenticated with Google Photos (using pull auth flow).")
+    logger.info(f"Granted scopes: {getattr(creds, 'scopes', None)}")
 
     album_title = f"Currently Curating - {album_month}"
     album_id = create_or_get_album(creds, album_title)
@@ -143,8 +152,6 @@ def main():
 
     logger.info(f"✅ Matched {len(matched_sorted)} favorites from curated album.")
 
-    conn = get_connection()
-    cursor = get_cursor()
 
     update_count = 0
     for item in matched_sorted:

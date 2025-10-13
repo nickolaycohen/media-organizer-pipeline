@@ -8,11 +8,11 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
-from constants import LOG_PATH, MEDIA_ORGANIZER_DB_PATH
+from constants import LOG_PATH, MEDIA_ORGANIZER_DB_PATH, GOOGLE_PHOTOS_READONLY_SCOPES
 from google_photos import create_or_get_album, get_all_favorites, authenticate
 from utils.logger import setup_logger
 from db.connections import get_connection, get_cursor, commit, close as close_conn
-from upload_to_google_photos import ensure_google_photos_credentials
+from db.queries import get_planned_month
 
 MODULE_TAG = 'pull_google_favorites'
 logger = setup_logger(LOG_PATH, MODULE_TAG)
@@ -21,62 +21,14 @@ for handler in logger.handlers:
         logging.Formatter('%(asctime)s [%(name)s:%(lineno)d] - %(levelname)s - %(message)s')
     )
 
-# -------------------- Pull-specific authentication --------------------
-CLIENT_SECRET_FILE = 'secrets/client_secret.json'
-TOKEN_FILE = 'secrets/token.json'
-ALBUM_SCOPES = [
-    'https://www.googleapis.com/auth/photoslibrary.readonly.appcreateddata',
-]
-ALBUM_EDIT_SCOPES = [
-    'https://www.googleapis.com/auth/photoslibrary.edit.appcreateddata',
-]
-
-
-# def ensure_google_photos_credentials(force_refresh=False):
-#     creds = None
-#     if force_refresh and os.path.exists(TOKEN_FILE):
-#         os.remove(TOKEN_FILE)
-
-#     if os.path.exists(TOKEN_FILE):
-#         creds = Credentials.from_authorized_user_file(TOKEN_FILE, ALBUM_SCOPES)
-
-#     if not creds or not creds.valid:
-#         if creds and creds.expired and creds.refresh_token:
-#             creds.refresh(Request())
-#             logger.info(f"Granted scopes after refresh: {getattr(creds, 'scopes', None)}")
-#         else:
-#             flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_FILE, ALBUM_SCOPES)
-#             creds = flow.run_local_server(port=0, access_type='offline', prompt='consent')
-#         with open(TOKEN_FILE, 'w') as token:
-#             token.write(creds.to_json())
-#         logger.info(f"Granted scopes after flow: {getattr(creds, 'scopes', None)}")
-#     return creds
-
 # -------------------- Existing pull logic --------------------
 
-def get_album_id(creds, album_title):
-    logger.info(f"🔍 Locating album: {album_title}")
-    headers = {'Authorization': f'Bearer {creds.token}'}
-    url = 'https://photoslibrary.googleapis.com/v1/albums'
 
-    while url:
-        response = requests.get(url, headers=headers)
-        if response.status_code != 200:
-            logger.error(f"Failed to list albums: {response.text}")
-            return None
-        data = response.json()
-        for album in data.get('albums', []):
-            if album.get('title') == album_title:
-                logger.info(f"Found album '{album_title}' with ID: {album['id']}")
-                return album['id']
-        page_token = data.get('nextPageToken')
-        url = f'https://photoslibrary.googleapis.com/v1/albums?pageSize=50&pageToken={page_token}' if page_token else None
-
-    logger.warning(f"Album '{album_title}' not found.")
-    return None
-
-
-def get_album_items(creds, album_id):
+def get_album_items(album_id):
+    # This function needs read-only access to get album contents.
+    # The authenticate call inside get_all_favorites will likely handle this,
+    # but for clarity, we can authenticate here as well if needed.
+    creds = authenticate(scopes=GOOGLE_PHOTOS_READONLY_SCOPES)
     logger.info(f"📥 Fetching all media items from album ID: {album_id}")
     headers = {'Authorization': f'Bearer {creds.token}', 'Content-type': 'application/json'}
     url = 'https://photoslibrary.googleapis.com/v1/mediaItems:search'
@@ -99,43 +51,27 @@ def get_album_items(creds, album_id):
     return items
 
 
-def get_uploaded_batch_month(cursor):
-    cursor.execute("""
-        SELECT planned_month 
-        FROM planned_execution 
-        LIMIT 1
-    """)
-    batch_month = cursor.fetchone()
-    return batch_month[0] if batch_month else None
-
-
 def main():
 
     # DB calls
     conn = get_connection()
     cursor = get_cursor()
 
-    album_month = get_uploaded_batch_month(cursor)
+    album_month = get_planned_month(cursor)
     if not album_month:
-        logger.error("No uploaded batch found.")
+        logger.error("No active planned batch found. Please run the planner first.")
         return
-
-    # Google API calls
-    # creds = ensure_google_photos_credentials(SCOPES)
-    creds = authenticate(scopes=ALBUM_SCOPES, force_refresh=True)
-    logger.info("Authenticated with Google Photos (using pull auth flow).")
-    logger.info(f"Granted scopes: {getattr(creds, 'scopes', None)}")
 
     album_title = f"Currently Curating - {album_month}"
-    album_id = create_or_get_album(creds, album_title)
+    album_id = create_or_get_album(album_title)
     if not album_id:
         logger.error(f"Album '{album_title}' not found.")
-        return
+        sys.exit(1)
 
-    all_favorites = get_all_favorites(creds)
+    all_favorites = get_all_favorites()
     logger.info(f"📊 Total favorite items globally: {len(all_favorites)}")
 
-    album_items = get_album_items(creds, album_id)
+    album_items = get_album_items(album_id)
     logger.info(f"📊 Total media items in album '{album_title}': {len(album_items)}")
 
     favorite_set = {(f.get('filename'), f.get('mediaMetadata', {}).get('creationTime')) for f in all_favorites}

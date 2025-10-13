@@ -8,7 +8,13 @@
 --set status_code = '000'
 --where "month" = '2025-08';
 
--- let see how many favotires are per month
+-- get google favorites by month - passed stage 550
+select count(), a."month" 
+from assets a 
+where a.google_favorite = 1
+group by a."month" 
+order by a."month" desc
+
 
 update assets 
 set uploaded_to_google = 0
@@ -19,13 +25,6 @@ select *
 from assets a
 where a.uploaded_to_google =1 and "month" = '2025-03'
 order by a.updated_at_utc desc
-
-
-select count(), a."month" 
-from assets a 
-where a.google_favorite = 1
-group by a."month" 
-order by a."month" desc
 
 select *
 from assets a 
@@ -58,9 +57,6 @@ from imports i
 order by i.import_uuid desc
 
 
-select * 
-from month_batches mb 
-order by mb."month" desc
 
 select distinct a."month", i2.import_uuid, i2.execution_id, i2.status_code 
 from assets a

@@ -1,6 +1,5 @@
 import os, sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-import pickle
 import requests
 from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -9,7 +8,7 @@ import google.auth.exceptions
 from googleapiclient.discovery import build
 import logging
 from utils.logger import setup_logger, compute_file_hash
-from constants import LOG_PATH
+from constants import LOG_PATH, GOOGLE_PHOTOS_GENERAL_SCOPES, GOOGLE_DRIVE_READ_ONLY_SCOPES, GOOGLE_PHOTOS_EDIT_ACCESS_SCOPES, GOOGLE_PHOTOS_READONLY_SCOPES, GOOGLE_PHOTOS_READONLY_SCOPES
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from db.connections import get_connection, get_cursor, commit, close as close_conn
 from db.queries import get_planned_month
@@ -21,34 +20,11 @@ for handler in logger.handlers:
     handler.setFormatter(logging.Formatter('%(asctime)s [%(name)s:%(lineno)d] - %(levelname)s - %(message)s'))
 
 
-SCOPES = [
-    "https://www.googleapis.com/auth/photoslibrary",
-    'https://www.googleapis.com/auth/drive.readonly'
-]
-
-#     "https://www.googleapis.com/auth/photoslibrary.readonly"
-#     'https://www.googleapis.com/auth/photoslibrary.readonly.appcreateddata',
-
-
-DRIVE_SCOPES = [
-    'https://www.googleapis.com/auth/drive.readonly'
-]
-
-TOKEN_PATH = 'token.pickle'
 CREDENTIALS_PATH = os.path.join(os.path.dirname(__file__), '../secrets/client_secret.json')
 API_BASE_URL = 'https://photoslibrary.googleapis.com/v1'
 TOKEN_FILE = 'secrets/token.json'
 CLIENT_SECRET_FILE = 'secrets/client_secret.json'
  
-
-# cursor = get_cursor()
-# month = get_planned_month(cursor)
-# if not month:
-#     logger.error("No uploaded batch found.")
-#     exit()
-# logger.info(f"📤 Starting upload to Google Photos for month: {args.month}")
-# for handler in logger.handlers:
-#     handler.setFormatter(logging.Formatter('%(asctime)s [%(name)s:%(lineno)d] - %(levelname)s - %(message)s'))
 
 def human_readable_size(size_bytes):
     if size_bytes == 0:
@@ -61,36 +37,56 @@ def human_readable_size(size_bytes):
         i += 1
     return f"{size_bytes:.2f} {size_name[i]}"
 
-def authenticate(scopes=SCOPES, force_refresh=False):
-    if force_refresh and os.path.exists(TOKEN_FILE):
-         os.remove(TOKEN_FILE)
+def authenticate(scopes=None, force_refresh=False):
+    if scopes is None:
+        scopes = GOOGLE_PHOTOS_GENERAL_SCOPES
 
     creds = None
-    if os.path.exists(TOKEN_PATH):
-        with open(TOKEN_PATH, 'rb') as token:
-            creds = pickle.load(token)
-    # Log currently loaded scopes if any
-    current_scopes = getattr(creds, "scopes", None) if creds else None
-    print("Loaded token scopes:", current_scopes)
+    if force_refresh and os.path.exists(TOKEN_FILE):
+        os.remove(TOKEN_FILE)
 
-    # Force new login if scopes are missing or token invalid
-    scopes_ok = creds and set(scopes).issubset(set(getattr(creds, "scopes", [])))
-    if not creds or not creds.valid or not scopes_ok:
-        if creds and creds.expired and creds.refresh_token and scopes_ok:
-            creds.refresh(Request())
+    # Check for existing token and validate its scopes
+    if os.path.exists(TOKEN_FILE):
+        try:
+            # Load credentials from file without specifying scopes first
+            loaded_creds = Credentials.from_authorized_user_file(TOKEN_FILE)
+            # Verify that all requested scopes are present in the token.
+            if all(scope in loaded_creds.scopes for scope in scopes):
+                creds = loaded_creds
+            else:
+                logger.warning("[Google Photos] Token found, but missing required scopes. Re-authenticating.")
+                if os.path.exists(TOKEN_FILE):
+                    os.remove(TOKEN_FILE)
+                creds = None  # Force re-authentication
+        except Exception as e:
+            logger.warning(f"[Google Photos] Could not load token file. It might be corrupted or invalid. Re-authenticating. Error: {e}")
+            creds = None
+
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                logger.info("[Google Photos] Credentials expired. Refreshing token...")
+                creds.refresh(Request())
+            except google.auth.exceptions.RefreshError as e:
+                logger.warning("[Google Photos] Token expired or revoked. Removing token and re-authenticating.")
+                logger.error(f"Refresh error: {e}")
+                if os.path.exists(TOKEN_FILE):
+                    os.remove(TOKEN_FILE)
+                flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_FILE, scopes)
+                creds = flow.run_local_server(port=0, access_type='offline', prompt='consent')
         else:
-            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, scopes=scopes)
-            creds = flow.run_local_server(port=0, access_type='offline', prompt='consent')        # Log granted scopes after flow
-        print("Granted scopes after flow:", getattr(creds, "scopes", None))
-        with open(TOKEN_PATH, 'wb') as token:
-            pickle.dump(creds, token)
-    else:
-        # Log valid token scopes if no flow needed
-        print("Token is valid. Active scopes:", getattr(creds, "scopes", None))
+            logger.info("[Google Photos] No valid credentials found. Starting new authentication flow.")
+            flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_FILE, scopes)
+            creds = flow.run_local_server(port=0, access_type='offline', prompt='consent')
+        with open(TOKEN_FILE, 'w') as token:
+            token.write(creds.to_json())
+        logger.info(f"[Google Photos] New credentials saved to {TOKEN_FILE}")
 
+    logger.info("[Google Photos] Authentication ready")
     return creds
 
-def create_or_get_album(creds, album_title):
+def create_or_get_album(album_title):
+    creds = authenticate(scopes=GOOGLE_PHOTOS_READONLY_SCOPES)
     headers = {'Authorization': f'Bearer {creds.token}'}
     albums = []
     page_token = None
@@ -112,53 +108,27 @@ def create_or_get_album(creds, album_title):
 
     # Find all matches
     matches = [a for a in albums if a.get('title') == album_title]
-    mediaCount = matches[0]['mediaItemsCount']
     if matches:
+        album_id = matches[0]['id']
+        media_count = matches[0].get('mediaItemsCount', '0')
         if len(matches) > 1:
-            print(f"⚠️ Multiple albums found with title '{album_title}'. Returning the first one (ID: {matches[0]['id']}).")
+            logger.warning(f"Multiple albums found with title '{album_title}'. Returning the first one (ID: {album_id}).")
         else:
-            print(f"Found existing album '{album_title}' (ID: {matches[0]['id']}). mediaItemsCount: {mediaCount}")
-        return matches[0]['id']
+            logger.info(f"Found existing album '{album_title}' (ID: {album_id}). mediaItemsCount: {media_count}")
+        return album_id
 
     # Create album if not found
     body = {'album': {'title': album_title}}
     response = requests.post(f'{API_BASE_URL}/albums', headers=headers, json=body)
     if response.status_code == 200:
         album_id = response.json()['id']
-        print(f"Created new album '{album_title}' (ID: {album_id}).")
+        logger.info(f"Created new album '{album_title}' (ID: {album_id}).")
         return album_id
     raise Exception(f'Failed to create album: {response.text}')
 
-def get_album_favorites(creds):
-    headers = {'Authorization': f'Bearer {creds.token}', 'Content-type': 'application/json'}
-    url = 'https://photoslibrary.googleapis.com/v1/mediaItems:search'
-    #body = {'albumId': album_id, 'pageSize': 100}
-    body = {'filters': {'featureFilter': {'includedFeatures': ['FAVORITES']}}, 'pageSize': 100}
 
-    favorites = []
-    while True:
-        response = requests.post(url, headers=headers, json=body)
-        if response.status_code != 200:
-            #logger.error(f"Failed to fetch favorites: {response.text}")
-            break
-        data = response.json()
-        # Only keep items marked as favorite
-        for item in data.get('mediaItems', []):
-            if item.get('favorite', False):
-                favorites.append(item)
-        next_page_token = data.get('nextPageToken')
-        if not next_page_token:
-            break
-        body['pageToken'] = next_page_token
-    return favorites
-
-
-def upload_media(creds, file_path, album_id):
-    if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        with open(TOKEN_PATH, 'wb') as token:
-            pickle.dump(creds, token)
-
+def upload_media(file_path, album_id):
+    creds = authenticate(scopes=["https://www.googleapis.com/auth/photoslibrary.appendonly"])
     headers = {
         'Authorization': f'Bearer {creds.token}',
         'Content-type': 'application/octet-stream',
@@ -188,7 +158,8 @@ def upload_media(creds, file_path, album_id):
     if create_response.status_code != 200:
         raise Exception(f'Failed to create media item: {create_response.text}')
 
-def get_all_favorites(creds):
+def get_all_favorites():
+    creds = authenticate(scopes=GOOGLE_PHOTOS_READONLY_SCOPES)
     #logger.info("📥 Fetching all favorite media items globally...")
     headers = {'Authorization': f'Bearer {creds.token}', 'Content-type': 'application/json'}
     url = 'https://photoslibrary.googleapis.com/v1/mediaItems:search'
@@ -216,44 +187,17 @@ def check_google_quota():
     Retrieves the remaining Google Drive quota using current credentials.
     Returns the usable remaining quota in bytes (int), or 0 if retrieval fails.
     """
-    creds = ensure_google_photos_credentials(DRIVE_SCOPES)
-    quota = get_google_storage_quota(creds)
+    creds = authenticate(scopes=GOOGLE_DRIVE_READ_ONLY_SCOPES)
+    quota = get_google_storage_quota()
     return quota.get("remaining", 0) if quota is not None else 0
 
-def ensure_google_photos_credentials(scopes,force_refresh=False):
-    creds = None
-    if force_refresh and os.path.exists(TOKEN_FILE):
-        os.remove(TOKEN_FILE)
-
-    if os.path.exists(TOKEN_FILE):
-        creds = Credentials.from_authorized_user_file(TOKEN_FILE, scopes)
-
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(Request())
-            except google.auth.exceptions.RefreshError:
-                logger.warning("[Google Photos] Token expired or revoked. Removing token and re-authenticating.")
-                if os.path.exists(TOKEN_FILE):
-                    os.remove(TOKEN_FILE)
-                flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_FILE, scopes)
-                creds = flow.run_local_server(port=0, access_type='offline', prompt='consent')
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_FILE, scopes)
-            creds = flow.run_local_server(port=0, access_type='offline', prompt='consent')
-        with open(TOKEN_FILE, 'w') as token:
-            token.write(creds.to_json())
-        logger.info(f"[Google Photos] New credentials saved to {TOKEN_FILE}")
-
-    logger.info("[Google Photos] Authentication ready")
-    return creds
-
-def get_google_storage_quota(creds):
+def get_google_storage_quota():
     """
     Uses Google Drive API to retrieve storage quota (used, total, remaining in bytes).
     Returns a dict with keys: used, total, remaining (all in bytes).
     """
     try:
+        creds = authenticate(scopes=GOOGLE_DRIVE_READ_ONLY_SCOPES)
         drive_service = build('drive', 'v3', credentials=creds)
         about = drive_service.about().get(fields='storageQuota').execute()
         quota = about.get('storageQuota', {})
@@ -269,3 +213,25 @@ def get_google_storage_quota(creds):
     except Exception as e:
         logger.error(f"Failed to retrieve Google storage quota: {e}")
         return None
+
+def list_albums():
+    """
+    Fetches and yields all albums from Google Photos.
+    """
+    creds = authenticate(scopes=["https://www.googleapis.com/auth/photoslibrary.readonly"])
+    headers = {'Authorization': f'Bearer {creds.token}'}
+    url = f'{API_BASE_URL}/albums'
+    page_token = None
+
+    while True:
+        params = {'pageSize': 50}
+        if page_token:
+            params['pageToken'] = page_token
+
+        response = requests.get(url, headers=headers, params=params)
+        response.raise_for_status()  # Will raise an exception for 4xx/5xx status
+        data = response.json()
+        yield from data.get('albums', [])
+        page_token = data.get('nextPageToken')
+        if not page_token:
+            break

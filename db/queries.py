@@ -1,5 +1,6 @@
 # Commenting out below as references to this routine are being depricated
 # def get_month_batch(cursor, current_code):
+from db.connections import close as close_conn
 #     """Get the next eligible batch based on the preceding_code for the given status code."""
 #     cursor.execute('''
 #         SELECT mb.month
@@ -31,14 +32,7 @@ def get_planned_month(cursor):
         LIMIT 1
     """)
     row = cursor.fetchone()
-    if not row:
-        #logger.info("No active planned month found. Exiting.")
-        #conn.close()
-        exit(0)
-
-    month = row[0]
-    #logger.info(f"Using planned month: {month}")
-    return month
+    return row[0] if row else None
 
 # def get_month_batch_album_verified(cursor):
 #     """Get the next pending batch from month_batches."""

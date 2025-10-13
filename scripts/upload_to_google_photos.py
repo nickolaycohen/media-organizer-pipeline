@@ -9,8 +9,8 @@ import hashlib
 from constants import MEDIA_ORGANIZER_DB_PATH, STAGING_ROOT, LOG_PATH
 from db.queries import get_planned_month
 from db.connections import get_connection, get_cursor, commit, close as close_conn
-from utils.logger import setup_logger, compute_file_hash
-from google_photos import create_or_get_album, upload_media, human_readable_size, get_google_storage_quota, ensure_google_photos_credentials
+from utils.logger import setup_logger
+from google_photos import create_or_get_album, upload_media, human_readable_size, check_google_quota, authenticate
 # from pull_google_favorites import get_album_id
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
@@ -19,28 +19,13 @@ from googleapiclient.discovery import build
 import google.auth.exceptions
 from datetime import datetime
 import logging
+from utils.logger import compute_file_hash
 
-
-#SCOPES = [
-#    "https://www.googleapis.com/auth/photoslibrary",
-#    "https://www.googleapis.com/auth/photoslibrary.readonly"
-#    'https://www.googleapis.com/auth/photoslibrary.readonly.appcreateddata',
-#]
 
 MODULE_TAG = 'upload_to_google_photos'
 logger = setup_logger(LOG_PATH, MODULE_TAG)
 
 SUPPORTED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.heic', '.mov', '.mp4'}
-
-CLIENT_SECRET_FILE = 'secrets/client_secret.json'
-SCOPES = [
-    "https://www.googleapis.com/auth/photoslibrary.readonly",
-]
-
-
-
-
-
 
 
 def get_files_to_upload(folder_path):
@@ -94,70 +79,62 @@ def main(args):
     if args.dry_run:
         logger.info("Dry run enabled. Skipping authentication and upload.")
     else:
-        service = ensure_google_photos_credentials(SCOPES)
-        # Retrieve and log Google storage quota
-        quota_info = get_google_storage_quota(service)
-        if quota_info:
-            used_gb = quota_info["used"] / (1024 ** 3)
-            total_gb = quota_info["total"] / (1024 ** 3)
-            if quota_info["remaining"] is not None:
-                remaining_gb = quota_info["remaining"] / (1024 ** 3)
-                logger.info(f"Google Storage Quota: Used {used_gb:.2f} GB / Total {total_gb:.2f} GB / Remaining {remaining_gb:.2f} GB")
-            else:
-                logger.info(f"Google Storage Quota: Used {used_gb:.2f} GB / Total {total_gb:.2f} GB / Remaining: Unlimited or unknown")
+        # Use the centralized quota check, which handles its own authentication
+        remaining_quota_bytes = check_google_quota()
 
-            # Calculate total size of current batch
-            batch_size = sum(size for _, size in files)
-            batch_size_gb = batch_size / (1024 ** 3)
-            logger.info(f"Current batch size: {batch_size_gb:.2f} GB")
+        # Calculate total size of current batch
+        batch_size = sum(size for _, size in files)
+        batch_size_gb = batch_size / (1024 ** 3)
+        logger.info(f"Current batch size: {batch_size_gb:.2f} GB")
 
-            if quota_info["remaining"] is not None and batch_size > quota_info["remaining"]:
-                # Sort files by aesthetic_score descending
-                files_with_scores = []
-                for file_path, file_size in files:
-                    filename = os.path.basename(file_path).lower()
-                    metadata = existing_metadata.get((filename, month), {})
-                    score = metadata.get("aesthetic_score")
-                    if score is None:
-                        score = -float('inf')  # Treat missing score as lowest
-                    files_with_scores.append((file_path, file_size, score))
-                files_with_scores.sort(key=lambda x: x[2], reverse=True)
+        if remaining_quota_bytes is not None and batch_size > remaining_quota_bytes:
+            remaining_gb = remaining_quota_bytes / (1024 ** 3)
+            logger.warning(f"Not enough space on Google Drive to upload the entire batch. Batch requires {batch_size_gb:.2f} GB but only {remaining_gb:.2f} GB is available.")
+            # Sort files by aesthetic_score descending
+            files_with_scores = []
+            for file_path, file_size in files:
+                filename = os.path.basename(file_path).lower()
+                metadata = existing_metadata.get((filename, month), {})
+                score = metadata.get("aesthetic_score")
+                if score is None:
+                    score = -float('inf')  # Treat missing score as lowest
+                files_with_scores.append((file_path, file_size, score))
+            files_with_scores.sort(key=lambda x: x[2], reverse=True)
 
-                selected_files = []
-                total_selected_size = 0
-                remaining_quota = quota_info["remaining"]
-                for file_path, file_size, score in files_with_scores:
-                    if total_selected_size + file_size <= remaining_quota:
-                        selected_files.append((file_path, file_size))
-                        total_selected_size += file_size
-                    else:
-                        break
+            selected_files = []
+            total_selected_size = 0
+            remaining_quota = remaining_quota_bytes
+            for file_path, file_size, score in files_with_scores:
+                if total_selected_size + file_size <= remaining_quota:
+                    selected_files.append((file_path, file_size))
+                    total_selected_size += file_size
+                else:
+                    break
 
-                if not selected_files:
-                    logger.error(f"Not enough space on Google Drive to upload any files. Batch requires {batch_size_gb:.2f} GB but only {remaining_gb:.2f} GB available.")
-                    return
+            if not selected_files:
+                logger.error(f"Not enough space on Google Drive to upload even the smallest file. Aborting upload.")
+                return
 
-                skipped_count = len(files) - len(selected_files)
-                logger.info(f"Selected {len(selected_files)} files to upload based on aesthetic score to fit available quota. Skipped {skipped_count} files.")
-                files = selected_files
+            skipped_count = len(files) - len(selected_files)
+            logger.info(f"Selected {len(selected_files)} files to upload based on aesthetic score to fit available quota. Skipped {skipped_count} files.")
+            files = selected_files
 
-                # Mark batch as partial upload if not all files fit
-                if len(files) < len(get_files_to_upload(album_path)):
-                    cursor.execute("""
-                        UPDATE month_batches
-                        SET status_code = '399'
-                        WHERE month = ?
-                    """, (month,))
-                    conn.commit()
-                    logger.info(f"Batch {month} marked as partial upload (399) due to Google Drive quota limits.")
+            # Mark batch as partial upload if not all files fit
+            if len(files) < len(get_files_to_upload(album_path)):
+                cursor.execute("""
+                    UPDATE month_batches
+                    SET status_code = '399'
+                    WHERE month = ?
+                """, (month,))
+                conn.commit()
+                logger.info(f"Batch {month} marked as partial upload (399) due to Google Drive quota limits.")
 
         album_title = f"Currently Curating - {month}"
-        existing_album_id = create_or_get_album(service, album_title)
-        if existing_album_id:
-            album_id = existing_album_id
-            logger.info(f"Using existing album: {album_title} (ID: {album_id})")
+        album_id = create_or_get_album(album_title)
+        if not album_id:
+            logger.error(f"Could not create or find album '{album_title}'. Aborting upload.")
+            return
         else:
-            album_id = create_or_get_album(service, album_title)
             logger.info(f"Created new album: {album_title} (ID: {album_id})")
 
     total_files = len(files)
@@ -186,7 +163,7 @@ def main(args):
         else:
             try:
                 logger.info(f"[{idx}/{total_files}] Uploading: {filename} ({file_size_mb:.2f} MB)")
-                upload_media(service, file_path, album_id)
+                upload_media(file_path, album_id)
                 logger.info(f"[{idx}/{total_files}] Uploaded: {filename}")
                 cursor.execute("""
                     INSERT INTO assets (
@@ -218,6 +195,8 @@ def main(args):
                 conn.commit()
             except Exception as e:
                 logger.error(f"[{idx}/{total_files}] Failed to upload {filename}: {e}")
+                logger.error("Halting upload process due to error.")
+                sys.exit(1)
 
     # Step 4: Mark batch as uploaded - 
     # cursor.execute("""

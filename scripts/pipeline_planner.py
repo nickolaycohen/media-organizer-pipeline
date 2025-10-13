@@ -16,16 +16,6 @@ import logging
 import requests
 
 
-SCOPES = [
-    "https://www.googleapis.com/auth/photoslibrary",
-    'https://www.googleapis.com/auth/drive.readonly'
-]
-
-#     "https://www.googleapis.com/auth/photoslibrary.readonly"
-#    'https://www.googleapis.com/auth/photoslibrary.readonly.appcreateddata',
-
-
-
 logger = setup_logger(LOG_PATH, "pipeline_planner")
 for handler in logger.handlers:
     handler.setFormatter(logging.Formatter('%(asctime)s [%(name)s:%(lineno)d] - %(levelname)s - %(message)s'))

@@ -93,7 +93,7 @@ def sync_assets(media_cursor, logger):
                     month
                 ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(original_filename, month) DO UPDATE SET aesthetic_score = excluded.aesthetic_score            """, assets_to_insert)
-        media_conn.commit()
+        commit()
 
     logger.info(f"✅ Inserted {inserted_count} new asset records into Media Organizer DB.")
     logger.info(f"ℹ️ Ignored {ignored_count} assets already uploaded or previously imported.")

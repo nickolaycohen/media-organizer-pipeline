@@ -6,32 +6,19 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import logging
 from utils.logger import setup_logger
 from constants import LOG_PATH, STAGING_ROOT
-from utils.utils import get_full_transition_path
+from utils.utils import get_full_transition_path, human_readable_size
 from google_photos import check_google_quota
 import argparse
 import sqlite3
 from constants import MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_COPY_PATH, LOG_PATH
 from db.connections import get_connection, get_cursor, commit, close as close_conn
-import logging
 import requests
+from datetime import timezone
 
 
 logger = setup_logger(LOG_PATH, "pipeline_planner")
 for handler in logger.handlers:
     handler.setFormatter(logging.Formatter('%(asctime)s [%(name)s:%(lineno)d] - %(levelname)s - %(message)s'))
-
-
-
-def human_readable_size(size_bytes):
-    if size_bytes == 0:
-        return "0B"
-    size_name = ("B", "KB", "MB", "GB", "TB")
-    i = 0
-    p = 1024
-    while size_bytes >= p and i < len(size_name)-1:
-        size_bytes /= p
-        i += 1
-    return f"{size_bytes:.2f}{size_name[i]}"
 
 def set_planned_month(cursor, month):
     cursor.execute("DELETE FROM planned_execution")
@@ -46,7 +33,7 @@ def should_run_sync_metadata(cursor):
     cursor.execute("""
         SELECT MAX(executed_at_utc)
         FROM pipeline_executions
-        WHERE label = '0.3 Sync Metadata' AND status = 'success'
+        WHERE (label = '0.3 Sync Metadata' OR label = '0.3 Sync assets' OR label = '0.3 Sync metadata') AND status = 'success'
     """)
     last_sync = cursor.fetchone()
     last_sync_time = last_sync[0] if last_sync else None
@@ -67,7 +54,7 @@ def should_run_sync_metadata(cursor):
     return db_mod_time > last_sync_timestamp
 
 # Helper to run bootstrap steps
-def run_bootstrap_steps(auto_apply, logger):
+def run_bootstrap_steps(cursor, auto_apply, logger):
     """
     Run the bootstrap steps: copy_all_media_db.py, storage_status.py, sync_photos_metadata.py.
     """
@@ -83,19 +70,10 @@ def run_bootstrap_steps(auto_apply, logger):
         script_path = os.path.join(script_dir, script_file)
         logger.info(f"🔧 Running bootstrap step: {step_name} ({script_file})")
         try:
-            if script_file == "sync_photos_metadata.py":
-                conn = None
-                try:
-                    import sqlite3
-                    from constants import MEDIA_ORGANIZER_DB_PATH
-                    conn = sqlite3.connect(MEDIA_ORGANIZER_DB_PATH)
-                    cursor = conn.cursor()
-                    if not should_run_sync_metadata(cursor):
-                        logger.info(f"Skipping {script_file} as sync is up to date.")
-                        continue
-                finally:
-                    if conn:
-                        close_conn()
+            if script_file in ["sync_photos_raw.py", "sync_photos_derived.py", "sync_photos_metadata.py"]:
+                if not should_run_sync_metadata(cursor):
+                    logger.info(f"Skipping {script_file} as sync is up to date.")
+                    continue
             subprocess.run(["python3", script_path] + step_args, check=True)
             logger.info(f"✅ Completed: {step_name}")
         except subprocess.CalledProcessError as e:
@@ -174,7 +152,7 @@ def main(auto_apply):
     cursor = get_cursor()
 
     # Run bootstrap steps before proceeding
-    run_bootstrap_steps(auto_apply, logger)
+    run_bootstrap_steps(cursor, auto_apply, logger)
 
     transitions = get_stage_transitions(cursor)
     batches = get_batch_statuses(cursor)
@@ -275,7 +253,7 @@ def main(auto_apply):
             try:
                 # Assume updated_at_utc is in format 'YYYY-MM-DD HH:MM:SS'
                 last_completed_dt = datetime.datetime.strptime(last_completed_at, "%Y-%m-%d %H:%M:%S")
-                now_utc = datetime.datetime.utcnow()
+                now_utc = datetime.datetime.now(timezone.utc).replace(tzinfo=None)
                 elapsed = now_utc - last_completed_dt
                 elapsed_days = elapsed.total_seconds() / (60 * 60 * 24)
             except Exception as e:
@@ -336,6 +314,10 @@ def main(auto_apply):
         if months_399:
             latest_399_month = months_399[0][0]
             free_space = check_google_quota()
+            if free_space is None:
+                logger.error("❌ Aborting: Could not retrieve Google Drive quota. Please check your connection and credentials.")
+                close_conn()
+                sys.exit(1)
             import glob
 
             matched_folders = glob.glob(os.path.join(STAGING_ROOT, f"*{latest_399_month}*"))
@@ -459,6 +441,10 @@ def main(auto_apply):
                 staging_size = 0
                 logger.warning(f"No staging folder found for month {latest_month}")
             free_space = check_google_quota()
+            if free_space is None:
+                logger.error("❌ Aborting: Could not retrieve Google Drive quota before upload.")
+                close_conn()
+                sys.exit(1)
             if free_space < staging_size:
                 logger.warning(f"Not enough Google Drive space to upload month {latest_month}. Free space: {human_readable_size(free_space)}, Staging size: {human_readable_size(staging_size)}")
                 logger.info("Pipeline transition aborted due to insufficient Google quota.")

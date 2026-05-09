@@ -2,9 +2,33 @@
 
 This pipeline handles the curation, export, and publishing of family photos, from organizing assets in Apple Photos to exporting and sharing curated memories.
 
-Pipeline executor format:
+## 🚀 Quick Start / Daily Workflow
 
-> python3 scripts/pipeline_executor.py --from 0 --to 2
+The pipeline is split into two phases: **Planning** and **Execution**.
+
+### 1. Plan the Session
+
+The planner performs bootstrap syncs (metadata, assets, batches) and analyzes the database to suggest the next logical action.
+
+```bash
+# Interactive mode (recommended)
+python3 scripts/pipeline_planner.py
+
+# Headless mode (automatically applies bootstrap and confirms transitions)
+python3 scripts/pipeline_planner.py --auto-apply
+```
+
+### 2. Execute the Plan
+
+Once a month is "planned," run the executor to perform the actual file operations (exporting, deduplicating, uploading).
+
+```bash
+# Run the planned execution
+python3 scripts/pipeline_executor.py
+
+# Safety check - log actions without performing them
+python3 scripts/pipeline_executor.py --dry-run
+```
 
 ---
 
@@ -194,6 +218,20 @@ Caches Apple Photos Smart Album metadata.
 
 ---
 
+## 🛠️ Utilities
+
+### Reset Batch State
+
+If you need to re-process a month (e.g., you deleted files from Google and want to re-upload), use this script to reset the database flags and status code.
+
+```bash
+python3 scripts/reset_batch_state.py 2026-03
+```
+
+This clears the `uploaded_to_google` and `google_favorite` flags for the month and sets the status back to `210` (Ready to Upload).
+
+---
+
 # ✨ Notes
 
 - **Manual Smart Album creation**: AppleScript cannot create Smart Albums — must be manually created before export.
@@ -211,10 +249,15 @@ Setup virtual environment:
 
 Activate virtual environment:
 
-> source venv/bin/activate
+> source .venv/bin/activate
 
 > pip3 install -r requirements.txt
 
 TODO: Start to think how to handle the reupload of the same month - either because assets count has been changed or because more space is availble on the drive
 
 - in upload scropt - if current status is 399 need to reset the list of uploaded files like 2025-05
+
+Latest observations from 10/11/2025 development:
+
+- older months Ex 2025-02 and 2025-01 do not properly pull the favorites from Google Photos - most likely related to the API deprication and scope. Need to develop a plan to reupload those assets.
+  -- following planner suggestion - 2024-12 should upload new files to Photos ...

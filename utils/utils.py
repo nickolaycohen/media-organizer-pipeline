@@ -1,5 +1,15 @@
 import sqlite3
-from scripts.constants import MEDIA_ORGANIZER_DB_PATH as DB_PATH
+
+def human_readable_size(size_bytes):
+    if size_bytes == 0:
+        return "0B"
+    size_name = ("B", "KB", "MB", "GB", "TB", "PB")
+    i = 0
+    p = 1024
+    while size_bytes >= p and i < len(size_name)-1:
+        size_bytes /= p
+        i += 1
+    return f"{size_bytes:.2f}{size_name[i]}"
 
 def set_batch_status(cursor, month, current_code, success=True, session_id=None):
     """Update the batch status for the given month based on the outcome of a step."""
@@ -37,17 +47,12 @@ def set_batch_status(cursor, month, current_code, success=True, session_id=None)
         print(f"[DB] ❌ Failed to update status for {month}: {e}")
 
 def get_full_transition_path(transitions, current_status):
-    """
-    Walks through all transitions linearly until no more next step is found.
-    Returns a list of transitions like ['000->100', '100->200', '200->210'].
-    """
     path = []
     status = current_status
     while True:
         next_steps = [code for code, prev, *_ in transitions if prev == status]
         if not next_steps:
             break
-        # assume linear pipeline (one valid next step at a time)
         next_code = next_steps[0]
         path.append(f"{status}->{next_code}")
         status = next_code

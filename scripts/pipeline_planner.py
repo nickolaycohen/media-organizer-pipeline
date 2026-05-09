@@ -1,6 +1,7 @@
 import sys
 import os
 import subprocess
+import re
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import logging
@@ -133,7 +134,25 @@ def check_active_sources_import_status(cursor, auto_apply):
             model, count, f_min, f_max, d_min, d_max = row
             if count > 0:
                 found_models.add(model)
-                logger.info(f"📸 Source: {model:20} | Count: {count:4} | Files: {f_min} -> {f_max} | Dates: {d_min} to {d_max}")
+
+                # Reasonability check: parse numeric part from filenames (ignoring extensions)
+                num_min = None
+                num_max = None
+                if f_min:
+                    nums = re.findall(r'(\d+)', os.path.splitext(f_min)[0])
+                    if nums: num_min = int(nums[-1])
+                if f_max:
+                    nums = re.findall(r'(\d+)', os.path.splitext(f_max)[0])
+                    if nums: num_max = int(nums[-1])
+
+                gap_info = ""
+                if num_min is not None and num_max is not None:
+                    # We use abs because string MIN/MAX might flip if sequence is not zero-padded
+                    expected_range = abs(num_max - num_min) + 1
+                    if expected_range > count:
+                        gap_info = f" | ⚠️ Reasonability: {expected_range} expected vs {count} found (gap of {expected_range - count})"
+
+                logger.info(f"📸 Source: {model:20} | Count: {count:4} | Files: {f_min} -> {f_max} | Dates: {d_min} to {d_max}{gap_info}")
 
         missing_models = set(ACTIVE_CAMERA_MODELS) - found_models
 

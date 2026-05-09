@@ -8,8 +8,7 @@ import google.auth.exceptions
 from googleapiclient.discovery import build
 import logging
 from utils.logger import setup_logger, compute_file_hash
-from constants import LOG_PATH, GOOGLE_PHOTOS_GENERAL_SCOPES, GOOGLE_DRIVE_READ_ONLY_SCOPES, GOOGLE_PHOTOS_EDIT_ACCESS_SCOPES, GOOGLE_PHOTOS_READONLY_SCOPES, GOOGLE_PHOTOS_READONLY_SCOPES
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from constants import LOG_PATH, GOOGLE_DRIVE_READ_ONLY_SCOPES, GOOGLE_PHOTOS_APPEND_ONLY_SCOPES, GOOGLE_PHOTOS_READONLY_SCOPES, PLANNER_REQUIRED_SCOPES
 from db.connections import get_connection, get_cursor, commit, close as close_conn
 from db.queries import get_planned_month
 
@@ -19,12 +18,10 @@ logger = setup_logger(LOG_PATH, MODULE_TAG)
 for handler in logger.handlers:
     handler.setFormatter(logging.Formatter('%(asctime)s [%(name)s:%(lineno)d] - %(levelname)s - %(message)s'))
 
-
-CREDENTIALS_PATH = os.path.join(os.path.dirname(__file__), '../secrets/client_secret.json')
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 API_BASE_URL = 'https://photoslibrary.googleapis.com/v1'
-TOKEN_FILE = 'secrets/token.json'
-CLIENT_SECRET_FILE = 'secrets/client_secret.json'
- 
+TOKEN_FILE = os.path.abspath(os.path.join(SCRIPT_DIR, '../secrets/token.json'))
+CLIENT_SECRET_FILE = os.path.abspath(os.path.join(SCRIPT_DIR, '../secrets/client_secret.json'))
 
 def human_readable_size(size_bytes):
     if size_bytes == 0:
@@ -39,11 +36,10 @@ def human_readable_size(size_bytes):
 
 def authenticate(scopes=None, force_refresh=False):
     if scopes is None:
-        scopes = GOOGLE_PHOTOS_GENERAL_SCOPES
+        logger.error("[Google Photos] Authenticate called without specifying scopes. This is not allowed.")
+        raise ValueError("Scopes must be provided to the authenticate function.")
 
     creds = None
-    if force_refresh and os.path.exists(TOKEN_FILE):
-        os.remove(TOKEN_FILE)
 
     # Check for existing token and validate its scopes
     if os.path.exists(TOKEN_FILE):
@@ -54,7 +50,8 @@ def authenticate(scopes=None, force_refresh=False):
             if all(scope in loaded_creds.scopes for scope in scopes):
                 creds = loaded_creds
             else:
-                logger.warning("[Google Photos] Token found, but missing required scopes. Re-authenticating.")
+                missing = [s for s in scopes if s not in loaded_creds.scopes]
+                logger.warning(f"[Google Photos] Token missing required scopes: {missing}. Re-authenticating.")
                 if os.path.exists(TOKEN_FILE):
                     os.remove(TOKEN_FILE)
                 creds = None  # Force re-authentication
@@ -67,6 +64,10 @@ def authenticate(scopes=None, force_refresh=False):
             try:
                 logger.info("[Google Photos] Credentials expired. Refreshing token...")
                 creds.refresh(Request())
+                # Save the refreshed token immediately to prevent stale token usage
+                with open(TOKEN_FILE, 'w') as token:
+                    token.write(creds.to_json())
+                logger.info(f"[Google Photos] Refreshed credentials saved to {TOKEN_FILE}")
             except google.auth.exceptions.RefreshError as e:
                 logger.warning("[Google Photos] Token expired or revoked. Removing token and re-authenticating.")
                 logger.error(f"Refresh error: {e}")
@@ -82,11 +83,16 @@ def authenticate(scopes=None, force_refresh=False):
             token.write(creds.to_json())
         logger.info(f"[Google Photos] New credentials saved to {TOKEN_FILE}")
 
-    logger.info("[Google Photos] Authentication ready")
+    # Final validation: log exactly what scopes were granted by the server
+    granted_scopes = getattr(creds, 'scopes', [])
+    logger.info(f"[Google Photos] Authentication ready. Scopes granted: {granted_scopes}")
+    
+    if not all(scope in granted_scopes for scope in scopes):
+        logger.error(f"❌ CRITICAL: The user did not grant all requested scopes. Missing: {[s for s in scopes if s not in granted_scopes]}")
+
     return creds
 
-def create_or_get_album(album_title):
-    creds = authenticate(scopes=GOOGLE_PHOTOS_READONLY_SCOPES)
+def create_or_get_album(creds, album_title):
     headers = {'Authorization': f'Bearer {creds.token}'}
     albums = []
     page_token = None
@@ -118,6 +124,11 @@ def create_or_get_album(album_title):
         return album_id
 
     # Create album if not found
+    # We use PLANNER_REQUIRED_SCOPES to ensure we don't lose existing library/drive access
+    logger.info(f"Album '{album_title}' not found. Ensuring credentials have required permissions to create...")
+    creds = authenticate(scopes=PLANNER_REQUIRED_SCOPES)
+
+    headers = {'Authorization': f'Bearer {creds.token}'} # IMPORTANT: Re-create headers with the new token
     body = {'album': {'title': album_title}}
     response = requests.post(f'{API_BASE_URL}/albums', headers=headers, json=body)
     if response.status_code == 200:
@@ -127,8 +138,7 @@ def create_or_get_album(album_title):
     raise Exception(f'Failed to create album: {response.text}')
 
 
-def upload_media(file_path, album_id):
-    creds = authenticate(scopes=["https://www.googleapis.com/auth/photoslibrary.appendonly"])
+def upload_media(creds, file_path, album_id):
     headers = {
         'Authorization': f'Bearer {creds.token}',
         'Content-type': 'application/octet-stream',
@@ -158,46 +168,59 @@ def upload_media(file_path, album_id):
     if create_response.status_code != 200:
         raise Exception(f'Failed to create media item: {create_response.text}')
 
-def get_all_favorites():
-    creds = authenticate(scopes=GOOGLE_PHOTOS_READONLY_SCOPES)
-    #logger.info("📥 Fetching all favorite media items globally...")
+def get_all_favorites(creds):
     headers = {'Authorization': f'Bearer {creds.token}', 'Content-type': 'application/json'}
-    url = 'https://photoslibrary.googleapis.com/v1/mediaItems:search'
-    body = {'filters': {'featureFilter': {'includedFeatures': ['FAVORITES']}}, 'pageSize': 100}
+
+    url = f'{API_BASE_URL}/mediaItems:search'
+    body = {
+        'filters': {
+            'includeArchivedMedia': True,
+            'featureFilter': {'includedFeatures': ['FAVORITES']}
+        },
+        'pageSize': 100
+    }
 
     favorites = []
+    page_count = 0
+
     while True:
+        page_count += 1
+        logger.info(f"[Google Photos API] POST mediaItems:search (Page {page_count}) - Fetching favorites data...")
         response = requests.post(url, headers=headers, json=body)
         if response.status_code != 200:
-            logger.error(f"Failed to fetch favorites: {response.text}")
+            logger.error(f"[Google Photos API] Error fetching favorites: {response.status_code} - {response.text}")
             break
         data = response.json()
-        favorites.extend(data.get('mediaItems', []))
+        items = data.get('mediaItems', [])
+        favorites.extend(items)
+
         next_page_token = data.get('nextPageToken')
         if not next_page_token:
             break
         body['pageToken'] = next_page_token
 
-    #logger.info(f"✅ Retrieved {len(favorites)} favorite media items globally.")
-
+    logger.info(f"✅ Finished fetching favorites data. Total favorites found: {len(favorites)}")
     return favorites
 
-def check_google_quota():
+def check_google_quota(creds=None):
     """
     Retrieves the remaining Google Drive quota using current credentials.
     Returns the usable remaining quota in bytes (int), or 0 if retrieval fails.
     """
-    creds = authenticate(scopes=GOOGLE_DRIVE_READ_ONLY_SCOPES)
-    quota = get_google_storage_quota()
-    return quota.get("remaining", 0) if quota is not None else 0
+    if creds is None:
+        # Default to PLANNER_REQUIRED_SCOPES to avoid overwriting a broad token 
+        # with a narrow one (Scope Thrashing).
+        creds = authenticate(scopes=PLANNER_REQUIRED_SCOPES)
 
-def get_google_storage_quota():
+    quota = get_google_storage_quota(creds)
+    return quota.get("remaining", 0) if quota is not None else None
+
+def get_google_storage_quota(creds):
     """
     Uses Google Drive API to retrieve storage quota (used, total, remaining in bytes).
     Returns a dict with keys: used, total, remaining (all in bytes).
     """
     try:
-        creds = authenticate(scopes=GOOGLE_DRIVE_READ_ONLY_SCOPES)
         drive_service = build('drive', 'v3', credentials=creds)
         about = drive_service.about().get(fields='storageQuota').execute()
         quota = about.get('storageQuota', {})
@@ -214,11 +237,10 @@ def get_google_storage_quota():
         logger.error(f"Failed to retrieve Google storage quota: {e}")
         return None
 
-def list_albums():
+def list_albums(creds):
     """
     Fetches and yields all albums from Google Photos.
     """
-    creds = authenticate(scopes=["https://www.googleapis.com/auth/photoslibrary.readonly"])
     headers = {'Authorization': f'Bearer {creds.token}'}
     url = f'{API_BASE_URL}/albums'
     page_token = None

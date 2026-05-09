@@ -7,14 +7,15 @@ import logging
 from utils.logger import setup_logger
 from constants import LOG_PATH, STAGING_ROOT
 from utils.utils import get_full_transition_path, human_readable_size
-from google_photos import check_google_quota
+from google_photos import check_google_quota, authenticate, get_all_favorites
 import argparse
 import sqlite3
-from constants import MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_COPY_PATH, LOG_PATH
+from constants import MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_COPY_PATH, LOG_PATH, GOOGLE_PHOTOS_READONLY_SCOPES, GOOGLE_DRIVE_READ_ONLY_SCOPES, PLANNER_REQUIRED_SCOPES
+from constants import ACTIVE_CAMERA_MODELS
 from db.connections import get_connection, get_cursor, commit, close as close_conn
 import requests
-from datetime import timezone
-
+from datetime import timezone, datetime, timedelta
+ 
 
 logger = setup_logger(LOG_PATH, "pipeline_planner")
 for handler in logger.handlers:
@@ -48,8 +49,7 @@ def should_run_sync_metadata(cursor):
     if last_sync_time is None:
         return True
 
-    import datetime
-    last_sync_timestamp = datetime.datetime.strptime(last_sync_time, "%Y-%m-%d %H:%M:%S").timestamp()
+    last_sync_timestamp = datetime.strptime(last_sync_time, "%Y-%m-%d %H:%M:%S").timestamp()
 
     return db_mod_time > last_sync_timestamp
 
@@ -83,6 +83,107 @@ def run_bootstrap_steps(cursor, auto_apply, logger):
                 sys.exit(1)
             else:
                 sys.exit(1)
+
+def check_active_sources_import_status(cursor, auto_apply):
+    """
+    Checks if all active camera models have imported assets for the latest complete month.
+    Prompts user if any active source is missing.
+    """
+    if not ACTIVE_CAMERA_MODELS:
+        logger.info("No active camera models configured. Skipping active source check.")
+        return True
+
+    # Determine the latest complete month (e.g., April if current month is May)
+    latest_complete_month = datetime.now().replace(day=1) - timedelta(days=1)
+    latest_complete_month_str = latest_complete_month.strftime('%Y-%m')
+
+    logger.info(f"🔍 Checking active source imports for latest complete month: {latest_complete_month_str}")
+
+    # Attach the Apple Photos database
+    try:
+        cursor.execute(f"ATTACH DATABASE '{APPLE_PHOTOS_DB_COPY_PATH}' AS photos_db;")
+        logger.debug("Attached Photos.sqlite database for active source check.")
+
+        query = """
+            SELECT DISTINCT xa.ZCAMERAMODEL
+            FROM photos_db.ZASSET a
+            JOIN photos_db.ZEXTENDEDATTRIBUTES xa ON xa.ZASSET = a.Z_PK
+            WHERE a.ZTRASHEDSTATE = 0
+              AND xa.ZCAMERAMODEL IN ({})
+              AND strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch')) = ?
+        """.format(','.join(['?' for _ in ACTIVE_CAMERA_MODELS]))
+
+        cursor.execute(query, ACTIVE_CAMERA_MODELS + [latest_complete_month_str])
+        found_models = {row[0] for row in cursor.fetchall()}
+
+        missing_models = set(ACTIVE_CAMERA_MODELS) - found_models
+
+        if missing_models:
+            logger.warning(f"⚠️ Missing imports for active camera models in {latest_complete_month_str}: {', '.join(missing_models)}")
+            if not auto_apply:
+                proceed_input = input("Some active sources are missing imports for the latest complete month. Do you want to proceed? [y/N]: ")
+                if proceed_input.strip().lower() != 'y':
+                    logger.info("Operation aborted by user due to missing active source imports.")
+                    sys.exit(0)
+            else:
+                logger.error("❌ Auto-apply aborted: Missing active source imports for the latest complete month. Manual intervention required.")
+                sys.exit(1)
+        else:
+            logger.info(f"✅ All active camera models have imports for {latest_complete_month_str}.")
+    finally:
+        cursor.execute("DETACH DATABASE photos_db;")
+        logger.debug("Detached Photos.sqlite database.")
+    return True
+
+def check_favorites_count(cursor, month, check_remote=False, all_favs=None, creds=None, verbose=True):
+    """
+    Checks for favorites in local DB or optionally Google Photos API.
+    Used to verify readiness for manual transitions or pull/ranking steps.
+    """
+    cursor.execute("SELECT original_filename FROM assets WHERE month = ? AND google_favorite = 1", (month,))
+    local_fav_names = [row[0] for row in cursor.fetchall()]
+    local_count = len(local_fav_names)
+    
+    if local_count > 0 or not check_remote:
+        if verbose:
+            logger.info(f"📊 Favorites check for {month}: Found {local_count} starred assets in local database.")
+        return local_count, "local", local_fav_names
+        
+    try:
+        if verbose: logger.info(f"🌐 Local database has 0 favorites for {month}. Calling Google Photos API to verify curation status...")
+        if all_favs is None:
+            if creds is None:
+                creds = authenticate(scopes=GOOGLE_PHOTOS_READONLY_SCOPES)
+            all_favs = get_all_favorites(creds)
+        else:
+            if verbose: logger.info(f"Using {len(all_favs)} cached favorites from current session.")
+        if verbose: logger.info(f"✅ API Response: {len(all_favs)} total favorites retrieved from account.")
+        
+        cursor.execute("SELECT original_filename, date_created_utc FROM assets WHERE month = ?", (month,))
+        local_assets = cursor.fetchall()
+        
+        fav_signatures = set()
+        for f in all_favs:
+            fname = f.get('filename')
+            q_time = f.get('mediaMetadata', {}).get('creationTime', '')
+            if fname and q_time:
+                ts = q_time.replace('T', ' ').split('.')[0]
+                fav_signatures.add((fname, ts))
+        
+        remote_count = 0
+        matched_files = []
+        for fname, ts in local_assets:
+            if (fname, ts) in fav_signatures:
+                remote_count += 1
+                matched_files.append(fname)
+        if matched_files and verbose:
+            logger.info(f"✨ Successfully matched remote favorites: {matched_files}")
+        if verbose:
+            logger.info(f"📊 Cross-reference result for {month}: Found {remote_count} assets matching global favorites list.")
+        return remote_count, "remote", matched_files
+    except Exception as e:
+        logger.warning(f"Could not verify remote favorites: {e}")
+        return 0, "error", []
 
 def get_stage_transitions(cursor):
     cursor.execute("""
@@ -154,6 +255,12 @@ def main(auto_apply):
     # Run bootstrap steps before proceeding
     run_bootstrap_steps(cursor, auto_apply, logger)
 
+    # Check active sources import status
+    check_active_sources_import_status(cursor, auto_apply)
+
+    # Shared credentials for all Google API calls in this planner session
+    creds = authenticate(scopes=PLANNER_REQUIRED_SCOPES)
+
     transitions = get_stage_transitions(cursor)
     batches = get_batch_statuses(cursor)
     # TODO - need to fix this - those latest values make sense only when transition type is known
@@ -173,6 +280,7 @@ def main(auto_apply):
     manual_candidates = []
     retryable_candidates = []
     pipeline_candidates = []
+    remote_favs_cache = None
 
     for month in months_descending:
         month_status = None
@@ -182,6 +290,44 @@ def main(auto_apply):
                 break
         if month_status is None:
             continue
+
+        # --- NEW: Manual Upload Detection / Fast-Forward Logic ---
+        # If the month is in an early stage but we suspect it might have been manually uploaded,
+        # check for remote favorites.
+        if month_status < '550':
+            # Only fetch remote favorites once per planner run
+            if remote_favs_cache is None:
+                try:
+                    logger.info("🌐 Fetching remote favorites from Google Photos API to detect potential manual uploads...")
+                    remote_favs_cache = get_all_favorites(creds)
+                except Exception as e:
+                    logger.warning(f"Failed to pre-fetch remote favorites: {e}")
+                    remote_favs_cache = []
+
+            fav_count, source, fav_names = check_favorites_count(cursor, month, check_remote=True, all_favs=remote_favs_cache, creds=creds, verbose=False)
+            if source == 'remote' and fav_count > 0:
+                logger.info(f"✨ [Manual Upload Detected] Month {month} has {fav_count} favorites on Google Photos: {fav_names}")
+                logger.info(f"Current local status is '{month_status}' (Export/Upload stage).")
+                
+                if not auto_apply:
+                    prompt = f"Would you like to skip Export/Upload and fast-forward {month} to 'Pull Favorites' stage? [y/N]: "
+                    jump_input = input(prompt)
+                    if jump_input.strip().lower() == 'y':
+                        # Identify the code that enables Pull Favorites (550)
+                        cursor.execute("""
+                            SELECT preceding_code FROM batch_status 
+                            WHERE code = '550' AND transition_type = 'pipeline'
+                        """)
+                        row = cursor.fetchone()
+                        if row:
+                            new_status = row[0]
+                            cursor.execute("UPDATE month_batches SET status_code = ? WHERE month = ?", (new_status, month))
+                            commit()
+                            logger.info(f"✅ Month {month} status fast-forwarded to {new_status}. Re-run planner to see the new execution plan.")
+                            close_conn()
+                            sys.exit(0)
+                        else:
+                            logger.warning("Could not find pipeline transition for stage 550 to perform fast-forward.")
 
         cursor.execute("""
             SELECT code, preceding_code, full_description, transition_type, short_label
@@ -193,10 +339,10 @@ def main(auto_apply):
         logger.debug(f"Inspecting transitions for month {month} with status {month_status}")
         for t in transitions_for_month:
             if t[3] == 'manual':
-                logger.info(f"Found manual transition candidate for month {month}: {t[2]} (code {t[1]}) -> (code {t[0]})")
+                logger.debug(f"Found manual transition candidate for month {month}: {t[2]} (code {t[1]}) -> (code {t[0]})")
                 manual_candidates.append((month, t))
             elif t[3] == 'retryable':
-                logger.info(f"Found retryable transition candidate for month {month}: {t[2]} (code {t[1]}) -> (code {t[0]})")
+                logger.debug(f"Found retryable transition candidate for month {month}: {t[2]} (code {t[1]}) -> (code {t[0]})")
                 retryable_candidates.append((month, t))
             elif t[3] == 'pipeline':
                 logger.debug(f"Found pipeline transition candidate for month {month}: {t[2]} (code {t[1]}) -> (code {t[0]})")
@@ -238,7 +384,6 @@ def main(auto_apply):
         logger.info("🔍 Checking for manual transition candidates...")
         logger.info(f"Month {latest_month} is waiting for manual transition ({selected_desc}, status {current_status}).")
         # --- Check how long ago the upload for this month was done ---
-        import datetime
         # Use the latest updated_at_utc from assets where uploaded_to_google = 1 for this month
         cursor.execute("""
             SELECT MAX(a.updated_at_utc)
@@ -252,8 +397,8 @@ def main(auto_apply):
         if last_completed_at:
             try:
                 # Assume updated_at_utc is in format 'YYYY-MM-DD HH:MM:SS'
-                last_completed_dt = datetime.datetime.strptime(last_completed_at, "%Y-%m-%d %H:%M:%S")
-                now_utc = datetime.datetime.now(timezone.utc).replace(tzinfo=None)
+                last_completed_dt = datetime.strptime(last_completed_at, "%Y-%m-%d %H:%M:%S")
+                now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
                 elapsed = now_utc - last_completed_dt
                 elapsed_days = elapsed.total_seconds() / (60 * 60 * 24)
             except Exception as e:
@@ -263,6 +408,13 @@ def main(auto_apply):
             # Skip suggesting manual transition, fall back to retryable or pipeline
             selected_type = None
         else:
+            # Check for favorites before prompting for manual completion
+            fav_count, source, fav_names = check_favorites_count(cursor, latest_month, check_remote=True, creds=creds)
+            if fav_count == 0:
+                logger.warning(f"⚠️ No favorites found in Google Photos for {latest_month}. Starring may not be complete.")
+            else:
+                logger.info(f"✨ Detected {fav_count} favorites for month {latest_month} in Google Photos (Source: {source}).")
+
             if not auto_apply:
                 proceed_input = input(f"Please confirm that the '{short_label}' task has been completed so I can move month {latest_month} to the next phase? [y/N]: ")
                 if proceed_input.strip().lower() == 'y':
@@ -313,7 +465,7 @@ def main(auto_apply):
         months_399 = cursor.fetchall()
         if months_399:
             latest_399_month = months_399[0][0]
-            free_space = check_google_quota()
+            free_space = check_google_quota(creds=creds)
             if free_space is None:
                 logger.error("❌ Aborting: Could not retrieve Google Drive quota. Please check your connection and credentials.")
                 close_conn()
@@ -408,6 +560,21 @@ def main(auto_apply):
         )
         logger.info(f"Run pipeline for: Month={latest_month}, Transitions={full_transition_list}")
 
+        # --- Check for favorites readiness if transition involves pulling or ranking ---
+        is_favorites_pull = any('550' in str(t) or 'Pull Google' in str(t) for t in full_transition_list)
+        is_after_pull = any('Rank Assets' in str(t) or 'Ranking' in str(t) for t in full_transition_list)
+        
+        if is_favorites_pull:
+            fav_count, source, fav_names = check_favorites_count(cursor, latest_month, check_remote=True, creds=creds)
+            if fav_count == 0:
+                logger.warning(f"⚠️ Suggested batch {latest_month} has no favorites in Google Photos yet.")
+            else:
+                logger.info(f"✨ Batch {latest_month} is ready with {fav_count} favorites in Google Photos (Source: {source}).")
+        elif is_after_pull:
+            fav_count, source, fav_names = check_favorites_count(cursor, latest_month, check_remote=False, creds=creds)
+            if fav_count == 0:
+                logger.warning(f"⚠️ Suggested batch {latest_month} has 0 favorites in local DB (Source: {source}). Ranking steps may be skipped.")
+
         # --- Begin Google quota check for upload transitions ---
         # Determine if any transition in the pipeline represents an upload to Google (e.g., '210->399')
         quota_check_needed = any(
@@ -440,16 +607,49 @@ def main(auto_apply):
                 staging_folder = None
                 staging_size = 0
                 logger.warning(f"No staging folder found for month {latest_month}")
-            free_space = check_google_quota()
+            free_space = check_google_quota(creds=creds)
             if free_space is None:
                 logger.error("❌ Aborting: Could not retrieve Google Drive quota before upload.")
                 close_conn()
                 sys.exit(1)
             if free_space < staging_size:
-                logger.warning(f"Not enough Google Drive space to upload month {latest_month}. Free space: {human_readable_size(free_space)}, Staging size: {human_readable_size(staging_size)}")
-                logger.info("Pipeline transition aborted due to insufficient Google quota.")
-                close_conn()
-                sys.exit(0)
+                logger.warning(f"⚠️ Insufficient space: {human_readable_size(free_space)} available vs {human_readable_size(staging_size)} required.")
+                
+                # Perform estimation of how many assets will fit based on aesthetic score
+                cursor.execute("SELECT original_filename, aesthetic_score FROM assets WHERE month = ?", (latest_month,))
+                db_scores = {row[0].lower(): (row[1] or -1) for row in cursor.fetchall()}
+                
+                staging_files = []
+                for root, _, fnames in os.walk(staging_folder):
+                    for f in fnames:
+                        fp = os.path.join(root, f)
+                        staging_files.append((f, os.path.getsize(fp), db_scores.get(f.lower(), -1)))
+                
+                # Sort by score descending (highest ranked first)
+                staging_files.sort(key=lambda x: x[2], reverse=True)
+                
+                can_upload_count = 0
+                simulated_sum = 0
+                for _, size, _ in staging_files:
+                    if simulated_sum + size <= free_space:
+                        simulated_sum += size
+                        can_upload_count += 1
+                    else:
+                        break
+                
+                logger.warning(f"📊 Estimate: Only {can_upload_count} out of {len(staging_files)} assets will fit.")
+                
+                if not auto_apply:
+                    partial_confirm = input(f"Proceed with a partial upload of the highest-ranked assets for {latest_month}? [y/N]: ")
+                    if partial_confirm.strip().lower() != 'y':
+                        logger.info("Pipeline transition aborted by user.")
+                        close_conn()
+                        sys.exit(0)
+                    logger.info("User confirmed partial upload. Proceeding with plan...")
+                else:
+                    logger.error("❌ Auto-apply aborted: Insufficient space for full upload. Manual confirmation required for partial sync.")
+                    close_conn()
+                    sys.exit(1)
             else:
                 logger.info(f"Enough Google Drive space available for upload. Free space: {human_readable_size(free_space)}, Staging size: {human_readable_size(staging_size)}")
 

@@ -4,6 +4,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import subprocess
 import platform
 import shutil
+import argparse
 import logging
 from db.queries import get_next_code
 from utils.utils import set_batch_status
@@ -73,31 +74,31 @@ def run_regular_steps(bootstrap_steps, steps, from_index, to_index, dry_run, mon
         if i < from_index or (to_index is not None and i >= to_index):
             continue
 
-        current_month = month
-        if step.code and not current_month:
+        if step.code and not month: # A step with a code requires a month batch
             logger.warning(f"⚠️ No batch found in status {step.code} — skipping step {step.label}")
             continue
 
         # --- Begin status check logic ---
-        if current_month and step.code:
+        # For a planned month, we check its current status against what the step expects.
+        if month and step.code:
             cur_status = conn.cursor()
-            cur_status.execute("SELECT status_code FROM month_batches WHERE month = ?", (current_month,))
+            # Find the status of the month we are supposed to process
+            cur_status.execute("SELECT status_code FROM month_batches WHERE month = ?", (month,))
             row = cur_status.fetchone()
             if row:
                 batch_status_code = row[0]
-                cursor = conn.cursor()
-                cursor.execute("SELECT preceding_code FROM batch_status WHERE code = ?", (step.code,))
-                expected_prev = cursor.fetchone()
+                cur_status.execute("SELECT preceding_code FROM batch_status WHERE code = ? AND transition_type = 'pipeline'", (step.code,))
+                expected_prev = cur_status.fetchone()
                 expected_prev_code = expected_prev[0] if expected_prev else None
                 if expected_prev_code and batch_status_code != expected_prev_code:
-                    logger.info(f"⏭️ Skipping step {step.label} for month {current_month} as current status {batch_status_code} does not match expected preceding code {expected_prev_code}")
+                    logger.info(f"⏭️ Skipping step '{step.label}' for month {month}. Its status '{batch_status_code}' doesn't match the expected preceding status '{expected_prev_code}'.")
                     continue
         # --- End status check logic ---
 
         # Prepare command with current_month replaced if available
-        command = [arg.replace("{month}", current_month) if current_month else arg for arg in step.command]
+        command = [arg.replace("{month}", month) if month else arg for arg in step.command]
 
-        if not run_step(conn, step, dry_run, current_month, command):
+        if not run_step(conn, step, dry_run, month, command):
             logger.error(f"❌ Pipeline execution halted. Session ID: {session_id}")
             conn.close()
             sys.exit(1)
@@ -233,12 +234,46 @@ def get_current_quarter_start(dt):
     minute = (dt.minute // 15) * 15
     return dt.replace(minute=minute, second=0, microsecond=0)
 
+def get_pipeline_steps(cursor, script_dir, use_mock_data=False):
+    """
+    Fetches and constructs the pipeline steps from the batch_status table.
+    If use_mock_data is True, returns a hardcoded list of steps for testing.
+    """
+    if use_mock_data:
+        logger.info("Using mocked pipeline steps data.")
+        
+        return [
+            PipelineStep("2.1 Verify Smart Album", "100", ["python3", os.path.join(script_dir, "verify_smart_album.py"), "{month}"]),
+            PipelineStep("2.2 Export Assets", "200", ["python3", os.path.join(script_dir, "export_photos_applescript.py"), "{month}"]),
+            PipelineStep("2.2.5 Remove duplicate assets based on extension and size", "210", ["python3", os.path.join(script_dir, "deduplicate_assets.py"), "{month}"]),
+            PipelineStep("2.4 Partial upload to Google Photos due to insufficient space", "399", ["python3", os.path.join(script_dir, "upload_to_google_photos.py"), "{month}"]),
+            PipelineStep("3.2 Pull Google Photos Favorites and update asset flags", "550", ["python3", os.path.join(script_dir, "pull_google_favorites.py"), "{month}"]),
+            #PipelineStep("3.4 Rank Assets by Score", "550", ["python3", os.path.join(script_dir, "rank_assets_by_score.py"), "{month}"]),
+        ]
+
+    steps = []
+    logger.info("Fetching pipeline steps from the database.")
+    cursor.execute("""
+        SELECT pipeline_stage, full_description, code, script_name, transition_type
+        FROM batch_status
+        WHERE code GLOB '[0-9][0-9][0-9]'
+          AND script_name NOT LIKE '%generate_month_batches.py%'
+        ORDER BY code
+    """)
+    rows = cursor.fetchall()
+    for pipeline_stage, full_description, code, script_name, transition_type in rows:
+        label = f"{pipeline_stage} {full_description}"
+        cmd = []
+        if script_name:
+            script_path = os.path.join(script_dir, script_name.split()[0])
+            cmd = ["python3", script_path]
+            if "{month}" in script_name:
+                cmd.append("{month}")
+        steps.append(PipelineStep(label, code, cmd))
+    return [step for step, (_, _, _, _, ttype) in zip(steps, rows) if ttype == 'pipeline']
 
 
-def main():
-    dry_run = "--dry-run" in sys.argv
-    from_index = 0
-    to_index = None
+def main(args):
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
     # Open a single SQLite connection to be used throughout
@@ -253,26 +288,7 @@ def main():
         # PipelineStep("1.1 Detect Gaps", "000", ["python3", os.path.join(SCRIPT_DIR, "generate_month_batches.py")]),
     ]
 
-    steps = []
-    cursor.execute("""
-        SELECT pipeline_stage, full_description, code, script_name, transition_type
-        FROM batch_status
-        WHERE code GLOB '[0-9][0-9][0-9]'
-          AND script_name NOT LIKE '%generate_month_batches.py%'
-        ORDER BY code
-    """)
-    rows = cursor.fetchall()
-    for pipeline_stage, full_description, code, script_name, transition_type in rows:
-        label = f"{pipeline_stage} {full_description}"
-        if script_name:
-            script_path = os.path.join(SCRIPT_DIR, script_name.split()[0])
-            cmd = ["python3", script_path]
-            if "{month}" in script_name:
-                cmd.append("{month}")
-        else:
-            cmd = []
-        steps.append(PipelineStep(label, code, cmd))
-    steps = [step for step, (_, _, _, _, ttype) in zip(steps, rows) if ttype == 'pipeline']
+    steps = get_pipeline_steps(cursor, SCRIPT_DIR, use_mock_data=args.mock_steps)
 
     all_steps = bootstrap_steps.copy()
     all_steps.extend(steps)
@@ -283,87 +299,30 @@ def main():
     if planned_row:
         month = planned_row[0]
         logger.info(f"📋 Planned execution found. Using batch: {month}")
-        from_index, to_index = 0, len(all_steps)
+        from_index, to_index = 0, len(all_steps) # Execute all steps for the planned month
     else:
         logger.error("🚫 No active planned execution found. Please run pipeline_planner first.")
         conn.close()
         sys.exit(1)
 
-    selected_steps = all_steps[from_index:to_index]
-
-    # Check for batches in error state
-    cur_err = conn.cursor()
-    cur_err.execute("SELECT month, status_code FROM month_batches WHERE status_code LIKE '%E'")
-    error_batches = cur_err.fetchall()
-
-    # month = None
-    # Determine if any selected step requires a batch status code (non-empty code)
-    requires_batch = any(step.code for step in selected_steps)
-
-    if requires_batch:
-        if error_batches:
-            print("\n⚠️  Error State Detected")
-            for m, status in error_batches:
-                print(f"  - Batch {m} is in error state ({status})")
-
-            choice = input("\n❓ Retry failed batch? [y/N]: ").strip().lower()
-            if choice == "y":
-                month = error_batches[0][0]
-                logger.info(f"🔁 Retrying failed batch: {month}")
-                # Reset the batch status to the previous valid code (strip 'E')
-                prev_code = error_batches[0][1]
-                if prev_code and prev_code.endswith('E'):
-                    clean_code = prev_code[:-1]
-                    cursor.execute(
-                        "UPDATE month_batches SET status_code = ? WHERE month = ?",
-                        (clean_code, month)
-                    )
-                    conn.commit()
-                    logger.info(f"♻️ Reset batch {month} status from {prev_code} to {clean_code}")
-            else:
-                logger.info("➡️ Proceeding with next eligible batch.")
-        if month is None:
-            # Extract first step that requires a batch code
-            first_code_step = next((step for step in selected_steps if step.code), None)
-            # month = None
-            if first_code_step:
-                step_code = first_code_step.code
-                if step_code == '000':
-                    logger.info(f"ℹ️ Step {first_code_step.label} (code {step_code}) has no prerequisites and will run unconditionally.")
-            if not month:
-                if first_code_step and first_code_step.code == '000':
-                    logger.info("ℹ️ Proceeding without batch for step 000.")
-                else:
-                    logger.error(f"🚫 No eligible batch found to process for step {first_code_step.label} (code {first_code_step.code}).")
-                    # Show batch_status short_label for visibility
-                    cursor.execute('''
-                        SELECT mb.month, mb.status_code, bs.short_label
-                        FROM month_batches mb
-                        LEFT JOIN batch_status bs ON mb.status_code = bs.code
-                        ORDER BY mb.month
-                    ''')
-                    all_batches = cursor.fetchall()
-                    if all_batches:
-                        logger.info("📋 Current month_batches (with status labels):")
-                        for m, s, label in all_batches:
-                            label_display = f" ({label})" if label else ""
-                            logger.info(f" - Month: {m}, Status: {s}{label_display}")
-                    else:
-                        logger.info("ℹ️ No entries in month_batches table.")
-                    conn.close()
-                    return 
-            logger.info(f"📦 Batch selected: {month}")
-
-    run_bootstrap_steps(bootstrap_steps, from_index, to_index, dry_run, None, conn, month)
-    run_regular_steps(bootstrap_steps, steps, from_index, to_index, dry_run, month, conn)
+    # The executor is non-interactive. The planner decides the month.
+    # We will now run all steps for the planned month.
+    # The run_regular_steps function has internal logic to skip steps
+    # that are not applicable based on the month's current status.
+    run_bootstrap_steps(bootstrap_steps, from_index, to_index, args.dry_run, None, conn, month)
+    run_regular_steps(bootstrap_steps, steps, from_index, to_index, args.dry_run, month, conn)
 
     # If a planned execution was used, mark it as inactive
     if planned_row:
         cursor.execute("UPDATE planned_execution SET active = 0 WHERE planned_month = ?", (month,))
         conn.commit()
 
-    start_index = len(bootstrap_steps) + len(steps)
     conn.close()
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Execute the media organizer pipeline.")
+    parser.add_argument("--dry-run", action="store_true", help="Log actions without executing them.")
+    parser.add_argument("--mock-steps", action="store_true", help="Use mocked pipeline steps instead of querying the database.")
+    args = parser.parse_args()
+
+    main(args)

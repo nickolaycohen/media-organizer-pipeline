@@ -1,3 +1,28 @@
+
+-- find assets by camera model
+
+SELECT name, sql
+FROM sqlite_master
+WHERE type='table'
+AND sql LIKE '%CAMERA%';
+
+select * 
+from ZASSET z 
+where z.Z_PK   in (70470, 89119, 224855, 238925, 302805, 339176)
+
+select * 
+from ZADDITIONALASSETATTRIBUTES z 
+where z.ZORIGINALFILENAME = 'IMG_6782.HEIC'
+
+select * 
+from 
+where Z_PK in (70470
+224852
+238926
+302809
+339174)
+
+
 --update imports 
 --set execution_id = null 
 --where import_uuid = '72720';
@@ -7,6 +32,25 @@
 --update month_batches 
 --set status_code = '000'
 --where "month" = '2025-08';
+-- this query executes against the DB when mocking flag is not passed
+SELECT pipeline_stage, full_description, code, script_name, transition_type
+        FROM batch_status
+        WHERE code GLOB '[0-9][0-9][0-9]'
+          AND script_name NOT LIKE '%generate_month_batches.py%'
+        ORDER BY code
+
+
+-- mocking executor data
+SELECT pipeline_stage || ' '|| full_description, code, script_name, transition_type
+FROM batch_status
+WHERE code GLOB '[0-9][0-9][0-9]'
+ORDER BY code
+
+
+-- batches status
+select * 
+from month_batches mb 
+order by mb."month" desc
 
 -- get google favorites by month - passed stage 550
 select count(), a."month" 
@@ -16,9 +60,10 @@ group by a."month"
 order by a."month" desc
 
 
+-- reset flag so assets can be reuploaded - first month to be reuploaded - March 2025
 update assets 
 set uploaded_to_google = 0
-where "month" = '2025-04'
+where "month" = '2025-03'
 
 
 select *

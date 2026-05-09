@@ -104,17 +104,36 @@ def check_active_sources_import_status(cursor, auto_apply):
         cursor.execute(f"ATTACH DATABASE '{APPLE_PHOTOS_DB_COPY_PATH}' AS photos_db;")
         logger.debug("Attached Photos.sqlite database for active source check.")
 
+        # We use conditional aggregation (CASE WHEN) to get the range for the target month 
+        # while still being able to group by camera model.
         query = """
-            SELECT DISTINCT xa.ZCAMERAMODEL
+            SELECT 
+                xa.ZCAMERAMODEL,
+                COUNT(CASE WHEN strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch')) = ? THEN 1 END) AS assets_in_month,
+                MIN(CASE WHEN strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch')) = ? THEN aaa.ZORIGINALFILENAME END) AS min_filename,
+                MAX(CASE WHEN strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch')) = ? THEN aaa.ZORIGINALFILENAME END) AS max_filename,
+                MIN(CASE WHEN strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch')) = ? THEN datetime(a.ZDATECREATED + 978307200, 'unixepoch') END) AS min_date,
+                MAX(CASE WHEN strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch')) = ? THEN datetime(a.ZDATECREATED + 978307200, 'unixepoch') END) AS max_date
             FROM photos_db.ZASSET a
             JOIN photos_db.ZEXTENDEDATTRIBUTES xa ON xa.ZASSET = a.Z_PK
+            JOIN photos_db.ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK
             WHERE a.ZTRASHEDSTATE = 0
               AND xa.ZCAMERAMODEL IN ({})
-              AND strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch')) = ?
+              AND a.ZDATECREATED >= (strftime('%s', date('now', 'start of month', '-24 month')) - 978307200)
+              AND a.ZDATECREATED < (strftime('%s', date('now', 'start of month')) - 978307200)
+            GROUP BY xa.ZCAMERAMODEL
         """.format(','.join(['?' for _ in ACTIVE_CAMERA_MODELS]))
 
-        cursor.execute(query, ACTIVE_CAMERA_MODELS + [latest_complete_month_str])
-        found_models = {row[0] for row in cursor.fetchall()}
+        # Passing the month string multiple times for each aggregate filter
+        cursor.execute(query, [latest_complete_month_str] * 5 + ACTIVE_CAMERA_MODELS)
+        results = cursor.fetchall()
+        found_models = set()
+
+        for row in results:
+            model, count, f_min, f_max, d_min, d_max = row
+            if count > 0:
+                found_models.add(model)
+                logger.info(f"📸 Source: {model:20} | Count: {count:4} | Files: {f_min} -> {f_max} | Dates: {d_min} to {d_max}")
 
         missing_models = set(ACTIVE_CAMERA_MODELS) - found_models
 

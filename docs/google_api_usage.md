@@ -10,7 +10,7 @@ This module contains the core functions that interact with Google's APIs. These 
 
 | Function                   | API Call(s)                                                                                    | Required Scopes                                            |
 | :------------------------- | :--------------------------------------------------------------------------------------------- | :--------------------------------------------------------- |
-| `create_or_get_album`      | `GET /v1/albums` (List albums)<br>`POST /v1/albums` (Create album)                             | `https://www.googleapis.com/auth/photoslibrary`            |
+| `create_or_get_album`      | `GET /v1/albums` (List albums)<br>`POST /v1/albums` (Create album)                             | `...photoslibrary.edit.appcreateddata`                     |
 | `upload_media`             | `POST /v1/uploads` (Get upload token)<br>`POST /v1/mediaItems:batchCreate` (Create media item) | `https://www.googleapis.com/auth/photoslibrary.appendonly` |
 | `get_all_favorites`        | `POST /v1/mediaItems:search` (with `FAVORITES` and `includeArchivedMedia`)                     | `...photoslibrary.readonly.appcreateddata`                 |
 | `get_google_storage_quota` | `GET /drive/v3/about?fields=storageQuota`                                                      | `https://www.googleapis.com/auth/drive.readonly`           |

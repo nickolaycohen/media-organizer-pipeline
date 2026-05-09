@@ -139,11 +139,9 @@ Once the Smart Album is created, you can continue the process.
 
 > python3 scripts/verify_smart_album.py --dry-run
 
-> ℹ️ Step 2.3.5 (`sync_photos_derived.py`) is a required step for syncing and enriching asset metadata before uploading to Google Photos.
-
 ## 📌 Step 3.1.5 – Pull Favorites from Google Photos
 
-After Google Photos auto-curates memories and before manual review, this step pulls the list of media items marked as ⭐ Favorites in Google Photos.
+After Google Photos auto-curates memories and before final ranking, this step pulls the list of media items marked as ⭐ Favorites in Google Photos.
 
 - Downloads favorite status using the API
 - Matches favorites to the assets in the local database (by filename and timestamp)
@@ -155,92 +153,13 @@ After uploading a full month of photos to Google Photos, wait for the auto-curat
 
 Use the Google Photos app (mobile or web) to view the generated Memories, and ⭐️ mark your favorite photos manually. These starred photos will later be retrieved via API in the next step (550) for export, curation, and cleanup.
 
-> ℹ️ Step 3.3 (`sync_photos_derived.py`) is optional and is used primarily for pre-upload filtering, scoring analysis, or offline reporting. It is not required for the standard pipeline flow.
+> ℹ️ Step 0.3 (`sync_photos_derived.py`) is required for syncing and enriching asset metadata (aesthetic scores) before uploading to Google Photos.
 
 ---
 
 ## 🗂️ Database Schema
 
-### Table: `imports`
-
-Tracks imports from Apple Photos.
-
-|        Column        |        Type         | Description                             |
-| :------------------: | :-----------------: | :-------------------------------------- |
-|          id          | INTEGER PRIMARY KEY | Unique ID                               |
-|         uuid         |        TEXT         | Import session UUID                     |
-| import_timestamp_utc |      DATETIME       | Timestamp of import                     |
-|     import_name      |        TEXT         | Human-friendly display name             |
-|        device        |        TEXT         | Device name (from camera metadata)      |
-|        album         |        TEXT         | Album name if provided during import    |
-|     asset_count      |       INTEGER       | Number of assets in the import session  |
-|   months_detected    |        TEXT         | Comma-separated list of included months |
-|    created_at_utc    |      DATETIME       | When record was added to the database   |
-
-### Table: `month_batches`
-
-Tracks batches to be processed and their status.
-
-|              Column               |        Type         | Description                           |
-| :-------------------------------: | :-----------------: | :------------------------------------ |
-|                id                 | INTEGER PRIMARY KEY | Unique ID                             |
-|               month               |   TEXT (YYYY-MM)    | Month identifier                      |
-|              status               |        TEXT         | Batch status (`pending`, `completed`) |
-|       batch_created_at_utc        |      DATETIME       | When batch created                    |
-|   staging_folder_created_at_utc   |      DATETIME       | Folder creation timestamp             |
-|  staging_folder_verified_at_utc   |      DATETIME       | Staging folder verified               |
-|       export_started_at_utc       |      DATETIME       | Export start timestamp                |
-|      export_finished_at_utc       |      DATETIME       | Export end timestamp                  |
-|       upload_started_at_utc       |      DATETIME       | Upload start timestamp                |
-|      upload_finished_at_utc       |      DATETIME       | Upload end timestamp                  |
-| google_highlights_detected_at_utc |      DATETIME       | When Google highlights detected       |
-|    final_curation_done_at_utc     |      DATETIME       | When final curation completed         |
-|     cleanup_completed_at_utc      |      DATETIME       | Cleanup completion timestamp          |
-
-### Table: `assets`
-
-Stores asset-level metadata and status flags.
-
-|        Column         |        Type         | Description                               |
-| :-------------------: | :-----------------: | :---------------------------------------- |
-|          id           | INTEGER PRIMARY KEY | Unique ID                                 |
-|       asset_id        |        TEXT         | Apple Photos asset UUID                   |
-|       file_hash       |        TEXT         | SHA-1 file hash of the original asset     |
-|         month         |        TEXT         | Month identifier (YYYY-MM)                |
-|       import_id       |        TEXT         | Related import UUID                       |
-|    aesthetic_score    |        FLOAT        | Apple Photos aesthetic ML score (0.0–1.0) |
-|   original_filename   |        TEXT         | Filename of the asset                     |
-|   date_created_utc    |      DATETIME       | Original creation timestamp (UTC)         |
-|   imported_date_utc   |      DATETIME       | When imported into Apple Photos (UTC)     |
-| score_imported_at_utc |      DATETIME       | When aesthetic score was synced (UTC)     |
-|    google_favorite    |       INTEGER       | 1 if starred in Google Photos, else 0     |
-|  uploaded_to_google   |       INTEGER       | 1 if uploaded, else 0                     |
-|    created_at_utc     |      DATETIME       | When added to Media Organizer DB          |
-|    updated_at_utc     |      DATETIME       | Last update timestamp                     |
-
-### Table: `log_entries`
-
-Tracks pipeline operations, errors, and timestamps.
-
-|     Column     |    Type    | Description                     |
-| :------------: | :--------: | :------------------------------ |
-|       id       | INTEGER PK | Unique ID                       |
-|  module_name   |    TEXT    | Script/module name              |
-|   log_level    |    TEXT    | Info, Debug, Warning, Error     |
-|  message_text  |    TEXT    | Logged message content          |
-| created_at_utc |  DATETIME  | When the log entry was recorded |
-
-### Table: `smart_albums`
-
-Caches Apple Photos Smart Album metadata.
-
-|     Column      |    Type    | Description                     |
-| :-------------: | :--------: | :------------------------------ |
-|       id        | INTEGER PK | Unique ID                       |
-|      title      |    TEXT    | Album name (e.g. "2025-04")     |
-|  parent_folder  |    TEXT    | Folder under which album exists |
-|    full_path    |    TEXT    | Full album path (for reference) |
-| verified_at_utc |  DATETIME  | Last verified timestamp         |
+The pipeline database structure and table definitions can be found in the Database Schema Reference.
 
 ---
 

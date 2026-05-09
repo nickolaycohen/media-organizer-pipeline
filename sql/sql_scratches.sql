@@ -875,3 +875,7 @@ from assets
 
 select * 
 from schema_migrations sm 
+
+select * 
+from imports
+order by import_uuid desc

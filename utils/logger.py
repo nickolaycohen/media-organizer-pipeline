@@ -1,6 +1,7 @@
 import hashlib
 import os
 import logging
+from logging.handlers import RotatingFileHandler
 
 def setup_logger(log_file, module_tag, extra_fields=None):
     # Ensure the log directory exists
@@ -20,7 +21,13 @@ def setup_logger(log_file, module_tag, extra_fields=None):
         console_handler = logging.StreamHandler()
         console_handler.setFormatter(formatter)
 
-        file_handler = logging.FileHandler(log_file)
+        # Use RotatingFileHandler to manage log file size. 
+        # maxBytes=5MB, keeping up to 5 backup files.
+        file_handler = RotatingFileHandler(
+            log_file, 
+            maxBytes=5 * 1024 * 1024, 
+            backupCount=5
+        )
         file_handler.setFormatter(formatter)
 
         logger.addHandler(console_handler)

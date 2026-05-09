@@ -2,13 +2,38 @@
 
 This pipeline handles the curation, export, and publishing of family photos, from organizing assets in Apple Photos to exporting and sharing curated memories.
 
-## 🚀 Quick Start / Daily Workflow
+## 🚀 Pipeline Execution Map
+
+The system is orchestrated by two primary scripts.
+
+### 1. Planning Phase (`scripts/pipeline_planner.py`)
+
+Runs every time you start a session. It handles the "Bootstrap" steps:
+
+1.  **Refresh DB**: `copy_all_media_photos_db.py`
+2.  **Schema Check**: `storage_manager_main.py`
+3.  **Raw Sync**: `sync_photos_raw.py`
+4.  **Derived Sync**: `sync_photos_derived.py`
+5.  **Batch Detection**: `generate_month_batches.py`
+
+### 2. Execution Phase (`scripts/pipeline_executor.py`)
+
+Carries out the "Stage" steps for the planned month:
+
+- **100 - Verify**: `verify_smart_album.py`
+- **200 - Export**: `export_photos_applescript.py`
+- **210 - Dedupe**: `deduplicate_assets.py`
+- **400 - Upload**: `upload_to_google_photos.py`
+- **550 - Favorites**: `pull_google_favorites.py`
+- **600 - Rank**: `rank_assets_by_score.py`
+
+---
+
+## 🛠️ Daily Workflow
 
 The pipeline is split into two phases: **Planning** and **Execution**.
 
-### 1. Plan the Session
-
-The planner performs bootstrap syncs (metadata, assets, batches) and analyzes the database to suggest the next logical action.
+### Step 1: Plan the Session
 
 ```bash
 # Interactive mode (recommended)
@@ -34,15 +59,16 @@ python3 scripts/pipeline_executor.py --dry-run
 
 ## 📂 Stage 0 – Initialization & Setup
 
-| Step | Label       | Description                                              | Script/Tool               | Status    |
-| ---- | ----------- | -------------------------------------------------------- | ------------------------- | --------- |
-| 0.1  | Init DB     | Create schema, set up tables and views                   | `storage_status.py`       | ✅ Stable |
-| 0.2  | Field Check | Verify Photos DB schema fields (safe fallback detection) | `storage_status.py`       | ✅ Stable |
-| 0.3  | Sync Meta   | Copy Apple Photos metadata and create query view         | `sync_photos_metadata.py` | ✅ Stable |
+| Step | Label        | Description                                          | Script/Tool                   | Status    |
+| ---- | ------------ | ---------------------------------------------------- | ----------------------------- | --------- |
+| 0.0  | Refresh DB   | Copy Apple Photos SQLite DB for safe processing      | `copy_all_media_photos_db.py` | ✅ Stable |
+| 0.1  | Init/Migrate | Create schema and apply pending migrations           | `storage_manager_main.py`     | ✅ Stable |
+| 0.2  | Raw Sync     | Copy raw ZASSET and attribute tables from Photos     | `sync_photos_raw.py`          | ✅ Stable |
+| 0.3  | Derived Sync | Extract scores, creation dates, and calculate months | `sync_photos_derived.py`      | ✅ Stable |
 
 ---
 
-## 📦 Stage 1 – Monthly Batch Detection
+## 📦 Stage 1 – Monthly Batch Detection (Handled by Planner)
 
 | Step | Label        | Description                                            | Script/Tool                 | Status     |
 | ---- | ------------ | ------------------------------------------------------ | --------------------------- | ---------- |
@@ -53,13 +79,13 @@ python3 scripts/pipeline_executor.py --dry-run
 
 ## 📤 Stage 2 – Apple Photos Export & Upload Prep
 
-| Step  | Label          | Description                                              | Script/Tool                      | Status      |
-| ----- | -------------- | -------------------------------------------------------- | -------------------------------- | ----------- |
-| 2.1   | Check Album    | Verify Smart Album for export exists                     | `verify_smart_album.py`          | ✅ Required |
-| 2.2   | Export Assets  | AppleScript export from Photos to monthly staging folder | `export_photos_applescript.scpt` | ✅ Working  |
-| 2.3   | Verify Folder  | Confirm export folder exists and matches expected batch  | `verify_staging.py`              | ✅ Working  |
-| 2.3.5 | Sync Metadata  | Extract metadata into DB from staging files              | `sync_photos_assets.py`          | ✅ Working  |
-| 2.4   | Upload to G.Ph | Upload curated batch to Google Photos API                | `upload_to_google_photos.py`     | ✅ Working  |
+| Step  | Label          | Description                                              | Script/Tool                       | Status      |
+| ----- | -------------- | -------------------------------------------------------- | --------------------------------- | ----------- |
+| 2.1   | Check Album    | Verify Smart Album for export exists                     | `verify_smart_album.py`           | ✅ Required |
+| 2.2   | Export Assets  | AppleScript export from Photos to monthly staging folder | `export_photos_applescript.py`    | ✅ Working  |
+| 2.3   | Verify Folder  | Confirm export folder exists and matches expected batch  | `scripts/utils/verify_staging.py` | ✅ Working  |
+| 2.3.5 | Sync Metadata  | Sync derived metadata (scores/dates) from Photos         | `sync_photos_derived.py`          | ✅ Working  |
+| 2.4   | Upload to G.Ph | Upload curated batch to Google Photos API                | `upload_to_google_photos.py`      | ✅ Working  |
 
 ---
 
@@ -70,7 +96,7 @@ python3 scripts/pipeline_executor.py --dry-run
 | 3.1   | Wait for Google AI          | Wait for Google Photos to generate Memories and Highlights (auto-curated)            | Manual (Google Photos)               | ✅ Manual |
 | 3.2   | Star Curated Items          | Manually star the best photos suggested by Google (or personal choice)               | Manual (Google Photos)               | ✅ Manual |
 | 3.2.5 | Pull Google Favorites       | Use Google Photos API to fetch starred media and update `is_google_favorite` in DB   | `pull_google_favorites.py`           | ✅ Done   |
-| 3.3   | Sync Apple Aesthetic Scores | Enrich DB with aesthetic scores and metadata from Apple Photos                       | `sync_photos_assets.py`              | ✅ Done   |
+| 3.3   | Sync Apple Aesthetic Scores | Enrich DB with aesthetic scores and metadata from Apple Photos                       | `sync_photos_derived.py`             | ✅ Done   |
 | 3.4   | Rank Assets by Score        | Combine Apple score + Google Favorite flag using weighted score; store session in DB | `rank_assets_by_score.py`            | ✅ Done   |
 | 3.5   | Export Ranked Assets        | Export scored assets to curated folder for human review                              | Built into `rank_assets_by_score.py` | ✅ Done   |
 
@@ -113,7 +139,7 @@ Once the Smart Album is created, you can continue the process.
 
 > python3 scripts/verify_smart_album.py --dry-run
 
-> ℹ️ Step 2.3.5 (`sync_photos_assets.py`) is a required step for syncing and enriching asset metadata before uploading to Google Photos.
+> ℹ️ Step 2.3.5 (`sync_photos_derived.py`) is a required step for syncing and enriching asset metadata before uploading to Google Photos.
 
 ## 📌 Step 3.1.5 – Pull Favorites from Google Photos
 
@@ -127,9 +153,9 @@ After Google Photos auto-curates memories and before manual review, this step pu
 
 After uploading a full month of photos to Google Photos, wait for the auto-curated **Memory Collection** to appear (e.g., “Best of March 2025”). These are not Albums and are not accessible via API.
 
-Use the Google Photos app (mobile or web) to view the generated Memories, and ⭐️ mark your favorite photos manually. These starred photos will later be retrieved via API in the next step (3.3) for export, curation, and cleanup.
+Use the Google Photos app (mobile or web) to view the generated Memories, and ⭐️ mark your favorite photos manually. These starred photos will later be retrieved via API in the next step (550) for export, curation, and cleanup.
 
-> ℹ️ Step 3.3 (`sync_photos_assets.py`) is optional and is used primarily for pre-upload filtering, scoring analysis, or offline reporting. It is not required for the standard pipeline flow.
+> ℹ️ Step 3.3 (`sync_photos_derived.py`) is optional and is used primarily for pre-upload filtering, scoring analysis, or offline reporting. It is not required for the standard pipeline flow.
 
 ---
 
@@ -225,10 +251,34 @@ Caches Apple Photos Smart Album metadata.
 If you need to re-process a month (e.g., you deleted files from Google and want to re-upload), use this script to reset the database flags and status code.
 
 ```bash
-python3 scripts/reset_batch_state.py 2026-03
+python3 scripts/utils/reset_batch_state.py 2026-03
 ```
 
 This clears the `uploaded_to_google` and `google_favorite` flags for the month and sets the status back to `210` (Ready to Upload).
+
+### List Google Photos Albums
+
+Useful for diagnostic checks and verifying that curation albums are being created correctly.
+
+```bash
+python3 scripts/list_google_photos_albums.py --filter "Curating"
+```
+
+### Verify Staging Folder
+
+Perform a manual sanity check on a specific staging folder to ensure file counts and naming conventions match.
+
+```bash
+python3 scripts/verify_staging.py 2026-03
+```
+
+### Create Ranked Assets View
+
+A maintenance tool to ensure the SQL view used for asset ranking and scoring is correctly initialized in the database.
+
+```bash
+python3 scripts/create_ranked_assets_view.py
+```
 
 ---
 

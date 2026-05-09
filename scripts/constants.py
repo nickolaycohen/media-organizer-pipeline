@@ -18,30 +18,23 @@ APPLE_PHOTOS_DB_MARKER = APPLE_PHOTOS_DB_COPY_PATH + ".lastcopy"
 # https://developers.google.com/photos/overview/authorization
 # https://developers.google.com/photos/library/reference/rest/v1/albums/get
 
-# General purpose scopes for reading albums, creating albums, and reading content
-GOOGLE_PHOTOS_GENERAL_SCOPES = [
-    "https://www.googleapis.com/auth/photoslibrary.readonly",
-    "https://www.googleapis.com/auth/photoslibrary.appendonly"
-]
+# Full access to read, write, and create albums/media. Required for listing all albums and creating new ones.
+GOOGLE_PHOTOS_EDIT_ACCESS_SCOPES = ['https://www.googleapis.com/auth/photoslibrary.edit.appcreateddata']
 
-# Scopes for uploading and managing app-created data
-GOOGLE_PHOTOS_UPLOAD_SCOPES = [
-    "https://www.googleapis.com/auth/photoslibrary.appendonly",
-    "https://www.googleapis.com/auth/photoslibrary.readonly.appcreateddata",
-    "https://www.googleapis.com/auth/photoslibrary.edit.appcreateddata"
-]
-GOOGLE_PHOTOS_READONLY_SCOPES = [
-    "https://www.googleapis.com/auth/photoslibrary.readonly.appcreateddata"
-] 
-
-# Scopes for creating albums and uploading media
-GOOGLE_PHOTOS_CREATE_AND_UPLOAD_SCOPES = [
-    "https://www.googleapis.com/auth/photoslibrary.readonly", # For listing albums
-    "https://www.googleapis.com/auth/photoslibrary.appendonly" # For uploading
-]
+# Read-only access to the entire library. Required for listing all albums and searching all media items (e.g., for favorites).
+GOOGLE_PHOTOS_READONLY_SCOPES = ["https://www.googleapis.com/auth/photoslibrary.readonly.appcreateddata"]
+ 
+# Append-only access. Allows uploading media but not reading library content.
+GOOGLE_PHOTOS_APPEND_ONLY_SCOPES = ["https://www.googleapis.com/auth/photoslibrary.appendonly"]
 
 # Read-only scope for checking storage quota via Drive API
 GOOGLE_DRIVE_READ_ONLY_SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
 
-# Edit Access only
-GOOGLE_PHOTOS_EDIT_ACCESS_SCOPES = ['https://www.googleapis.com/auth/photoslibrary.edit.appcreateddata']
+# Combined scopes required for the Pipeline Planner session
+PLANNER_REQUIRED_SCOPES = GOOGLE_PHOTOS_EDIT_ACCESS_SCOPES + GOOGLE_PHOTOS_READONLY_SCOPES  + GOOGLE_DRIVE_READ_ONLY_SCOPES + GOOGLE_PHOTOS_APPEND_ONLY_SCOPES
+
+# List of camera models considered "active sources" for import checks
+ACTIVE_CAMERA_MODELS = ['iPhone 13 Pro Max', 'Canon EOS Rebel T7', 'iPhone 16 Pro', 'iPhone 12 Pro Max']
+
+# DEPRECATED/UNUSED - Kept for reference, but should be removed in the future.
+# GOOGLE_PHOTOS_GENERAL_SCOPES = ["https://www.googleapis.com/auth/photoslibrary.readonly", "https://www.googleapis.com/auth/photoslibrary.appendonly"]

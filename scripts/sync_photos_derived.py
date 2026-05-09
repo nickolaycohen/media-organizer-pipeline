@@ -21,20 +21,17 @@ def sync_assets(media_cursor, logger):
     logger.info("Attached Photos.sqlite database.")
 
 
-    logger.info("Fetching existing uploaded or imported assets from Media Organizer DB...")
-    media_cursor.execute("SELECT asset_id FROM assets WHERE uploaded_to_google = 1 OR score_imported_at_utc IS NOT NULL")
-    processed_assets = set(row[0] for row in media_cursor.fetchall())
-
-    media_cursor.execute("SELECT MAX(import_id) FROM assets")
-    latest_import_id = media_cursor.fetchone()[0] or 0
-    logger.info(f"Latest import session ID in DB: {latest_import_id}")
-
     # We are fetching all assets that exist in ZASSET table,
     # but might not be in assets table and also do not have 
     # a default /Apple Photos/ assigned aestetic score
     # or might have aestetic score reeveluated
     # ideally this should be a refresh of the assets table with 
     # what exists in ZASSET table
+    media_cursor.execute("SELECT MAX(import_id) FROM assets")
+    latest_import_id = media_cursor.fetchone()[0] or 0
+    logger.info(f"Latest import session ID in DB: {latest_import_id}")
+
+
     logger.info("Fetching assets from Apple Photos DB...")
     media_cursor.execute("""
         SELECT 
@@ -46,58 +43,44 @@ def sync_assets(media_cursor, logger):
             a.ZIMPORTSESSION,
             strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) as month
         FROM ZASSET a
-        LEFT JOIN ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK
-        LEFT JOIN assets ON assets.asset_id = a.ZUUID
-        WHERE a.ZOVERALLAESTHETICSCORE IS NOT NULL
-        AND a.ZOVERALLAESTHETICSCORE != 0.5
-        AND (
-            a.ZIMPORTSESSION > ?
-            OR a.ZOVERALLAESTHETICSCORE != assets.aesthetic_score
-        )
+        JOIN ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK
+        WHERE a.ZIMPORTSESSION > ?
     """, (latest_import_id,))
     results = media_cursor.fetchall()
 
     logger.info(f"Fetched {len(results)} assets from Photos DB.")
 
     inserted_count = 0
-    skipped_count = 0
-    ignored_count = 0
     assets_to_insert = []
 
     for row in results:
         asset_id, score, filename, date_created, imported_date, import_id, month = row
-
-        # Skip if already uploaded or already imported (score_imported_at_utc is not null)
-        if asset_id in processed_assets:
-            ignored_count += 1
-            logger.debug(f"Ignored asset already in DB or already processed: {asset_id}")
-            continue
-        
         assets_to_insert.append((asset_id, score, filename, date_created, imported_date, import_id, month))
-        inserted_count += 1
 
-        if inserted_count % 10000 == 0:
-            percentage = (inserted_count / len(results)) * 100
-            logger.info(f"Progress: {inserted_count}/{len(results)} assets inserted ({percentage:.2f}% complete).")
-
-        # Perform bulk insert for remaining assets
-        if assets_to_insert:
-            media_cursor.executemany("""
-                INSERT INTO assets (
-                    asset_id, 
-                    aesthetic_score, 
-                    original_filename, 
-                    date_created_utc,
-                    imported_date_utc,
-                    import_id,
-                    month
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(original_filename, month) DO UPDATE SET aesthetic_score = excluded.aesthetic_score            """, assets_to_insert)
+    if assets_to_insert:
+        logger.info(f"Preparing to insert/update {len(assets_to_insert)} asset records...")
+        media_cursor.executemany("""
+            INSERT INTO assets (
+                asset_id, 
+                aesthetic_score, 
+                original_filename, 
+                date_created_utc,
+                imported_date_utc,
+                import_id,
+                month,
+                score_imported_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(original_filename, month) DO UPDATE SET
+                asset_id = excluded.asset_id,
+                aesthetic_score = excluded.aesthetic_score,
+                score_imported_at_utc = datetime('now'),
+                updated_at_utc = datetime('now')
+            WHERE aesthetic_score IS NULL OR aesthetic_score != excluded.aesthetic_score OR asset_id != excluded.asset_id;
+        """, assets_to_insert)
+        inserted_count = media_cursor.rowcount
         commit()
 
-    logger.info(f"✅ Inserted {inserted_count} new asset records into Media Organizer DB.")
-    logger.info(f"ℹ️ Ignored {ignored_count} assets already uploaded or previously imported.")
-    logger.info(f"ℹ️ Skipped {skipped_count} assets due to insertion conflict.")
+    logger.info(f"✅ Inserted or updated {inserted_count} asset records in Media Organizer DB.")
 
     # Clear and repopulate smart_albums
     logger.info("Clearing existing smart_albums entries...")
@@ -169,12 +152,9 @@ def sync_assets(media_cursor, logger):
 
     logger.info("View photos_assets_view recreated successfully.")
 
-    # Now update the db_updates.raw_synced flag
+    # Now update the db_updates.derived_synced flag
     media_cursor.execute("UPDATE db_updates SET derived_synced = 1")
     commit()
-
-    close_conn()
-    logger.info("Connection to Media Organizer DB closed.")
 
 if __name__ == "__main__":
     logger = setup_logger(LOG_PATH, MODULE_TAG)

@@ -59,10 +59,10 @@ def sync_metadata(logger):
         cursor_media.execute("DETACH DATABASE photos_db;")
         logger.info("Detached Photos.sqlite database.")
 
-        # After successful sync, update the derived_synced flag
+        # After successful sync, update the raw_synced flag
         cursor_media.execute("UPDATE db_updates SET raw_synced = 1")
         conn_media.commit()
-        logger.info("Derived sync flag updated to 1 after successful metadata sync.")
+        logger.info("Raw sync flag updated to 1 after successful metadata sync.")
         # TODO - This sync process should have a schema modification logic to 
         # recognize schema changes on Photos Database and possibly stop any further
         # executions until schema is updated 

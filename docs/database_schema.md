@@ -10,17 +10,19 @@ Tracks import sessions from Apple Photos.
 | Column | Type | Description |
 | :--- | :--- | :--- |
 | `id` | INTEGER PRIMARY KEY | Unique ID |
-| `uuid` | TEXT | Import session UUID |
+| `import_uuid` | TEXT | Import session UUID |
 | `import_timestamp_utc` | DATETIME | Timestamp of import |
 | `import_name` | TEXT | Human-friendly display name |
 | `camera_make` | TEXT | Manufacturer (e.g. Apple) |
 | `camera_model` | TEXT | Specific model (e.g. iPhone 16 Pro) |
 | `album` | TEXT | Album name if provided during import |
-| `asset_count` | INTEGER | Number of assets in the import session |
+| `assets_count` | INTEGER | Number of assets in the import session |
 | `months_detected` | TEXT | Comma-separated list of included months |
 | `status_code` | TEXT | Current lifecycle status of the import |
 | `min_filename` | TEXT | Smallest filename (alphabetically) in the import |
 | `max_filename` | TEXT | Largest filename (alphabetically) in the import |
+| `min_date` | TEXT | Smallest asset creation date in the import |
+| `max_date` | TEXT | Largest asset creation date in the import |
 | `sequencing_confirmed` | INTEGER | 1 if user confirmed sequencing is reasonable, else 0 |
 | `execution_id` | TEXT | UUID of the pipeline session that processed it |
 | `created_at_utc` | DATETIME | When record was added to the database |

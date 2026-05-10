@@ -45,6 +45,15 @@ def should_run_sync_metadata(cursor):
     if not os.path.exists(APPLE_PHOTOS_DB_COPY_PATH):
         return True  # If DB does not exist, better to run sync
 
+    # Check if necessary columns exist in imports table
+    try:
+        cursor.execute("SELECT min_date, max_date, months_detected FROM imports LIMIT 1")
+    except sqlite3.OperationalError:
+        logger.info("Schema mismatch detected in 'imports' table. Resetting sync flags to force metadata sync.")
+        cursor.execute("UPDATE db_updates SET raw_synced = 0, derived_synced = 0")
+        commit()
+        return True
+
     db_mod_time = os.path.getmtime(APPLE_PHOTOS_DB_COPY_PATH)
 
     if last_sync_time is None:

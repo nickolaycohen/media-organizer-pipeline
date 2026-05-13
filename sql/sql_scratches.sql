@@ -1,4 +1,37 @@
 
+-- sync photos derived query 
+SELECT
+        strftime('%Y-%m', datetime(z.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) || '_' || COALESCE(ea.ZCAMERAMODEL, 'Unknown'),
+    strftime('%Y-%m', datetime(z.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) || ' - ' || COALESCE(ea.ZCAMERAMODEL, 'Unknown'),
+    MIN(datetime(z.ZDATECREATED + 978307200, 'unixepoch', 'localtime')),
+    NULL,
+    COUNT(z.Z_ENT),
+    COALESCE(ea.ZCAMERAMAKE, 'Unknown'),
+    COALESCE(ea.ZCAMERAMODEL, 'Unknown'),
+    MIN(aaa.ZORIGINALFILENAME),
+    MAX(aaa.ZORIGINALFILENAME),
+    MIN(datetime(z.ZDATECREATED + 978307200, 'unixepoch', 'localtime')),
+    MAX(datetime(z.ZDATECREATED + 978307200, 'unixepoch', 'localtime')),
+    strftime('%Y-%m', datetime(z.ZDATECREATED + 978307200, 'unixepoch', 'localtime'))
+FROM ZASSET z
+LEFT JOIN ZEXTENDEDATTRIBUTES ea ON ea.ZASSET = z.Z_PK
+LEFT JOIN ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = z.Z_PK
+WHERE z.ZIMPORTSESSION IS NOT NULL
+GROUP BY 1, ea.ZCAMERAMAKE, ea.ZCAMERAMODEL
+ORDER BY 1 DESC
+
+delete FROM imports 
+where import_uuid in (72997, 72996, 72995)
+
+update imports
+set min_filename = NULL, max_filename = NULL, sequencing_confirmed = 0, min_date = NULL, max_date = NULL
+where import_uuid in (72997, 72996, 72995)
+
+-- check sequencing logic
+select * 
+from imports i 
+order by min_date desc
+
 -- find assets by camera model
 
 SELECT name, sql
@@ -49,7 +82,7 @@ ORDER BY code
 
 -- batches status
 select * 
-from month_batches mb 
+from month_batches mb 			
 order by mb."month" desc
 
 -- get google favorites by month - passed stage 550

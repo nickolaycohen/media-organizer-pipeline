@@ -8,7 +8,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
-from constants import LOG_PATH, MEDIA_ORGANIZER_DB_PATH, GOOGLE_PHOTOS_READONLY_SCOPES
+from constants import LOG_PATH, MEDIA_ORGANIZER_DB_PATH, GOOGLE_PHOTOS_EDIT_ACCESS_SCOPES
 from google_photos import create_or_get_album, get_all_favorites, authenticate
 from utils.logger import setup_logger
 from db.connections import get_connection, get_cursor, commit, close as close_conn
@@ -24,11 +24,8 @@ for handler in logger.handlers:
 # -------------------- Existing pull logic --------------------
 
 
-def get_album_items(album_id):
-    # This function needs read-only access to get album contents.
-    # The authenticate call inside get_all_favorites will likely handle this,
-    # but for clarity, we can authenticate here as well if needed.
-    creds = authenticate(scopes=GOOGLE_PHOTOS_READONLY_SCOPES)
+def get_album_items(creds, album_id):
+    """Fetches all media items from a specific album using provided credentials."""
     logger.info(f"📥 Fetching all media items from album ID: {album_id}")
     headers = {'Authorization': f'Bearer {creds.token}', 'Content-type': 'application/json'}
     url = 'https://photoslibrary.googleapis.com/v1/mediaItems:search'
@@ -53,25 +50,31 @@ def get_album_items(album_id):
 
 def main():
 
-    # DB calls
+    # --- Single, Consolidated Authentication ---
+    # This script needs to create albums and read the entire library.
+    # Authenticate once with a scope that covers all required actions.
+    logger.info("Authenticating with edit access for all operations...")
+    creds = authenticate(scopes=GOOGLE_PHOTOS_EDIT_ACCESS_SCOPES)
+    if not creds:
+        logger.error("Authentication failed. Cannot proceed.")
+        sys.exit(1)
+
     conn = get_connection()
     cursor = get_cursor()
 
     album_month = get_planned_month(cursor)
     if not album_month:
         logger.error("No active planned batch found. Please run the planner first.")
+        close_conn()
         return
 
     album_title = f"Currently Curating - {album_month}"
-    album_id = create_or_get_album(album_title)
-    if not album_id:
-        logger.error(f"Album '{album_title}' not found.")
-        sys.exit(1)
+    album_id = create_or_get_album(creds, album_title)
 
-    all_favorites = get_all_favorites()
+    all_favorites = get_all_favorites(creds)
     logger.info(f"📊 Total favorite items globally: {len(all_favorites)}")
 
-    album_items = get_album_items(album_id)
+    album_items = get_album_items(creds, album_id)
     logger.info(f"📊 Total media items in album '{album_title}': {len(album_items)}")
 
     favorite_set = {(f.get('filename'), f.get('mediaMetadata', {}).get('creationTime')) for f in all_favorites}
@@ -87,6 +90,16 @@ def main():
     )
 
     logger.info(f"✅ Matched {len(matched_sorted)} favorites from curated album.")
+
+    # --- Idempotency Improvement ---
+    # First, reset all google_favorite flags for the current month.
+    # This ensures that if a photo was previously a favorite but is no longer,
+    # its status is correctly updated in the database.
+    logger.info(f"Resetting google_favorite flag for all assets in month {album_month} before update...")
+    cursor.execute("UPDATE assets SET google_favorite = 0, updated_at_utc = datetime('now') WHERE month = ?", (album_month,))
+    logger.info(f"Reset {cursor.rowcount} assets. Now applying current favorites.")
+    commit()
+    # --- End Improvement ---
 
 
     update_count = 0
@@ -104,7 +117,7 @@ def main():
                 update_count += 1
 
     commit()
-    #con_close()
+    close_conn()
     logger.info(f"✅ Updated {update_count} asset(s) in database as Google favorites.")
 
     for item in matched_sorted:

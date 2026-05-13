@@ -10,13 +10,7 @@ from constants import MEDIA_ORGANIZER_DB_PATH, STAGING_ROOT, LOG_PATH
 from db.queries import get_planned_month
 from db.connections import get_connection, get_cursor, commit, close as close_conn
 from utils.logger import setup_logger
-from google_photos import create_or_get_album, upload_media, human_readable_size, check_google_quota, authenticate
-# from pull_google_favorites import get_album_id
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
-import google.auth.exceptions
+from google_photos import create_or_get_album, upload_media, human_readable_size, check_google_quota, authenticate, GOOGLE_PHOTOS_READONLY_SCOPES, GOOGLE_PHOTOS_APPEND_ONLY_SCOPES
 from datetime import datetime
 import logging
 from utils.logger import compute_file_hash
@@ -81,6 +75,10 @@ def main(args):
     else:
         # Use the centralized quota check, which handles its own authentication
         remaining_quota_bytes = check_google_quota()
+        if remaining_quota_bytes is None:
+            logger.error("❌ Aborting: Failed to verify Google Drive quota via API.")
+            close_conn()
+            sys.exit(1)
 
         # Calculate total size of current batch
         batch_size = sum(size for _, size in files)
@@ -130,12 +128,12 @@ def main(args):
                 logger.info(f"Batch {month} marked as partial upload (399) due to Google Drive quota limits.")
 
         album_title = f"Currently Curating - {month}"
-        album_id = create_or_get_album(album_title)
-        if not album_id:
-            logger.error(f"Could not create or find album '{album_title}'. Aborting upload.")
-            return
-        else:
-            logger.info(f"Created new album: {album_title} (ID: {album_id})")
+        # Authenticate with a scope that can list albums
+        creds_read = authenticate(scopes=GOOGLE_PHOTOS_READONLY_SCOPES)
+        album_id = create_or_get_album(creds_read, album_title)
+
+        # Authenticate with append-only scope for uploading
+        creds_append = authenticate(scopes=GOOGLE_PHOTOS_APPEND_ONLY_SCOPES)
 
     total_files = len(files)
     for idx, (file_path, file_size) in enumerate(files, start=1):
@@ -163,7 +161,7 @@ def main(args):
         else:
             try:
                 logger.info(f"[{idx}/{total_files}] Uploading: {filename} ({file_size_mb:.2f} MB)")
-                upload_media(file_path, album_id)
+                upload_media(creds_append, file_path, album_id)
                 logger.info(f"[{idx}/{total_files}] Uploaded: {filename}")
                 cursor.execute("""
                     INSERT INTO assets (

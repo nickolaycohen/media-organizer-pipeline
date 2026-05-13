@@ -13,7 +13,9 @@ def sync_metadata(logger):
         logger.error(f"Apple Photos database not found at {APPLE_PHOTOS_DB_COPY_PATH}")
         return
 
-    conn_media = sqlite3.connect(MEDIA_ORGANIZER_DB_PATH)
+    conn_media = sqlite3.connect(MEDIA_ORGANIZER_DB_PATH, timeout=30)
+    conn_media.execute("PRAGMA journal_mode=WAL;")
+    conn_media.execute("PRAGMA busy_timeout = 30000;")
     cursor_media = conn_media.cursor()
 
     try:
@@ -35,19 +37,19 @@ def sync_metadata(logger):
         cursor_media.execute(f"ATTACH DATABASE '{APPLE_PHOTOS_DB_COPY_PATH}' AS photos_db;")
         logger.info("Attached Photos.sqlite database.")
 
-        logger.info("Dropping old local copies of ZASSET, ZIMPORTSESSION and ZADDITIONALASSETATTRIBUTES if exist...")
-        cursor_media.execute("DROP TABLE IF EXISTS main.ZASSET;")
-        cursor_media.execute("DROP TABLE IF EXISTS main.ZIMPORTSESSION;")
-        cursor_media.execute("DROP TABLE IF EXISTS main.ZADDITIONALASSETATTRIBUTES;")
-        conn_media.commit()
-
-        # Create fresh local copies
-        logger.info("Copying ZASSET from Apple Photos...")
-        cursor_media.execute("CREATE TABLE main.ZASSET AS SELECT * FROM photos_db.ZASSET;")
-
-        logger.info("Copying ZADDITIONALASSETATTRIBUTES from Apple Photos...")
-        cursor_media.execute("CREATE TABLE main.ZADDITIONALASSETATTRIBUTES AS SELECT * FROM photos_db.ZADDITIONALASSETATTRIBUTES;")
-        conn_media.commit()
+        # Refresh local copies of heavy tables. ZIMPORTSESSION is optional in some Photos versions.
+        for table in ["ZASSET", "ZADDITIONALASSETATTRIBUTES", "ZEXTENDEDATTRIBUTES", "ZIMPORTSESSION"]:
+            cursor_media.execute("SELECT name FROM photos_db.sqlite_master WHERE type='table' AND name=?", (table,))
+            if cursor_media.fetchone():
+                logger.info(f"Copying {table} from Apple Photos...")
+                cursor_media.execute(f"DROP TABLE IF EXISTS main.{table};")
+                cursor_media.execute(f"CREATE TABLE main.{table} AS SELECT * FROM photos_db.{table};")
+                conn_media.commit()
+            else:
+                if table == "ZIMPORTSESSION":
+                    logger.warning(f"Optional table {table} not found in Apple Photos DB. Skipping.")
+                else:
+                    raise sqlite3.OperationalError(f"Required table {table} not found in photos_db.")
 
         logger.info("Copied tables successfully.")
 
@@ -84,5 +86,6 @@ if __name__ == '__main__':
         logger.info("Photos metadata sync completed successfully.")
     except Exception as e:
         logger.error(f"Sync failed: {e}")
+        sys.exit(1)
     finally:
         close_logger(logger=logger)

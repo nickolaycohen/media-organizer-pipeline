@@ -1,6 +1,7 @@
 import sys, os
 import logging
 import sqlite3
+import argparse
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from utils.logger import setup_logger, close_logger
@@ -27,12 +28,7 @@ def sync_assets(media_cursor, logger):
     # or might have aestetic score reeveluated
     # ideally this should be a refresh of the assets table with 
     # what exists in ZASSET table
-    media_cursor.execute("SELECT MAX(import_id) FROM assets")
-    latest_import_id = media_cursor.fetchone()[0] or 0
-    logger.info(f"Latest import session ID in DB: {latest_import_id}")
-
-
-    logger.info("Fetching assets from Apple Photos DB...")
+    logger.info("Syncing asset metadata (detecting new assets and updating aesthetic scores)...")
     media_cursor.execute("""
         SELECT 
             a.ZUUID, 
@@ -40,12 +36,14 @@ def sync_assets(media_cursor, logger):
             aaa.ZORIGINALFILENAME, 
             datetime(a.ZDATECREATED + 978307200, 'unixepoch'),
             datetime(a.ZADDEDDATE + 978307200, 'unixepoch'),
-            a.ZIMPORTSESSION,
-            strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) as month
+            strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) as import_id,
+            strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) as month,
+            COALESCE(ea.ZCAMERAMODEL, 'Unknown') as camera_model
         FROM ZASSET a
         JOIN ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK
-        WHERE a.ZIMPORTSESSION > ?
-    """, (latest_import_id,))
+        LEFT JOIN ZEXTENDEDATTRIBUTES ea ON ea.ZASSET = a.Z_PK
+        WHERE a.ZIMPORTSESSION IS NOT NULL
+    """)
     results = media_cursor.fetchall()
 
     logger.info(f"Fetched {len(results)} assets from Photos DB.")
@@ -54,7 +52,7 @@ def sync_assets(media_cursor, logger):
     assets_to_insert = []
 
     for row in results:
-        asset_id, score, filename, date_created, imported_date, import_id, month = row
+        asset_id, score, filename, date_created, imported_date, import_id, month, _ = row
         assets_to_insert.append((asset_id, score, filename, date_created, imported_date, import_id, month))
 
     if assets_to_insert:
@@ -105,29 +103,108 @@ def sync_assets(media_cursor, logger):
 
     logger.info("Smart albums synced successfully.")
 
-    # Incrementally insert new import session records into imports table
-    logger.info("Fetching latest import_uuid from imports table for incremental insert...")
-    media_cursor.execute("SELECT MAX(import_uuid) FROM imports")
-    max_import_uuid_row = media_cursor.fetchone()
-    max_import_uuid = max_import_uuid_row[0] if max_import_uuid_row and max_import_uuid_row[0] is not None else 0
+    logger.info("Ensuring imports table schema is up to date...")
 
-    logger.info(f"Latest import_uuid in imports table: {max_import_uuid}")
+    # Detect if the table has the legacy UNIQUE constraint in its definition
+    media_cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='imports'")
+    row = media_cursor.fetchone()
+    if row and ("UNIQUE" in row[0] and "import_timestamp_utc" in row[0] and "import_uuid" in row[0]):
+        logger.info("Legacy UNIQUE constraint detected in 'imports' table schema. Migrating table to remove it...")
+        
+        # 1. Rename old table
+        media_cursor.execute("ALTER TABLE imports RENAME TO imports_old")
+        
+        # 2. Create new table without the legacy composite UNIQUE constraint
+        media_cursor.execute("""
+            CREATE TABLE imports (
+                import_uuid TEXT,
+                import_name TEXT,
+                import_timestamp_utc TEXT,
+                album TEXT,
+                assets_count INTEGER,
+                camera_make TEXT,
+                camera_model TEXT,
+                min_filename TEXT,
+                max_filename TEXT,
+                min_date TEXT,
+                max_date TEXT,
+                months_detected TEXT,
+                execution_id TEXT,
+                status_code TEXT,
+                sequencing_confirmed INTEGER DEFAULT 0
+            )
+        """)
+        
+        # 3. Copy existing data (mapping columns carefully)
+        media_cursor.execute("""
+            INSERT INTO imports (
+                import_uuid, import_name, import_timestamp_utc, album, assets_count, 
+                camera_make, camera_model, min_filename, max_filename, min_date, 
+                max_date, months_detected, sequencing_confirmed
+            )
+            SELECT 
+                import_uuid, import_name, import_timestamp_utc, album, assets_count, 
+                camera_make, camera_model, min_filename, max_filename, min_date, 
+                max_date, months_detected, sequencing_confirmed
+            FROM imports_old
+        """)
+        
+        # 4. Drop old table
+        media_cursor.execute("DROP TABLE imports_old")
+        commit()
+        logger.info("Migration of 'imports' table completed successfully.")
 
-    logger.info("Inserting new import session records from ZIMPORTSESSION...")
+    # Create unique index to support UPSERT on (import_uuid, camera_model)
+    try:
+        media_cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_imports_uuid_model ON imports(import_uuid, camera_model)")
+        logger.info("Ensured unique index on imports(import_uuid, camera_model) exists.")
+    except sqlite3.OperationalError as e:
+        logger.warning(f"Could not create unique index on imports: {e}. If there are duplicate rows, you may need to clear the imports table.")
+
+    # Ensure necessary columns exist in imports table
+    for col in ["min_date", "max_date", "months_detected"]:
+        try:
+            media_cursor.execute(f"ALTER TABLE imports ADD COLUMN {col} TEXT")
+            logger.info(f"Updated imports table schema with missing column: {col}")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+    logger.info("Syncing import session records (inserting new and updating existing)...")
     media_cursor.execute('''
-        INSERT INTO imports (import_uuid, import_name, import_timestamp_utc, album, assets_count)
+        INSERT INTO imports (import_uuid, import_name, import_timestamp_utc, album, assets_count, camera_make, camera_model, min_filename, max_filename, min_date, max_date, months_detected)
         SELECT
-            ZIMPORTSESSION,  -- used as a stand-in for import_uuid
-            datetime((z.ZADDEDDATE + 978307200), 'unixepoch') || ' UTC - ' || ea.ZCAMERAMAKE || '-' || ea.ZCAMERAMODEL,
-            datetime((z.ZADDEDDATE + 978307200), 'unixepoch'),
+            strftime('%Y-%m', datetime(z.ZDATECREATED + 978307200, 'unixepoch', 'localtime')),
+            strftime('%Y-%m', datetime(z.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) || ' - ' || COALESCE(ea.ZCAMERAMODEL, 'Unknown'),
+            MIN(datetime(z.ZDATECREATED + 978307200, 'unixepoch', 'localtime')),
             NULL,
-            COUNT(z.Z_ENT)
+            COUNT(z.Z_ENT),
+            COALESCE(ea.ZCAMERAMAKE, 'Unknown'),
+            COALESCE(ea.ZCAMERAMODEL, 'Unknown'),
+            MIN(aaa.ZORIGINALFILENAME),
+            MAX(aaa.ZORIGINALFILENAME),
+            MIN(datetime(z.ZDATECREATED + 978307200, 'unixepoch', 'localtime')),
+            MAX(datetime(z.ZDATECREATED + 978307200, 'unixepoch', 'localtime')),
+            strftime('%Y-%m', datetime(z.ZDATECREATED + 978307200, 'unixepoch', 'localtime'))
         FROM photos_db.ZASSET z
         LEFT JOIN photos_db.ZEXTENDEDATTRIBUTES ea ON ea.ZASSET = z.Z_PK
-        WHERE z.ZIMPORTSESSION IS NOT NULL AND z.ZIMPORTSESSION > ?
-        GROUP BY z.ZIMPORTSESSION
-        ORDER BY z.ZIMPORTSESSION DESC, z.ZADDEDDATE DESC;
-    ''', (max_import_uuid,))
+        LEFT JOIN photos_db.ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = z.Z_PK
+        WHERE z.ZIMPORTSESSION IS NOT NULL
+        GROUP BY 1, ea.ZCAMERAMAKE, ea.ZCAMERAMODEL
+        ORDER BY 1 DESC
+        ON CONFLICT(import_uuid, camera_model) DO UPDATE SET
+            assets_count = excluded.assets_count,
+            min_filename = excluded.min_filename,
+            max_filename = excluded.max_filename,
+            min_date = excluded.min_date,
+            max_date = excluded.max_date,
+            months_detected = excluded.months_detected
+        WHERE assets_count != excluded.assets_count 
+           OR min_filename != excluded.min_filename 
+           OR max_filename != excluded.max_filename
+           OR min_date != excluded.min_date
+           OR max_date != excluded.max_date
+           OR months_detected != excluded.months_detected;
+    ''')
     commit()
 
     logger.info("New import sessions inserted successfully.")
@@ -157,22 +234,27 @@ def sync_assets(media_cursor, logger):
     commit()
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--force", action="store_true", help="Force sync even if derived_synced flag is set")
+    args = parser.parse_args()
+
     logger = setup_logger(LOG_PATH, MODULE_TAG)
     for handler in logger.handlers:
         handler.setFormatter(logging.Formatter('%(asctime)s [%(name)s:%(lineno)d] - %(levelname)s - %(message)s'))
 
-    # Check db_updates.derived_synced flag before running sync_assets
-    # import sqlite3
     conn = get_connection()
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout = 30000")
     media_cursor = get_cursor()
-    media_cursor.execute("SELECT derived_synced FROM db_updates ORDER BY id DESC LIMIT 1")
-    row = media_cursor.fetchone()
-    
-    if row and row[0] == 1:
-        logger.info("Derived sync flag is already set. Skipping derived assets sync.")
-        close_conn()
-        close_logger(logger=logger)
-        sys.exit(0)
+
+    if not args.force:
+        media_cursor.execute("SELECT derived_synced FROM db_updates ORDER BY id DESC LIMIT 1")
+        row = media_cursor.fetchone()
+        if row and row[0] == 1:
+            logger.info("Derived sync flag is already set. Skipping derived assets sync (use --force to override).")
+            close_conn()
+            close_logger(logger=logger)
+            sys.exit(0)
 
     try:
         sync_assets(media_cursor, logger)

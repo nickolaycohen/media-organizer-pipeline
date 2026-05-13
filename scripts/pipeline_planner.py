@@ -51,7 +51,7 @@ def should_run_sync_metadata(cursor):
     except sqlite3.OperationalError:
         logger.info("Schema mismatch detected in 'imports' table. Resetting sync flags to force metadata sync.")
         cursor.execute("UPDATE db_updates SET raw_synced = 0, derived_synced = 0")
-        commit()
+        cursor.connection.commit()
         return True
 
     db_mod_time = os.path.getmtime(APPLE_PHOTOS_DB_COPY_PATH)
@@ -64,7 +64,7 @@ def should_run_sync_metadata(cursor):
     return db_mod_time > last_sync_timestamp
 
 # Helper to run bootstrap steps
-def run_bootstrap_steps(cursor, auto_apply, logger):
+def run_bootstrap_steps(auto_apply, logger):
     """
     Run the bootstrap steps: copy_all_media_db.py, storage_status.py, sync_photos_metadata.py.
     """
@@ -72,7 +72,7 @@ def run_bootstrap_steps(cursor, auto_apply, logger):
         ("0.0 Copy all media DB", "copy_all_media_photos_db.py", []),
         ("0.1 Run storage manager", "storage_manager_main.py", ["--migrate"]),
         ("0.2 Sync assets", "sync_photos_raw.py", []),
-        ("0.3 Sync metadata", "sync_photos_derived.py", []),
+        ("0.3 Sync metadata", "sync_photos_derived.py", ["--force"]),
         ("1.0 Generate Batches", "generate_month_batches.py", [])
     ]
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -81,7 +81,15 @@ def run_bootstrap_steps(cursor, auto_apply, logger):
         logger.info(f"🔧 Running bootstrap step: {step_name} ({script_file})")
         try:
             if script_file in ["sync_photos_raw.py", "sync_photos_derived.py", "sync_photos_metadata.py"]:
-                if not should_run_sync_metadata(cursor):
+                # Isolate the check so the connection is definitely closed before the subprocess starts
+                tmp_conn = sqlite3.connect(MEDIA_ORGANIZER_DB_PATH)
+                tmp_conn.execute("PRAGMA journal_mode=WAL;")
+                tmp_conn.execute("PRAGMA busy_timeout = 30000;")
+                tmp_cursor = tmp_conn.cursor()
+                should_sync = should_run_sync_metadata(tmp_cursor)
+                tmp_conn.close()
+                
+                if not should_sync:
                     logger.info(f"Skipping {script_file} as sync is up to date.")
                     continue
             subprocess.run(["python3", script_path] + step_args, check=True)
@@ -94,77 +102,76 @@ def run_bootstrap_steps(cursor, auto_apply, logger):
             else:
                 sys.exit(1)
 
-def check_active_sources_import_status(cursor, conn, auto_apply):
+def check_active_sources_import_status(cursor, conn, month, auto_apply):
     """
-    Checks if all active camera models have imported assets for the latest complete month.
+    Checks if all active camera models have imported assets for the proposed month.
     Prompts user if any active source is missing.
     """
     if not ACTIVE_CAMERA_MODELS:
         logger.info("No active camera models configured. Skipping active source check.")
         return True
 
-    # Determine the latest complete month (e.g., April if current month is May)
-    latest_complete_month = datetime.now().replace(day=1) - timedelta(days=1)
-    latest_complete_month_str = latest_complete_month.strftime('%Y-%m')
+    months_to_check = [month]
 
-    logger.info(f"🔍 Checking active source imports for latest complete month: {latest_complete_month_str}")
-
-    # Attach the Apple Photos database
     try:
         cursor.execute(f"ATTACH DATABASE '{APPLE_PHOTOS_DB_COPY_PATH}' AS photos_db;")
         logger.debug("Attached Photos.sqlite database for active source check.")
 
-        # We use conditional aggregation (CASE WHEN) to get the range for the target month 
-        # while still being able to group by camera model.
-        query = """
-            SELECT 
-                xa.ZCAMERAMODEL,
-                COUNT(CASE WHEN strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch')) = ? THEN 1 END) AS assets_in_month,
-                MIN(CASE WHEN strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch')) = ? THEN aaa.ZORIGINALFILENAME END) AS min_filename,
-                MAX(CASE WHEN strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch')) = ? THEN aaa.ZORIGINALFILENAME END) AS max_filename,
-                MIN(CASE WHEN strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch')) = ? THEN datetime(a.ZDATECREATED + 978307200, 'unixepoch') END) AS min_date,
-                MAX(CASE WHEN strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch')) = ? THEN datetime(a.ZDATECREATED + 978307200, 'unixepoch') END) AS max_date,
-                GROUP_CONCAT(DISTINCT CASE WHEN strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch')) = ? THEN a.ZIMPORTSESSION END) AS involved_import_ids
-            FROM photos_db.ZASSET a
-            JOIN photos_db.ZEXTENDEDATTRIBUTES xa ON xa.ZASSET = a.Z_PK
-            JOIN photos_db.ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK
-            WHERE a.ZTRASHEDSTATE = 0
-              AND xa.ZCAMERAMODEL IN ({})
-              AND a.ZDATECREATED >= (strftime('%s', date('now', 'start of month', '-24 month')) - 978307200)
-              AND a.ZDATECREATED < (strftime('%s', date('now', 'start of month')) - 978307200)
-            GROUP BY xa.ZCAMERAMODEL
-        """.format(','.join(['?' for _ in ACTIVE_CAMERA_MODELS]))
+        for month_str in months_to_check:
+            source_metadata = []
+            # We use conditional aggregation (CASE WHEN) to get the range for the target month 
+            # while still being able to group by camera model.
+            query = """
+                SELECT 
+                    xa.ZCAMERAMODEL,
+                    COUNT(CASE WHEN strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) = ? THEN 1 END) AS assets_in_month,
+                    MIN(CASE WHEN strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) = ? THEN aaa.ZORIGINALFILENAME END) AS min_filename,
+                    MAX(CASE WHEN strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) = ? THEN aaa.ZORIGINALFILENAME END) AS max_filename,
+                    MIN(CASE WHEN strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) = ? THEN datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime') END) AS min_date,
+                    MAX(CASE WHEN strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) = ? THEN datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime') END) AS max_date,
+                    GROUP_CONCAT(DISTINCT CASE WHEN strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) = ? 
+                                               THEN strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) END) AS involved_import_ids
+                FROM photos_db.ZASSET a
+                JOIN photos_db.ZEXTENDEDATTRIBUTES xa ON xa.ZASSET = a.Z_PK
+                JOIN photos_db.ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK
+                JOIN imports i ON i.import_uuid = strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) 
+                              AND i.camera_model = xa.ZCAMERAMODEL
+                WHERE a.ZTRASHEDSTATE = 0
+                  AND xa.ZCAMERAMODEL IN ({})
+                  AND a.ZDATECREATED >= (strftime('%s', date(?, 'start of month', '-12 month')) - 978307200)
+                  AND a.ZDATECREATED < (strftime('%s', date(?, 'start of month', '+2 month')) - 978307200)
+                GROUP BY xa.ZCAMERAMODEL
+            """.format(','.join(['?' for _ in ACTIVE_CAMERA_MODELS]))
 
-        # Passing the month string 6 times for the aggregate filters and GROUP_CONCAT
-        cursor.execute(query, [latest_complete_month_str] * 6 + ACTIVE_CAMERA_MODELS)
-        results = cursor.fetchall()
-        found_models = set()
+            cursor.execute(query, [month_str] * 6 + ACTIVE_CAMERA_MODELS + [month_str + "-01", month_str + "-01"])
+            results = cursor.fetchall()
+            found_models = set()
 
-        for row in results:
-            model, count, f_min, f_max, d_min, d_max, involved_import_ids = row
-            if count > 0:
-                found_models.add(model)
-
-                # Reasonability check: parse numeric part from filenames (ignoring extensions)
+            for row in results:
+                model, count, f_min, f_max, d_min, d_max, involved_import_ids = row
                 num_min = None
                 num_max = None
-                if f_min:
-                    nums = re.findall(r'(\d+)', os.path.splitext(f_min)[0])
-                    if nums: num_min = int(nums[-1])
-                if f_max:
-                    nums = re.findall(r'(\d+)', os.path.splitext(f_max)[0])
-                    if nums: num_max = int(nums[-1])
-
                 gap_info = ""
-                if num_min is not None and num_max is not None:
-                    # We use abs because string MIN/MAX might flip if sequence is not zero-padded
-                    expected_range = abs(num_max - num_min) + 1
-                    if expected_range > count:
-                        gap_info = f" | ⚠️ Reasonability: {expected_range} expected vs {count} found (gap of {expected_range - count})"
+                if count > 0:
+                    found_models.add(model)
+
+                    # Reasonability check: parse numeric part from filenames (ignoring extensions)
+                    if f_min:
+                        nums = re.findall(r'(\d+)', os.path.splitext(f_min)[0])
+                        if nums: num_min = int(nums[-1])
+                    if f_max:
+                        nums = re.findall(r'(\d+)', os.path.splitext(f_max)[0])
+                        if nums: num_max = int(nums[-1])
+
+                    if num_min is not None and num_max is not None:
+                        # We use abs because string MIN/MAX might flip if sequence is not zero-padded
+                        expected_range = abs(num_max - num_min) + 1
+                        if expected_range > count:
+                            gap_info = f" | ⚠️ Reasonability: {expected_range} expected vs {count} found (gap of {expected_range - count})"
 
                 # Continuity check with previous month's confirmed imports
                 continuity_info = ""
-                previous_month = (latest_complete_month.replace(day=1) - timedelta(days=1)).strftime('%Y-%m')
+                previous_month = (datetime.strptime(month_str, '%Y-%m').replace(day=1) - timedelta(days=1)).strftime('%Y-%m')
                 cursor.execute("""
                     SELECT MAX(max_filename), MAX(max_date)
                     FROM imports
@@ -188,52 +195,79 @@ def check_active_sources_import_status(cursor, conn, auto_apply):
                     if d_min < prev_max_date:
                         continuity_info += f" | ⚠️ Date overlap from {previous_month}: {prev_max_date} -> {d_min}"
 
-                logger.info(f"📸 Source: {model:20} | Count: {count:4} | Files: {f_min} -> {f_max} | Dates: {d_min} to {d_max}{gap_info}{continuity_info}")
+                logger.info(f"📸 Month: {month_str} | Source: {model:20} | Count: {count:4} | Files: {f_min} -> {f_max} | Dates: {d_min} to {d_max}{gap_info}{continuity_info}")
+                source_metadata.append({
+                    'row': row,
+                    'gap_info': gap_info,
+                    'continuity_info': continuity_info
+                })
 
-        missing_models = set(ACTIVE_CAMERA_MODELS) - found_models
+            missing_models = set(ACTIVE_CAMERA_MODELS) - found_models
 
-        if missing_models:
-            logger.warning(f"⚠️ Missing imports for active camera models in {latest_complete_month_str}: {', '.join(missing_models)}")
+            if missing_models:
+                logger.warning(f"⚠️ Missing imports for active camera models in {month_str}: {', '.join(missing_models)}")
+                if not auto_apply:
+                    proceed_input = input(f"Some active sources are missing imports for {month_str}. Do you want to proceed? [y/N]: ")
+                    if proceed_input.strip().lower() != 'y':
+                        logger.info("Operation aborted by user due to missing active source imports.")
+                        sys.exit(0)
+                else:
+                    logger.error(f"❌ Auto-apply aborted: Missing active source imports for {month_str}. Manual intervention required.")
+                    sys.exit(1)
+
+            # Per-source sequencing confirmation
             if not auto_apply:
-                proceed_input = input("Some active sources are missing imports for the latest complete month. Do you want to proceed? [y/N]: ")
-                if proceed_input.strip().lower() != 'y':
-                    logger.info("Operation aborted by user due to missing active source imports.")
-                    sys.exit(0)
-            else:
-                logger.error("❌ Auto-apply aborted: Missing active source imports for the latest complete month. Manual intervention required.")
-                sys.exit(1)
-        else:
-            logger.info(f"✅ All active camera models have imports for {latest_complete_month_str}.")
+                for entry in source_metadata:
+                    row = entry['row']
+                    gap_info = entry['gap_info']
+                    continuity_info = entry['continuity_info']
+                    model, count, f_min, f_max, d_min, d_max, involved_import_ids = row
 
-        # Per-source sequencing confirmation
-        if not auto_apply:
-            for row in results:
-                model, count, f_min, f_max, d_min, d_max, involved_import_ids = row
-                if count == 0 or not involved_import_ids:
-                    continue
-                
-                # Extract individual import IDs from the concatenated string
-                import_id_list = involved_import_ids.split(',')
-                placeholders = ','.join(['?' for _ in import_id_list])
-                
-                # Check which of these involved imports are still unconfirmed in our local table
-                cursor.execute("""
-                    SELECT COUNT(*) FROM imports
-                    WHERE import_uuid IN ({})
-                      AND (sequencing_confirmed = 0 OR sequencing_confirmed IS NULL)
-                """.format(placeholders), import_id_list)
-                unconfirmed_count = cursor.fetchone()[0]
+                    if count == 0 or not involved_import_ids:
+                        continue
+                    
+                    # Extract individual import IDs from the concatenated string
+                    import_id_list = involved_import_ids.split(',')
+                    placeholders = ','.join(['?' for _ in import_id_list])
+                    
+                    # Check which of these involved imports are still unconfirmed in our local table
+                    cursor.execute("""
+                        SELECT COUNT(*) FROM imports
+                        WHERE import_uuid IN ({}) AND camera_model = ?
+                          AND (sequencing_confirmed = 0 OR sequencing_confirmed IS NULL)
+                    """.format(placeholders), import_id_list + [model])
+                    unconfirmed_count = cursor.fetchone()[0]
 
-                if unconfirmed_count > 0:
-                    choice = input(f"Verifying that {model} filenames for {latest_complete_month_str} are reasonable. Select I to mark the import as reasonable. [I/n]: ").strip().upper()
-                    if choice == 'I':
-                        cursor.execute("""
-                            UPDATE imports 
-                            SET sequencing_confirmed = 1 
-                            WHERE import_uuid IN ({})
-                        """.format(placeholders), import_id_list)
-                        conn.commit()
-                        logger.info(f"✅ Marked involved imports for {model} in {latest_complete_month_str} as reasonable.")
+                    if unconfirmed_count > 0:
+                        choice = input(f"Verifying {model} for {month_str}: {f_min} -> {f_max} ({d_min} to {d_max}){gap_info}{continuity_info}\nMark as reasonable? [I/n]: ").strip().upper()
+                        if choice == 'I':
+                            for import_uuid in import_id_list:
+                                # Calculate metadata specific to this individual import_uuid for the month
+                                cursor.execute("""
+                                    SELECT 
+                                        MIN(aaa.ZORIGINALFILENAME),
+                                        MAX(aaa.ZORIGINALFILENAME),
+                                        MIN(datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')),
+                                        MAX(datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime'))
+                                    FROM photos_db.ZASSET a
+                                    JOIN photos_db.ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK
+                                    WHERE a.ZIMPORTSESSION = ?
+                                      AND strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) = ?
+                                """, (import_uuid, month_str))
+                                res = cursor.fetchone()
+                                if res:
+                                    s_f_min, s_f_max, s_d_min, s_d_max = res
+                                    cursor.execute("""
+                                        UPDATE imports 
+                                        SET sequencing_confirmed = 1,
+                                            min_filename = COALESCE(min_filename, ?),
+                                            max_filename = COALESCE(max_filename, ?),
+                                            min_date = COALESCE(min_date, ?),
+                                            max_date = COALESCE(max_date, ?)
+                                    WHERE import_uuid = ? AND camera_model = ?
+                                """, (s_f_min, s_f_max, s_d_min, s_d_max, import_uuid, model))
+                            conn.commit()
+                            logger.info(f"✅ Marked involved imports for {model} in {month_str} as reasonable and updated metadata individually.")
     finally:
         cursor.execute("DETACH DATABASE photos_db;")
         logger.debug("Detached Photos.sqlite database.")
@@ -295,7 +329,7 @@ def verify_sequencing_for_planned_month(cursor, conn, month, auto_apply):
     Prompts the user if confirmation is missing.
     """
     cursor.execute("""
-        SELECT DISTINCT i.import_uuid, i.camera_model, i.min_filename, i.max_filename, i.assets_count
+        SELECT DISTINCT i.import_uuid, i.camera_model, i.min_filename, i.max_filename, i.assets_count, i.min_date, i.max_date
         FROM imports i
         JOIN assets a ON a.import_id = i.import_uuid
         WHERE a.month = ? AND (i.sequencing_confirmed = 0 OR i.sequencing_confirmed IS NULL)
@@ -306,7 +340,24 @@ def verify_sequencing_for_planned_month(cursor, conn, month, auto_apply):
         return True
 
     logger.info(f"🧐 Found {len(unconfirmed)} import sessions for {month} requiring sequencing confirmation.")
-    for uuid, model, f_min, f_max, count in unconfirmed:
+    for uuid, model, f_min, f_max, count, d_min, d_max in unconfirmed:
+
+        # Fallback for missing metadata in the imports table by querying the local assets table
+        if not f_min or not f_max or not d_min or not d_max:
+            cursor.execute("""
+                SELECT MIN(original_filename), MAX(original_filename), MIN(date_created_utc), MAX(date_created_utc)
+                FROM assets WHERE import_id = ?
+            """, (uuid,))
+            res = cursor.fetchone()
+            if res:
+                f_min = f_min or res[0]
+                f_max = f_max or res[1]
+                d_min = d_min or res[2]
+                d_max = d_max or res[3]
+
+        if not model:
+            model = "Unknown Model"
+
         num_min_matches = re.findall(r'(\d+)', os.path.splitext(f_min)[0]) if f_min else []
         num_min = int(num_min_matches[-1]) if num_min_matches else 0
         num_max_matches = re.findall(r'(\d+)', os.path.splitext(f_max)[0]) if f_max else []
@@ -315,18 +366,44 @@ def verify_sequencing_for_planned_month(cursor, conn, month, auto_apply):
         expected = abs(num_max - num_min) + 1
         gap = expected - count if expected > count else 0
         gap_str = f" | ⚠️ Gap detected: {gap} items" if gap > 0 else ""
-        logger.info(f"   - Session {uuid} ({model}): {f_min} -> {f_max} ({count} files){gap_str}")
+        logger.info(f"   - Session {uuid} ({model}): {f_min} -> {f_max} ({d_min} to {d_max}) ({count} files){gap_str}")
+
+        if auto_apply:
+            continue
+
+        choice = input(f"Verifying {model} session {uuid}: {f_min} -> {f_max} ({d_min} to {d_max}) ({count} files){gap_str}\nMark as reasonable? [I/n]: ").strip().upper()
+        if choice == 'I':
+            # Calculate missing metadata from assets table
+            cursor.execute("""
+                SELECT MIN(original_filename), MAX(original_filename), MIN(date_created_utc), MAX(date_created_utc)
+                FROM assets WHERE import_id = ?
+            """, (uuid,))
+            calc_f_min, calc_f_max, calc_d_min, calc_d_max = cursor.fetchone()
+
+            cursor.execute("""
+                UPDATE imports 
+                SET sequencing_confirmed = 1,
+                    min_filename = COALESCE(min_filename, ?),
+                    max_filename = COALESCE(max_filename, ?),
+                    min_date = COALESCE(min_date, ?),
+                    max_date = COALESCE(max_date, ?)
+                WHERE import_uuid = ? AND camera_model = ?
+            """, (calc_f_min, calc_f_max, calc_d_min, calc_d_max, uuid, model))
+            conn.commit()
+            logger.info(f"✅ Marked import {uuid} for {model} as reasonable and updated metadata.")
 
     if auto_apply:
         return True
 
-    choice = input("Verifying that the months filenames are reasonable. Select I to mark the import as reasonable. [I/n]: ").strip().upper()
-    if choice == 'I':
-        placeholders = ','.join(['?' for _ in unconfirmed])
-        cursor.execute(f"UPDATE imports SET sequencing_confirmed = 1 WHERE import_uuid IN ({placeholders})", [row[0] for row in unconfirmed])
-        conn.commit()
-        return True
-    return False
+    # Final check: are there any remaining unconfirmed sessions for this month?
+    cursor.execute("""
+        SELECT COUNT(*)
+        FROM imports i
+        JOIN assets a ON a.import_id = i.import_uuid
+        WHERE a.month = ? AND (i.sequencing_confirmed = 0 OR i.sequencing_confirmed IS NULL)
+    """, (month,))
+    remaining = cursor.fetchone()[0]
+    return remaining == 0
 
 def get_stage_transitions(cursor):
     cursor.execute("""
@@ -392,14 +469,12 @@ def display_summary(transitions, batches):
 def main(auto_apply):
     # Set up logger with line number in format
 
-    conn = get_connection()
-    cursor = get_cursor()
-
     # Run bootstrap steps before proceeding
-    run_bootstrap_steps(cursor, auto_apply, logger)
+    run_bootstrap_steps(auto_apply, logger)
 
-    # Check active sources import status
-    check_active_sources_import_status(cursor, conn, auto_apply)
+    conn = get_connection()
+    conn.execute("PRAGMA busy_timeout = 30000")
+    cursor = get_cursor()
 
     # Shared credentials for all Google API calls in this planner session
     creds = authenticate(scopes=PLANNER_REQUIRED_SCOPES)
@@ -423,7 +498,6 @@ def main(auto_apply):
     manual_candidates = []
     retryable_candidates = []
     pipeline_candidates = []
-    remote_favs_cache = None
 
     for month in months_descending:
         month_status = None
@@ -433,44 +507,6 @@ def main(auto_apply):
                 break
         if month_status is None:
             continue
-
-        # --- NEW: Manual Upload Detection / Fast-Forward Logic ---
-        # If the month is in an early stage but we suspect it might have been manually uploaded,
-        # check for remote favorites.
-        if month_status < '550':
-            # Only fetch remote favorites once per planner run
-            if remote_favs_cache is None:
-                try:
-                    logger.info("🌐 Fetching remote favorites from Google Photos API to detect potential manual uploads...")
-                    remote_favs_cache = get_all_favorites(creds)
-                except Exception as e:
-                    logger.warning(f"Failed to pre-fetch remote favorites: {e}")
-                    remote_favs_cache = []
-
-            fav_count, source, fav_names = check_favorites_count(cursor, month, check_remote=True, all_favs=remote_favs_cache, creds=creds, verbose=False)
-            if source == 'remote' and fav_count > 0:
-                logger.info(f"✨ [Manual Upload Detected] Month {month} has {fav_count} favorites on Google Photos: {fav_names}")
-                logger.info(f"Current local status is '{month_status}' (Export/Upload stage).")
-                
-                if not auto_apply:
-                    prompt = f"Would you like to skip Export/Upload and fast-forward {month} to 'Pull Favorites' stage? [y/N]: "
-                    jump_input = input(prompt)
-                    if jump_input.strip().lower() == 'y':
-                        # Identify the code that enables Pull Favorites (550)
-                        cursor.execute("""
-                            SELECT preceding_code FROM batch_status 
-                            WHERE code = '550' AND transition_type = 'pipeline'
-                        """)
-                        row = cursor.fetchone()
-                        if row:
-                            new_status = row[0]
-                            cursor.execute("UPDATE month_batches SET status_code = ? WHERE month = ?", (new_status, month))
-                            commit()
-                            logger.info(f"✅ Month {month} status fast-forwarded to {new_status}. Re-run planner to see the new execution plan.")
-                            close_conn()
-                            sys.exit(0)
-                        else:
-                            logger.warning("Could not find pipeline transition for stage 550 to perform fast-forward.")
 
         cursor.execute("""
             SELECT code, preceding_code, full_description, transition_type, short_label
@@ -701,6 +737,16 @@ def main(auto_apply):
             [t for t in transitions if t[3] == 'pipeline'],
             current_status
         )
+
+        # Check active sources import status for the proposed month
+        check_active_sources_import_status(cursor, conn, latest_month, auto_apply)
+
+        # --- Check sequencing before recording the plan ---
+        if not verify_sequencing_for_planned_month(cursor, conn, latest_month, auto_apply):
+            logger.warning(f"Sequencing not confirmed for {latest_month}. Aborting plan recording.")
+            close_conn()
+            sys.exit(0)
+
         logger.info(f"Run pipeline for: Month={latest_month}, Transitions={full_transition_list}")
 
         # --- Check for favorites readiness if transition involves pulling or ranking ---
@@ -795,12 +841,6 @@ def main(auto_apply):
                     sys.exit(1)
             else:
                 logger.info(f"Enough Google Drive space available for upload. Free space: {human_readable_size(free_space)}, Staging size: {human_readable_size(staging_size)}")
-
-        # --- Check sequencing before recording the plan ---
-        if not verify_sequencing_for_planned_month(cursor, conn, latest_month, auto_apply):
-            logger.warning(f"Sequencing not confirmed for {latest_month}. Aborting plan recording.")
-            close_conn()
-            sys.exit(0)
 
         logger.info("🚀 Executing planned steps...")
         set_planned_month(cursor, latest_month)

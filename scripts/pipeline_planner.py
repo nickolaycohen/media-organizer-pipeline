@@ -130,11 +130,11 @@ def check_active_sources_import_status(cursor, conn, month, auto_apply):
                     MIN(CASE WHEN strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) = ? THEN datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime') END) AS min_date,
                     MAX(CASE WHEN strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) = ? THEN datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime') END) AS max_date,
                     GROUP_CONCAT(DISTINCT CASE WHEN strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) = ? 
-                                               THEN strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) END) AS involved_import_ids
+                                               THEN a.ZIMPORTSESSION END) AS involved_import_ids
                 FROM photos_db.ZASSET a
                 JOIN photos_db.ZEXTENDEDATTRIBUTES xa ON xa.ZASSET = a.Z_PK
                 JOIN photos_db.ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK
-                JOIN imports i ON i.import_uuid = strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) 
+                JOIN imports i ON i.import_uuid = a.ZIMPORTSESSION 
                               AND i.camera_model = xa.ZCAMERAMODEL
                 WHERE a.ZTRASHEDSTATE = 0
                   AND xa.ZCAMERAMODEL IN ({})
@@ -238,8 +238,40 @@ def check_active_sources_import_status(cursor, conn, month, auto_apply):
                     """.format(placeholders), import_id_list + [model])
                     unconfirmed_count = cursor.fetchone()[0]
 
+                    #   TODO: Before the promt we should check confirmed months for each source in comparison to months in the past or in the future relative to the proposed month
                     if unconfirmed_count > 0:
-                        choice = input(f"Verifying {model} for {month_str}: {f_min} -> {f_max} ({d_min} to {d_max}){gap_info}{continuity_info}\nMark as reasonable? [I/n]: ").strip().upper()
+                        # Determine naming pattern (e.g., 'IMG_') to filter irrelevant conventions
+                        pattern = "*"
+                        if f_min:
+                            p_match = re.match(r'^([a-zA-Z_-]+)', f_min)
+                            if p_match:
+                                pattern = p_match.group(1) + "*"
+
+                        # Fetch global boundaries for this model before and after the current month
+                        cursor.execute("""
+                            SELECT MIN(min_filename), MAX(max_filename), MIN(min_date), MAX(max_date)
+                            FROM imports
+                            WHERE camera_model = ? AND max_date < ? AND min_filename GLOB ?
+                        """, (model, f"{month_str}-01 00:00:00", pattern))
+                        b = cursor.fetchone()
+                        before_str = f"  Before:  {b[0]} -> {b[1]} ({b[2]} to {b[3]})" if b and b[1] else "  Before:  None"
+
+                        cursor.execute("""
+                            SELECT MIN(min_filename), MAX(max_filename), MIN(min_date), MAX(max_date)
+                            FROM imports
+                            WHERE camera_model = ? AND min_date >= date(?, 'start of month', '+1 month') AND min_filename GLOB ?
+                        """, (model, f"{month_str}-01", pattern))
+                        a = cursor.fetchone()
+                        after_str = f"  After:   {a[0]} -> {a[1]} ({a[2]} to {a[3]})" if a and a[0] else "  After:   None"
+
+                        print(f"Verifying {model} for {month_str}:")
+                        print(before_str)
+                        choice = input(
+                            f"  Current: {f_min} -> {f_max} ({d_min} to {d_max}){gap_info}{continuity_info}\n"
+                            f"{after_str}\n"
+                            f"Mark as reasonable? [I/n]: "
+                        ).strip().upper()
+
                         if choice == 'I':
                             for import_uuid in import_id_list:
                                 # Calculate metadata specific to this individual import_uuid for the month
@@ -268,6 +300,22 @@ def check_active_sources_import_status(cursor, conn, month, auto_apply):
                                 """, (s_f_min, s_f_max, s_d_min, s_d_max, import_uuid, model))
                             conn.commit()
                             logger.info(f"✅ Marked involved imports for {model} in {month_str} as reasonable and updated metadata individually.")
+                        else:
+                            print(f"\n❌ Reasonability rejected for {model} in {month_str}. Listing involved assets:")
+                            cursor.execute(f"""
+                                SELECT aaa.ZORIGINALFILENAME, datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')
+                                FROM photos_db.ZASSET a
+                                JOIN photos_db.ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK
+                                LEFT JOIN photos_db.ZEXTENDEDATTRIBUTES ea ON ea.ZASSET = a.Z_PK
+                                WHERE a.ZIMPORTSESSION IN ({placeholders})
+                                  AND COALESCE(ea.ZCAMERAMODEL, 'Unknown') = ?
+                                  AND strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) = ?
+                                ORDER BY aaa.ZORIGINALFILENAME
+                            """, import_id_list + [model, month_str])
+                            for fname, dt in cursor.fetchall():
+                                print(f"  - {fname} ({dt})")
+                            logger.error("Execution halted by user. Source data needs fixing.")
+                            sys.exit(1)
     finally:
         cursor.execute("DETACH DATABASE photos_db;")
         logger.debug("Detached Photos.sqlite database.")
@@ -371,7 +419,38 @@ def verify_sequencing_for_planned_month(cursor, conn, month, auto_apply):
         if auto_apply:
             continue
 
-        choice = input(f"Verifying {model} session {uuid}: {f_min} -> {f_max} ({d_min} to {d_max}) ({count} files){gap_str}\nMark as reasonable? [I/n]: ").strip().upper()
+        # Determine naming pattern (e.g., 'IMG_') to filter irrelevant conventions
+        pattern = "*"
+        if f_min:
+            p_match = re.match(r'^([a-zA-Z_-]+)', f_min)
+            if p_match:
+                pattern = p_match.group(1) + "*"
+
+        # Fetch global boundaries for this model before and after the current month
+        cursor.execute("""
+            SELECT MIN(min_filename), MAX(max_filename), MIN(min_date), MAX(max_date)
+            FROM imports
+            WHERE camera_model = ? AND max_date < ? AND min_filename GLOB ?
+        """, (model, f"{month}-01 00:00:00", pattern))
+        b = cursor.fetchone()
+        before_str = f"  Before:  {b[0]} -> {b[1]} ({b[2]} to {b[3]})" if b and b[1] else "  Before:  None"
+
+        cursor.execute("""
+            SELECT MIN(min_filename), MAX(max_filename), MIN(min_date), MAX(max_date)
+            FROM imports
+            WHERE camera_model = ? AND min_date >= date(?, 'start of month', '+1 month') AND min_filename GLOB ?
+        """, (model, f"{month}-01", pattern))
+        a = cursor.fetchone()
+        after_str = f"  After:   {a[0]} -> {a[1]} ({a[2]} to {a[3]})" if a and a[0] else "  After:   None"
+
+        print(f"Verifying {model} session {uuid} for {month}:")
+        print(before_str)
+        choice = input(
+            f"  Current: {f_min} -> {f_max} ({d_min} to {d_max}) ({count} files){gap_str}\n"
+            f"{after_str}\n"
+            f"Mark as reasonable? [I/n]: "
+        ).strip().upper()
+
         if choice == 'I':
             # Calculate missing metadata from assets table
             cursor.execute("""
@@ -391,6 +470,27 @@ def verify_sequencing_for_planned_month(cursor, conn, month, auto_apply):
             """, (calc_f_min, calc_f_max, calc_d_min, calc_d_max, uuid, model))
             conn.commit()
             logger.info(f"✅ Marked import {uuid} for {model} as reasonable and updated metadata.")
+        else:
+            print(f"\n❌ Reasonability rejected for session {uuid}. Listing involved assets:")
+            # Attach Photos DB to get camera-model filtered results since assets table lacks model info
+            cursor.execute(f"ATTACH DATABASE '{APPLE_PHOTOS_DB_COPY_PATH}' AS photos_db_tmp;")
+            try:
+                cursor.execute("""
+                    SELECT aaa.ZORIGINALFILENAME, datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')
+                    FROM photos_db_tmp.ZASSET a
+                    JOIN photos_db_tmp.ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK
+                    LEFT JOIN photos_db_tmp.ZEXTENDEDATTRIBUTES ea ON ea.ZASSET = a.Z_PK
+                    WHERE a.ZIMPORTSESSION = ?
+                      AND COALESCE(ea.ZCAMERAMODEL, 'Unknown') = ?
+                      AND strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) = ?
+                    ORDER BY aaa.ZORIGINALFILENAME
+                """, (uuid, model, month))
+                for fname, dt in cursor.fetchall():
+                    print(f"  - {fname} ({dt})")
+            finally:
+                cursor.execute("DETACH DATABASE photos_db_tmp;")
+            logger.error("Execution halted by user. Source data needs fixing.")
+            sys.exit(1)
 
     if auto_apply:
         return True
@@ -452,7 +552,7 @@ def get_latest_import_and_month(cursor, transition_type="pipeline"):
     return cursor.fetchone()
 
 
-def display_summary(transitions, batches):
+def display_summary(transitions, batches, remote_favs_cache=None):
     print("\n=== 📊 Stage Transitions ===")
     for code, prev, desc, ttype, label in transitions:
         print(f"{prev} ➜ {code}: {desc} (Type: {ttype})")
@@ -461,10 +561,18 @@ def display_summary(transitions, batches):
     for month, status in batches:
         print(f"Month: {month}, Status: {status}")
 
-    # TODO - Cannot determine below without knowing the transition type
-    # print("\n=== 🗓️ Latest Info ===")
-    # print(f"Latest Import Month: {latest_import}")
-    # print(f"Latest Complete Month: {latest_month}")
+    if remote_favs_cache:
+        fav_counts = {}
+        for item in remote_favs_cache:
+            creation_time = item.get('mediaMetadata', {}).get('creationTime')
+            if creation_time:
+                month_key = creation_time[:7]  # Extract YYYY-MM
+                fav_counts[month_key] = fav_counts.get(month_key, 0) + 1
+        
+        if fav_counts:
+            print("\n=== ⭐ Remote Favorites (Google Photos) by Month ===")
+            for month in sorted(fav_counts.keys(), reverse=True):
+                print(f"Month: {month}, Favorites: {fav_counts[month]}")
 
 def main(auto_apply):
     # Set up logger with line number in format
@@ -479,13 +587,21 @@ def main(auto_apply):
     # Shared credentials for all Google API calls in this planner session
     creds = authenticate(scopes=PLANNER_REQUIRED_SCOPES)
 
+    # Pre-fetch remote favorites to avoid repeated API calls during analysis
+    remote_favs_cache = None
+    try:
+        logger.info("🌐 Fetching remote favorites from Google Photos API to verify curation status...")
+        remote_favs_cache = get_all_favorites(creds)
+    except Exception as e:
+        logger.warning(f"Could not pre-fetch remote favorites: {e}")
+
     transitions = get_stage_transitions(cursor)
     batches = get_batch_statuses(cursor)
     # TODO - need to fix this - those latest values make sense only when transition type is known
     # TODO - unless we filtered right here by pipeline type
     # latest_import, latest_month = get_latest_import_and_month(cursor)
 
-    display_summary(transitions, batches)
+    display_summary(transitions, batches, remote_favs_cache)
 
     logger.info("=== ✅ Suggested Action ===")
 
@@ -588,13 +704,21 @@ def main(auto_apply):
             selected_type = None
         else:
             # Check for favorites before prompting for manual completion
-            fav_count, source, fav_names = check_favorites_count(cursor, latest_month, check_remote=True, creds=creds)
+            fav_count, source, fav_names = check_favorites_count(
+                cursor, latest_month, check_remote=True, 
+                all_favs=remote_favs_cache, creds=creds
+            )
             if fav_count == 0:
-                logger.warning(f"⚠️ No favorites found in Google Photos for {latest_month}. Starring may not be complete.")
+                if current_status == '500':
+                    logger.info(f"⏸️ Manual transition for {latest_month} (500 -> 550) is blocked: No favorites detected in Google Photos. Curation must be completed manually first.")
+                    # Invalidate manual selection to fall back to retryable/pipeline candidates
+                    selected_type = None
+                else:
+                    logger.warning(f"⚠️ No favorites found in Google Photos for {latest_month}. Starring may not be complete.")
             else:
                 logger.info(f"✨ Detected {fav_count} favorites for month {latest_month} in Google Photos (Source: {source}).")
 
-            if not auto_apply:
+            if selected_type == 'manual' and not auto_apply:
                 proceed_input = input(f"Please confirm that the '{short_label}' task has been completed so I can move month {latest_month} to the next phase? [y/N]: ")
                 if proceed_input.strip().lower() == 'y':
                     # Find next status code for this manual transition
@@ -754,13 +878,19 @@ def main(auto_apply):
         is_after_pull = any('Rank Assets' in str(t) or 'Ranking' in str(t) for t in full_transition_list)
         
         if is_favorites_pull:
-            fav_count, source, fav_names = check_favorites_count(cursor, latest_month, check_remote=True, creds=creds)
+            fav_count, source, fav_names = check_favorites_count(
+                cursor, latest_month, check_remote=True, 
+                all_favs=remote_favs_cache, creds=creds
+            )
             if fav_count == 0:
                 logger.warning(f"⚠️ Suggested batch {latest_month} has no favorites in Google Photos yet.")
             else:
                 logger.info(f"✨ Batch {latest_month} is ready with {fav_count} favorites in Google Photos (Source: {source}).")
         elif is_after_pull:
-            fav_count, source, fav_names = check_favorites_count(cursor, latest_month, check_remote=False, creds=creds)
+            fav_count, source, fav_names = check_favorites_count(
+                cursor, latest_month, check_remote=False, 
+                all_favs=remote_favs_cache, creds=creds
+            )
             if fav_count == 0:
                 logger.warning(f"⚠️ Suggested batch {latest_month} has 0 favorites in local DB (Source: {source}). Ranking steps may be skipped.")
 

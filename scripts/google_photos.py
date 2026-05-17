@@ -199,7 +199,17 @@ def get_all_favorites(creds):
             break
         body['pageToken'] = next_page_token
 
-    logger.info(f"✅ Finished fetching favorites data. Total favorites found: {len(favorites)}")
+    if favorites:
+        months = {}
+        for item in favorites:
+            c_time = item.get('mediaMetadata', {}).get('creationTime', '')
+            if c_time:
+                m = c_time[:7]
+                months[m] = months.get(m, 0) + 1
+        month_summary = ", ".join([f"{m}: {count}" for m, count in sorted(months.items(), reverse=True)])
+        logger.info(f"✅ Finished fetching favorites data. Total: {len(favorites)}. Breakdown: {month_summary}")
+    else:
+        logger.info(f"✅ Finished fetching favorites data. Total: 0")
     return favorites
 
 def check_google_quota(creds=None):

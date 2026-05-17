@@ -36,7 +36,7 @@ def sync_assets(media_cursor, logger):
             aaa.ZORIGINALFILENAME, 
             datetime(a.ZDATECREATED + 978307200, 'unixepoch'),
             datetime(a.ZADDEDDATE + 978307200, 'unixepoch'),
-            strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) as import_id,
+            a.ZIMPORTSESSION as import_id,
             strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) as month,
             COALESCE(ea.ZCAMERAMODEL, 'Unknown') as camera_model
         FROM ZASSET a
@@ -173,8 +173,8 @@ def sync_assets(media_cursor, logger):
     media_cursor.execute('''
         INSERT INTO imports (import_uuid, import_name, import_timestamp_utc, album, assets_count, camera_make, camera_model, min_filename, max_filename, min_date, max_date, months_detected)
         SELECT
-            strftime('%Y-%m', datetime(z.ZDATECREATED + 978307200, 'unixepoch', 'localtime')),
-            strftime('%Y-%m', datetime(z.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) || ' - ' || COALESCE(ea.ZCAMERAMODEL, 'Unknown'),
+            z.ZIMPORTSESSION,
+            COALESCE(ea.ZCAMERAMODEL, 'Unknown') || ' (Session ' || z.ZIMPORTSESSION || ')',
             MIN(datetime(z.ZDATECREATED + 978307200, 'unixepoch', 'localtime')),
             NULL,
             COUNT(z.Z_ENT),
@@ -184,13 +184,13 @@ def sync_assets(media_cursor, logger):
             MAX(aaa.ZORIGINALFILENAME),
             MIN(datetime(z.ZDATECREATED + 978307200, 'unixepoch', 'localtime')),
             MAX(datetime(z.ZDATECREATED + 978307200, 'unixepoch', 'localtime')),
-            strftime('%Y-%m', datetime(z.ZDATECREATED + 978307200, 'unixepoch', 'localtime'))
+            GROUP_CONCAT(DISTINCT strftime('%Y-%m', datetime(z.ZDATECREATED + 978307200, 'unixepoch', 'localtime')))
         FROM photos_db.ZASSET z
         LEFT JOIN photos_db.ZEXTENDEDATTRIBUTES ea ON ea.ZASSET = z.Z_PK
         LEFT JOIN photos_db.ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = z.Z_PK
         WHERE z.ZIMPORTSESSION IS NOT NULL
-        GROUP BY 1, ea.ZCAMERAMAKE, ea.ZCAMERAMODEL
-        ORDER BY 1 DESC
+        GROUP BY z.ZIMPORTSESSION, ea.ZCAMERAMAKE, ea.ZCAMERAMODEL
+        ORDER BY z.ZIMPORTSESSION DESC
         ON CONFLICT(import_uuid, camera_model) DO UPDATE SET
             assets_count = excluded.assets_count,
             min_filename = excluded.min_filename,

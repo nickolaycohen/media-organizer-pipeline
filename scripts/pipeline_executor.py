@@ -312,10 +312,11 @@ def main(args):
     run_bootstrap_steps(bootstrap_steps, from_index, to_index, args.dry_run, None, conn, month)
     run_regular_steps(bootstrap_steps, steps, from_index, to_index, args.dry_run, month, conn)
 
-    # If a planned execution was used, mark it as inactive
-    if planned_row:
+    # If a planned execution was used, mark it as inactive upon successful completion
+    if planned_row and not args.dry_run:
         cursor.execute("UPDATE planned_execution SET active = 0 WHERE planned_month = ?", (month,))
         conn.commit()
+        logger.info(f"✅ Planned execution for {month} marked as inactive.")
 
     conn.close()
 

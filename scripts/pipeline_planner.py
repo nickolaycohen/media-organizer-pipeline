@@ -303,7 +303,7 @@ def check_active_sources_import_status(cursor, conn, month, auto_apply):
                         else:
                             print(f"\n❌ Reasonability rejected for {model} in {month_str}. Listing involved assets:")
                             cursor.execute(f"""
-                                SELECT aaa.ZORIGINALFILENAME, datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')
+                                SELECT aaa.ZORIGINALFILENAME, datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime'), a.ZUUID
                                 FROM photos_db.ZASSET a
                                 JOIN photos_db.ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK
                                 LEFT JOIN photos_db.ZEXTENDEDATTRIBUTES ea ON ea.ZASSET = a.Z_PK
@@ -312,8 +312,8 @@ def check_active_sources_import_status(cursor, conn, month, auto_apply):
                                   AND strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) = ?
                                 ORDER BY aaa.ZORIGINALFILENAME
                             """, import_id_list + [model, month_str])
-                            for fname, dt in cursor.fetchall():
-                                print(f"  - {fname} ({dt})")
+                            for fname, dt, uuid in cursor.fetchall():
+                                print(f"  - {fname} ({dt}) [UUID: {uuid}]")
                             logger.error("Execution halted by user. Source data needs fixing.")
                             sys.exit(1)
     finally:
@@ -476,7 +476,7 @@ def verify_sequencing_for_planned_month(cursor, conn, month, auto_apply):
             cursor.execute(f"ATTACH DATABASE '{APPLE_PHOTOS_DB_COPY_PATH}' AS photos_db_tmp;")
             try:
                 cursor.execute("""
-                    SELECT aaa.ZORIGINALFILENAME, datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')
+                    SELECT aaa.ZORIGINALFILENAME, datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime'), a.ZUUID
                     FROM photos_db_tmp.ZASSET a
                     JOIN photos_db_tmp.ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK
                     LEFT JOIN photos_db_tmp.ZEXTENDEDATTRIBUTES ea ON ea.ZASSET = a.Z_PK
@@ -485,8 +485,8 @@ def verify_sequencing_for_planned_month(cursor, conn, month, auto_apply):
                       AND strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) = ?
                     ORDER BY aaa.ZORIGINALFILENAME
                 """, (uuid, model, month))
-                for fname, dt in cursor.fetchall():
-                    print(f"  - {fname} ({dt})")
+                for fname, dt, asset_uuid in cursor.fetchall():
+                    print(f"  - {fname} ({dt}) [UUID: {asset_uuid}]")
             finally:
                 cursor.execute("DETACH DATABASE photos_db_tmp;")
             logger.error("Execution halted by user. Source data needs fixing.")
@@ -576,6 +576,19 @@ def display_summary(transitions, batches, remote_favs_cache=None):
 
 def main(auto_apply):
     # Set up logger with line number in format
+
+    # Check for active planned execution first to prevent overlapping plans
+    check_conn = sqlite3.connect(MEDIA_ORGANIZER_DB_PATH)
+    check_cursor = check_conn.cursor()
+    check_cursor.execute("SELECT planned_month FROM planned_execution WHERE active = 1")
+    planned_row = check_cursor.fetchone()
+    check_conn.close()
+
+    if planned_row:
+        active_month = planned_row[0]
+        logger.warning(f"⚠️ An active plan for month {active_month} already exists.")
+        logger.info(f"Please run 'python3 scripts/pipeline_executor.py' to execute it, or manually reset the planned_execution table.")
+        sys.exit(0)
 
     # Run bootstrap steps before proceeding
     run_bootstrap_steps(auto_apply, logger)
@@ -810,9 +823,16 @@ def main(auto_apply):
                         logger.debug(f"Found uploaded asset: {file_path}, size: {human_readable_size(file_size)}")
             logger.info(f"Total latest upload size for month {latest_399_month}: {human_readable_size(latest_upload_size)}")
 
-            if free_space >= staging_size:
-                logger.info(f"Enough Google Drive space available to transition month {latest_399_month} from 399 to 400. Free space: {human_readable_size(free_space)}, Staging size: {human_readable_size(staging_size)}, Latest upload size: {human_readable_size(latest_upload_size)}")
-                if auto_apply:
+            remaining_to_upload = max(0, staging_size - latest_upload_size)
+
+            if remaining_to_upload == 0 or free_space >= remaining_to_upload:
+                if remaining_to_upload == 0:
+                    logger.info(f"✅ All assets for {latest_399_month} appear to be uploaded already. Ready to finalize batch.")
+                else:
+                    logger.info(f"Enough Google Drive space available to finish uploading month {latest_399_month}. "
+                                f"Free space: {human_readable_size(free_space)}, Remaining to upload: {human_readable_size(remaining_to_upload)}.")
+                
+                if auto_apply or remaining_to_upload == 0:
                     proceed_transition = True
                 else:
                     proceed_input = input(f"Transition month {latest_399_month} from status 399 to 400? [y/N]: ")
@@ -822,7 +842,8 @@ def main(auto_apply):
                     conn.commit()
                     logger.info(f"Month {latest_399_month} status updated to 400.")
             else:
-                logger.warning(f"Not enough Google Drive space to transition month {latest_399_month} from 399 to 400. Free space: {human_readable_size(free_space)}, Staging size: {human_readable_size(staging_size)}, Latest upload size: {human_readable_size(latest_upload_size)}")
+                logger.warning(f"⚠️ Still insufficient Google Drive space to finish {latest_399_month}. "
+                               f"Free space: {human_readable_size(free_space)}, Required: {human_readable_size(remaining_to_upload)}.")
                 logger.info("Retryable transition not possible. Falling back to pipeline transitions.")
                 selected_type = None
         else:

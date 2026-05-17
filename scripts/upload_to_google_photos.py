@@ -196,15 +196,25 @@ def main(args):
                 logger.error("Halting upload process due to error.")
                 sys.exit(1)
 
-    # Step 4: Mark batch as uploaded - 
-    # cursor.execute("""
-    #     UPDATE month_batches
-    #     SET status_code = 'uploaded'
-    #     WHERE month = ?
-    # """, (month,))
-    conn.commit()
-    #conn.close()
+    # Final check: Determine if the month is now fully uploaded to finalize status.
+    files_in_staging = get_files_to_upload(album_path)
+    total_count = len(files_in_staging)
 
+    cursor.execute("SELECT COUNT(*) FROM assets WHERE month = ? AND uploaded_to_google = 1", (month,))
+    uploaded_count = cursor.fetchone()[0]
+
+    if uploaded_count >= total_count:
+        logger.info(f"🎊 All {total_count} files for {month} are verified as uploaded in the database.")
+        # If the batch was in a partial state (399), move it to full upload (400)
+        cursor.execute("SELECT status_code FROM month_batches WHERE month = ?", (month,))
+        row = cursor.fetchone()
+        if row and row[0] == '399':
+            cursor.execute("UPDATE month_batches SET status_code = '400' WHERE month = ?", (month,))
+            logger.info(f"✅ Batch {month} status finalized from 399 to 400.")
+    else:
+        logger.info(f"⚠️ Month {month} remains partially uploaded ({uploaded_count}/{total_count} files).")
+
+    conn.commit()
     logger.info(f"✅ Upload process completed at {datetime.utcnow().isoformat()}Z")
 
 def parse_args():

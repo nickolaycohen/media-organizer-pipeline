@@ -80,6 +80,35 @@ def sync_assets(media_cursor, logger):
 
     logger.info(f"✅ Inserted or updated {inserted_count} asset records in Media Organizer DB.")
 
+    # Purge assets from local 'assets' table that no longer exist in ZASSET
+    logger.info("Purging orphaned assets that no longer exist in Apple Photos...")
+    media_cursor.execute("""
+        DELETE FROM assets 
+        WHERE asset_id NOT IN (SELECT ZUUID FROM photos_db.ZASSET)
+    """)
+    purged_count = media_cursor.rowcount
+    if purged_count > 0:
+        logger.info(f"🗑️ Purged {purged_count} orphaned asset records.")
+        commit()
+
+    # Purge import sessions from local 'imports' table that no longer have corresponding assets in ZASSET
+    logger.info("Purging orphaned import sessions that no longer exist in Apple Photos...")
+    media_cursor.execute("""
+        DELETE FROM imports
+        WHERE (import_uuid, camera_model) NOT IN (
+            SELECT DISTINCT
+                a.ZIMPORTSESSION,
+                COALESCE(ea.ZCAMERAMODEL, 'Unknown')
+            FROM photos_db.ZASSET a
+            LEFT JOIN photos_db.ZEXTENDEDATTRIBUTES ea ON ea.ZASSET = a.Z_PK
+            WHERE a.ZIMPORTSESSION IS NOT NULL
+        )
+    """)
+    purged_imports_count = media_cursor.rowcount
+    if purged_imports_count > 0:
+        logger.info(f"🗑️ Purged {purged_imports_count} orphaned import session records.")
+        commit()
+
     # Clear and repopulate smart_albums
     logger.info("Clearing existing smart_albums entries...")
     media_cursor.execute("DELETE FROM smart_albums;")

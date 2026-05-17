@@ -1,4 +1,9 @@
 
+UPDATE month_batches
+SET status_code = '400'
+WHERE month = '2026-03';
+
+
 -- sync photos derived query 
 SELECT
         strftime('%Y-%m', datetime(z.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) || '_' || COALESCE(ea.ZCAMERAMODEL, 'Unknown'),

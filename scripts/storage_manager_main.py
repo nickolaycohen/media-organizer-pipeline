@@ -16,6 +16,14 @@ def main():
     logger.info(f"🗂  Checking Storage Status at {DB_PATH}")
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
+
+    # Ensure the assets table has the ignore_continuity_check column
+    cursor.execute("PRAGMA table_info(assets)")
+    columns = [row[1] for row in cursor.fetchall()]
+    if "ignore_continuity_check" not in columns:
+        logger.info("Adding 'ignore_continuity_check' column to assets table.")
+        cursor.execute("ALTER TABLE assets ADD COLUMN ignore_continuity_check INTEGER DEFAULT 0")
+
     get_migration_status(cursor)
     conn.commit()
     if "--migrate" in sys.argv:

@@ -102,6 +102,43 @@ def run_bootstrap_steps(auto_apply, logger):
             else:
                 sys.exit(1)
 
+def prompt_asset_level_triage(cursor, conn, import_uuids, camera_model, camera_make, month):
+    """
+    Prompts the user to ignore assets one by one for a given import/month/camera.
+    """
+    placeholders = ','.join(['?' for _ in import_uuids])
+    cursor.execute(f"""
+        SELECT a.original_filename, a.date_created_utc, a.asset_id
+        FROM assets a
+        JOIN ZASSET za ON za.ZUUID = a.asset_id
+        LEFT JOIN ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
+        WHERE a.import_id IN ({placeholders})
+          AND a.month = ?
+          AND COALESCE(zea.ZCAMERAMODEL, 'Unknown') = ?
+          AND COALESCE(zea.ZCAMERAMAKE, 'Unknown') = ?
+          AND (a.ignore_continuity_check = 0 OR a.ignore_continuity_check IS NULL)
+        ORDER BY a.date_created_utc
+    """, import_uuids + [month, camera_model, camera_make])
+    
+    assets = cursor.fetchall()
+    if not assets:
+        print(f"No active assets found to triage for {camera_make} {camera_model} in {month}.")
+        return
+
+    print(f"\n--- Asset-level Triage for {camera_make} {camera_model} ({month}) ---")
+    ignored_any = False
+    for fname, dt, asset_id in assets:
+        choice = input(f"  Ignore {fname} ({dt})? [y/N]: ").strip().lower()
+        if choice == 'y':
+            cursor.execute("UPDATE assets SET ignore_continuity_check = 1 WHERE asset_id = ?", (asset_id,))
+            ignored_any = True
+            print(f"  ✅ Asset {fname} ignored.")
+    
+    if ignored_any:
+        conn.commit()
+        print("\nTriaging complete. Please re-run the planner to see updated reasonability metrics.")
+        sys.exit(0)
+
 def check_active_sources_import_status(cursor, conn, month, auto_apply):
     """
     Checks if all active camera models have imported assets for the proposed month.
@@ -124,6 +161,7 @@ def check_active_sources_import_status(cursor, conn, month, auto_apply):
             query = """
                 SELECT 
                     xa.ZCAMERAMODEL,
+                    xa.ZCAMERAMAKE,
                     COUNT(CASE WHEN strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) = ? THEN 1 END) AS assets_in_month,
                     MIN(CASE WHEN strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) = ? THEN aaa.ZORIGINALFILENAME END) AS min_filename,
                     MAX(CASE WHEN strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) = ? THEN aaa.ZORIGINALFILENAME END) AS max_filename,
@@ -136,11 +174,13 @@ def check_active_sources_import_status(cursor, conn, month, auto_apply):
                 JOIN photos_db.ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK
                 JOIN imports i ON i.import_uuid = a.ZIMPORTSESSION 
                               AND i.camera_model = xa.ZCAMERAMODEL
+                LEFT JOIN assets loc ON loc.asset_id = a.ZUUID
                 WHERE a.ZTRASHEDSTATE = 0
+                  AND (loc.ignore_continuity_check = 0 OR loc.ignore_continuity_check IS NULL)
                   AND xa.ZCAMERAMODEL IN ({})
                   AND a.ZDATECREATED >= (strftime('%s', date(?, 'start of month', '-12 month')) - 978307200)
                   AND a.ZDATECREATED < (strftime('%s', date(?, 'start of month', '+2 month')) - 978307200)
-                GROUP BY xa.ZCAMERAMODEL
+                GROUP BY xa.ZCAMERAMODEL, xa.ZCAMERAMAKE
             """.format(','.join(['?' for _ in ACTIVE_CAMERA_MODELS]))
 
             cursor.execute(query, [month_str] * 6 + ACTIVE_CAMERA_MODELS + [month_str + "-01", month_str + "-01"])
@@ -148,7 +188,7 @@ def check_active_sources_import_status(cursor, conn, month, auto_apply):
             found_models = set()
 
             for row in results:
-                model, count, f_min, f_max, d_min, d_max, involved_import_ids = row
+                model, make, count, f_min, f_max, d_min, d_max, involved_import_ids = row
                 num_min = None
                 num_max = None
                 gap_info = ""
@@ -221,7 +261,7 @@ def check_active_sources_import_status(cursor, conn, month, auto_apply):
                     row = entry['row']
                     gap_info = entry['gap_info']
                     continuity_info = entry['continuity_info']
-                    model, count, f_min, f_max, d_min, d_max, involved_import_ids = row
+                    model, make, count, f_min, f_max, d_min, d_max, involved_import_ids = row
 
                     if count == 0 or not involved_import_ids:
                         continue
@@ -283,9 +323,14 @@ def check_active_sources_import_status(cursor, conn, month, auto_apply):
                                         MAX(datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime'))
                                     FROM photos_db.ZASSET a
                                     JOIN photos_db.ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK
+                                    LEFT JOIN ZEXTENDEDATTRIBUTES ea ON ea.ZASSET = a.Z_PK
+                                    LEFT JOIN assets loc ON loc.asset_id = a.ZUUID
                                     WHERE a.ZIMPORTSESSION = ?
+                                      AND (loc.ignore_continuity_check = 0 OR loc.ignore_continuity_check IS NULL)
                                       AND strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) = ?
-                                """, (import_uuid, month_str))
+                                      AND COALESCE(ea.ZCAMERAMODEL, 'Unknown') = ?
+                                      AND COALESCE(ea.ZCAMERAMAKE, 'Unknown') = ?
+                                """, (import_uuid, month_str, model, make or "Unknown"))
                                 res = cursor.fetchone()
                                 if res:
                                     s_f_min, s_f_max, s_d_min, s_d_max = res
@@ -309,9 +354,10 @@ def check_active_sources_import_status(cursor, conn, month, auto_apply):
                                 LEFT JOIN photos_db.ZEXTENDEDATTRIBUTES ea ON ea.ZASSET = a.Z_PK
                                 WHERE a.ZIMPORTSESSION IN ({placeholders})
                                   AND COALESCE(ea.ZCAMERAMODEL, 'Unknown') = ?
+                                  AND COALESCE(ea.ZCAMERAMAKE, 'Unknown') = ?
                                   AND strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) = ?
                                 ORDER BY aaa.ZORIGINALFILENAME
-                            """, import_id_list + [model, month_str])
+                            """, import_id_list + [model, make or "Unknown", month_str])
                             for fname, dt, uuid in cursor.fetchall():
                                 print(f"  - {fname} ({dt}) [UUID: {uuid}]")
                             logger.error("Execution halted by user. Source data needs fixing.")
@@ -377,10 +423,16 @@ def verify_sequencing_for_planned_month(cursor, conn, month, auto_apply):
     Prompts the user if confirmation is missing.
     """
     cursor.execute("""
-        SELECT DISTINCT i.import_uuid, i.camera_model, i.min_filename, i.max_filename, i.assets_count, i.min_date, i.max_date
+        SELECT DISTINCT i.import_uuid, i.camera_model, i.camera_make
         FROM imports i
-        JOIN assets a ON a.import_id = i.import_uuid
-        WHERE a.month = ? AND (i.sequencing_confirmed = 0 OR i.sequencing_confirmed IS NULL)
+        JOIN ZASSET za ON za.ZIMPORTSESSION = i.import_uuid
+        LEFT JOIN ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
+        LEFT JOIN assets a ON a.asset_id = za.ZUUID
+        WHERE a.month = ?
+          AND COALESCE(zea.ZCAMERAMODEL, 'Unknown') = COALESCE(i.camera_model, 'Unknown')
+          AND COALESCE(zea.ZCAMERAMAKE, 'Unknown') = COALESCE(i.camera_make, 'Unknown')
+          AND (a.ignore_continuity_check = 0 OR a.ignore_continuity_check IS NULL)
+          AND (i.sequencing_confirmed = 0 OR i.sequencing_confirmed IS NULL)
     """, (month,))
     unconfirmed = cursor.fetchall()
 
@@ -388,20 +440,27 @@ def verify_sequencing_for_planned_month(cursor, conn, month, auto_apply):
         return True
 
     logger.info(f"🧐 Found {len(unconfirmed)} import sessions for {month} requiring sequencing confirmation.")
-    for uuid, model, f_min, f_max, count, d_min, d_max in unconfirmed:
+    for uuid, model, make in unconfirmed:
+        # Recalculate metrics based on non-ignored assets matching this specific import row's camera
+        cursor.execute("""
+            SELECT MIN(aaa.ZORIGINALFILENAME), MAX(aaa.ZORIGINALFILENAME), COUNT(za.Z_PK),
+                   MIN(datetime(za.ZDATECREATED + 978307200, 'unixepoch', 'localtime')),
+                   MAX(datetime(za.ZDATECREATED + 978307200, 'unixepoch', 'localtime'))
+            FROM ZASSET za
+            JOIN ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = za.Z_PK
+            LEFT JOIN ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
+            LEFT JOIN assets a ON a.asset_id = za.ZUUID
+            WHERE za.ZIMPORTSESSION = ?
+              AND a.month = ?
+              AND COALESCE(zea.ZCAMERAMODEL, 'Unknown') = COALESCE(?, 'Unknown')
+              AND COALESCE(zea.ZCAMERAMAKE, 'Unknown') = COALESCE(?, 'Unknown')
+              AND (a.ignore_continuity_check = 0 OR a.ignore_continuity_check IS NULL)
+        """, (uuid, month, model, make))
+        
+        f_min, f_max, count, d_min, d_max = cursor.fetchone()
 
-        # Fallback for missing metadata in the imports table by querying the local assets table
-        if not f_min or not f_max or not d_min or not d_max:
-            cursor.execute("""
-                SELECT MIN(original_filename), MAX(original_filename), MIN(date_created_utc), MAX(date_created_utc)
-                FROM assets WHERE import_id = ?
-            """, (uuid,))
-            res = cursor.fetchone()
-            if res:
-                f_min = f_min or res[0]
-                f_max = f_max or res[1]
-                d_min = d_min or res[2]
-                d_max = d_max or res[3]
+        if not count:
+            continue
 
         if not model:
             model = "Unknown Model"
@@ -471,24 +530,27 @@ def verify_sequencing_for_planned_month(cursor, conn, month, auto_apply):
             conn.commit()
             logger.info(f"✅ Marked import {uuid} for {model} as reasonable and updated metadata.")
         else:
-            print(f"\n❌ Reasonability rejected for session {uuid}. Listing involved assets:")
-            # Attach Photos DB to get camera-model filtered results since assets table lacks model info
-            cursor.execute(f"ATTACH DATABASE '{APPLE_PHOTOS_DB_COPY_PATH}' AS photos_db_tmp;")
-            try:
-                cursor.execute("""
-                    SELECT aaa.ZORIGINALFILENAME, datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime'), a.ZUUID
-                    FROM photos_db_tmp.ZASSET a
-                    JOIN photos_db_tmp.ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK
-                    LEFT JOIN photos_db_tmp.ZEXTENDEDATTRIBUTES ea ON ea.ZASSET = a.Z_PK
-                    WHERE a.ZIMPORTSESSION = ?
-                      AND COALESCE(ea.ZCAMERAMODEL, 'Unknown') = ?
-                      AND strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) = ?
-                    ORDER BY aaa.ZORIGINALFILENAME
-                """, (uuid, model, month))
-                for fname, dt, asset_uuid in cursor.fetchall():
-                    print(f"  - {fname} ({dt}) [UUID: {asset_uuid}]")
-            finally:
-                cursor.execute("DETACH DATABASE photos_db_tmp;")
+            print(f"\n❌ Reasonability rejected for {model} (session {uuid}). Listing active assets:")
+            cursor.execute("""
+                SELECT aaa.ZORIGINALFILENAME, datetime(za.ZDATECREATED + 978307200, 'unixepoch', 'localtime'), za.ZUUID
+                FROM ZASSET za
+                JOIN ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = za.Z_PK
+                LEFT JOIN ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
+                LEFT JOIN assets a ON a.asset_id = za.ZUUID
+                WHERE za.ZIMPORTSESSION = ?
+                  AND COALESCE(zea.ZCAMERAMODEL, 'Unknown') = COALESCE(?, 'Unknown')
+                  AND COALESCE(zea.ZCAMERAMAKE, 'Unknown') = COALESCE(?, 'Unknown')
+                  AND a.month = ?
+                  AND (a.ignore_continuity_check = 0 OR a.ignore_continuity_check IS NULL)
+                ORDER BY aaa.ZORIGINALFILENAME
+            """, (uuid, model, make, month))
+            for fname, dt, asset_uuid in cursor.fetchall():
+                print(f"  - {fname} ({dt}) [UUID: {asset_uuid}]")
+
+            asset_choice = input(f"\nWould you like to triage assets one by one for {model} (session {uuid}) to ignore specific items? [y/N]: ").strip().lower()
+            if asset_choice == 'y':
+                prompt_asset_level_triage(cursor, conn, [uuid], model or "Unknown", make or "Unknown", month)
+
             logger.error("Execution halted by user. Source data needs fixing.")
             sys.exit(1)
 

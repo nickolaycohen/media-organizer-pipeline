@@ -1,3 +1,10 @@
+UPDATE month_batches 
+SET status_code = '400', updated_at_utc = datetime('now') 
+WHERE month = '2026-01';
+
+
+select * 
+from planned_execution pe 
 
 UPDATE month_batches
 SET status_code = '400'

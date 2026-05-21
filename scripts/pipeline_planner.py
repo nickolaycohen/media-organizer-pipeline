@@ -18,6 +18,8 @@ import requests
 from datetime import timezone, datetime, timedelta
  
 
+SUPPORTED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.heic', '.mov', '.mp4'}
+
 logger = setup_logger(LOG_PATH, "pipeline_planner")
 for handler in logger.handlers:
     handler.setFormatter(logging.Formatter('%(asctime)s [%(name)s:%(lineno)d] - %(levelname)s - %(message)s'))
@@ -614,7 +616,7 @@ def get_latest_import_and_month(cursor, transition_type="pipeline"):
     return cursor.fetchone()
 
 
-def display_summary(transitions, batches, remote_favs_cache=None):
+def display_summary(transitions, batches, cursor, remote_favs_cache=None):
     print("\n=== 📊 Stage Transitions ===")
     for code, prev, desc, ttype, label in transitions:
         print(f"{prev} ➜ {code}: {desc} (Type: {ttype})")
@@ -624,15 +626,26 @@ def display_summary(transitions, batches, remote_favs_cache=None):
         print(f"Month: {month}, Status: {status}")
 
     if remote_favs_cache:
+        # Build a lookup of (filename, timestamp) -> local batch month
+        cursor.execute("SELECT original_filename, date_created_utc, month FROM assets")
+        local_mapping = {(row[0], row[1]): row[2] for row in cursor.fetchall()}
+        
         fav_counts = {}
         for item in remote_favs_cache:
+            fname = item.get('filename')
             creation_time = item.get('mediaMetadata', {}).get('creationTime')
+            
             if creation_time:
-                month_key = creation_time[:7]  # Extract YYYY-MM
+                # Convert Google format '2026-04-18T23:00:00Z' to local format '2026-04-18 23:00:00'
+                ts = creation_time.replace('T', ' ').split('.')[0]
+                
+                # Group by the local batch month if the asset is recognized, 
+                # otherwise fallback to Google's raw month metadata.
+                month_key = local_mapping.get((fname, ts), creation_time[:7])
                 fav_counts[month_key] = fav_counts.get(month_key, 0) + 1
         
         if fav_counts:
-            print("\n=== ⭐ Remote Favorites (Google Photos) by Month ===")
+            print("\n=== ⭐ Remote Favorites Matched to Local Batches ===")
             for month in sorted(fav_counts.keys(), reverse=True):
                 print(f"Month: {month}, Favorites: {fav_counts[month]}")
 
@@ -672,11 +685,8 @@ def main(auto_apply):
 
     transitions = get_stage_transitions(cursor)
     batches = get_batch_statuses(cursor)
-    # TODO - need to fix this - those latest values make sense only when transition type is known
-    # TODO - unless we filtered right here by pipeline type
-    # latest_import, latest_month = get_latest_import_and_month(cursor)
 
-    display_summary(transitions, batches, remote_favs_cache)
+    display_summary(transitions, batches, cursor, remote_favs_cache)
 
     logger.info("=== ✅ Suggested Action ===")
 
@@ -718,227 +728,114 @@ def main(auto_apply):
                 logger.debug(f"Found pipeline transition candidate for month {month}: {t[2]} (code {t[1]}) -> (code {t[0]})")
                 pipeline_candidates.append((month, t))
 
-    def pick_latest(candidates):
-        # Ensure months are compared as YYYY-MM strings correctly
-        return max(candidates, key=lambda x: x[0])
+    # Precedence: manual > retryable > pipeline. Sort by month descending to prioritize newer batches.
+    manual_candidates.sort(key=lambda x: x[0], reverse=True)
+    retryable_candidates.sort(key=lambda x: x[0], reverse=True)
+    pipeline_candidates.sort(key=lambda x: x[0], reverse=True)
 
-    selected_month = None
-    selected_transition = None
-    selected_type = None
-    current_status = None
-    latest_month = None
+    logger.info("🔍 Evaluating manual transition candidates...")
+    for month, transition in manual_candidates:
+        selected_code, selected_prev, selected_desc, selected_type, short_label = transition
+        logger.info(f"  Checking {month} ({selected_desc}, status {selected_prev})...")
 
-    # Precedence: manual > retryable > pipeline
-    if manual_candidates:
-        selected_month, selected_transition = pick_latest(manual_candidates)
-    elif retryable_candidates:
-        selected_month, selected_transition = pick_latest(retryable_candidates)
-    elif pipeline_candidates:
-        selected_month, selected_transition = pick_latest(pipeline_candidates)
-    else:
-        logger.info("No eligible month found with available transitions. Exiting.")
-        close_conn()
-        sys.exit(0)
-
-    if selected_month and selected_transition:
-        selected_code, selected_prev, selected_desc, selected_type, short_label = selected_transition
-        current_status = selected_prev
-        latest_month = selected_month
-    else:
-        logger.info("No eligible month found with available transitions. Exiting.")
-        close_conn()
-        sys.exit(0)
-
-    # Handle manual transition logic
-    if selected_type == 'manual':
-        logger.info("🔍 Checking for manual transition candidates...")
-        logger.info(f"Month {latest_month} is waiting for manual transition ({selected_desc}, status {current_status}).")
-        # --- Check how long ago the upload for this month was done ---
-        # Use the latest updated_at_utc from assets where uploaded_to_google = 1 for this month
-        cursor.execute("""
-            SELECT MAX(a.updated_at_utc)
-            FROM assets a
-            WHERE a.uploaded_to_google = 1
-              AND a.month = ?
-        """, (latest_month,))
+        cursor.execute("SELECT MAX(updated_at_utc) FROM assets WHERE uploaded_to_google = 1 AND month = ?", (month,))
         result = cursor.fetchone()
         last_completed_at = result[0] if result else None
         elapsed_days = None
         if last_completed_at:
             try:
-                # Assume updated_at_utc is in format 'YYYY-MM-DD HH:MM:SS'
-                last_completed_dt = datetime.strptime(last_completed_at, "%Y-%m-%d %H:%M:%S")
+                last_dt = datetime.strptime(last_completed_at, "%Y-%m-%d %H:%M:%S")
                 now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
-                elapsed = now_utc - last_completed_dt
-                elapsed_days = elapsed.total_seconds() / (60 * 60 * 24)
-            except Exception as e:
-                logger.warning(f"Could not parse updated_at_utc ({last_completed_at}): {e}")
+                elapsed_days = (now_utc - last_dt).total_seconds() / 86400
+            except: pass
+
         if elapsed_days is not None and elapsed_days < 3:
-            logger.info(f"Too soon for manual transition: Only {elapsed_days:.2f} days since upload for month {latest_month}. Minimum is 3 days. Skipping manual transition prompt.")
-            # Skip suggesting manual transition, fall back to retryable or pipeline
-            selected_type = None
-        else:
-            # Check for favorites before prompting for manual completion
-            fav_count, source, fav_names = check_favorites_count(
-                cursor, latest_month, check_remote=True, 
-                all_favs=remote_favs_cache, creds=creds
-            )
-            if fav_count == 0:
-                if current_status == '500':
-                    logger.info(f"⏸️ Manual transition for {latest_month} (500 -> 550) is blocked: No favorites detected in Google Photos. Curation must be completed manually first.")
-                    # Invalidate manual selection to fall back to retryable/pipeline candidates
-                    selected_type = None
-                else:
-                    logger.warning(f"⚠️ No favorites found in Google Photos for {latest_month}. Starring may not be complete.")
+            logger.info(f"    ⏸️ Too soon: Only {elapsed_days:.1f} days since upload. Need 3 days for Google AI curation.")
+            continue
+
+        fav_count, source, _ = check_favorites_count(cursor, month, check_remote=True, all_favs=remote_favs_cache, creds=creds)
+        if fav_count == 0:
+            if selected_prev == '500':
+                logger.info(f"    ⏸️ Manual transition blocked: No favorites in Google Photos.")
+                continue
             else:
-                logger.info(f"✨ Detected {fav_count} favorites for month {latest_month} in Google Photos (Source: {source}).")
-
-            if selected_type == 'manual' and not auto_apply:
-                proceed_input = input(f"Please confirm that the '{short_label}' task has been completed so I can move month {latest_month} to the next phase? [y/N]: ")
-                if proceed_input.strip().lower() == 'y':
-                    # Find next status code for this manual transition
-                    next_status = None
-                    for code, prev, desc, ttype, label in transitions:
-                        if prev == current_status and ttype == 'manual':
-                            next_status = code
-                            break
-                    if next_status is not None:
-                        cursor.execute("UPDATE month_batches SET status_code = ? WHERE month = ?", (next_status, latest_month))
-                        conn.commit()
-                        logger.info(f"Month {latest_month} status forcibly updated to {next_status}.")
-                    else:
-                        logger.warning("No manual transition found from current status.")
-                    close_conn()
-                    sys.exit(0)
-                else:
-                    logger.info("Manual transition aborted by user. Falling back to retryable or pipeline transitions.")
-                    selected_type = None
-            else:
-                logger.info("Auto-apply enabled, skipping manual transition prompt. Falling back to retryable or pipeline transitions.")
-                selected_type = None
-
-    # If manual transition was not performed, or if we are now at retryable
-    if selected_type is None:
-        # Try retryable candidates
-        if retryable_candidates:
-            selected_month, selected_transition = pick_latest(retryable_candidates)
-            selected_code, selected_prev, selected_desc, selected_type, short_label = selected_transition
-            current_status = selected_prev
-            latest_month = selected_month
-        elif pipeline_candidates:
-            selected_month, selected_transition = pick_latest(pipeline_candidates)
-            selected_code, selected_prev, selected_desc, selected_type, short_label = selected_transition
-            current_status = selected_prev
-            latest_month = selected_month
+                logger.warning(f"    ⚠️ No favorites found for {month}. Starring may not be complete.")
         else:
-            logger.info("No eligible month found with available transitions after manual transition fallback. Exiting.")
-            close_conn()
-            sys.exit(0)
+            logger.info(f"    ✨ Detected {fav_count} favorites ({source}).")
 
-    if selected_type == 'retryable':
-        logger.info("🔍 Checking for retryable transition candidates...")
-        logger.info(f"Handling retryable transition for month with current status {current_status}.")
-        # Existing quota logic for 399->400 transition
-        cursor.execute("SELECT month FROM month_batches WHERE status_code = 399 ORDER BY month DESC")
-        months_399 = cursor.fetchall()
-        if months_399:
-            latest_399_month = months_399[0][0]
+        if not auto_apply:
+            proceed_input = input(f"\nPlease confirm: has '{short_label}' task been completed for {month}? [y/N]: ")
+            if proceed_input.strip().lower() == 'y':
+                cursor.execute("UPDATE month_batches SET status_code = ? WHERE month = ?", (selected_code, month))
+                conn.commit()
+                logger.info(f"✅ Month {month} status updated to {selected_code}.")
+                close_conn(); sys.exit(0)
+            else:
+                logger.info(f"  Skipped manual transition for {month}. Checking next candidate...")
+                continue
+        else:
+            logger.info(f"  Auto-apply enabled; skipping manual task {month} for safety. Checking next candidate...")
+            continue
+
+    logger.info("🔍 Evaluating retryable transition candidates...")
+    for month, transition in retryable_candidates:
+        selected_code, selected_prev, selected_desc, selected_type, short_label = transition
+        if selected_prev == '399':
             free_space = check_google_quota(creds=creds)
             if free_space is None:
-                logger.error("❌ Aborting: Could not retrieve Google Drive quota. Please check your connection and credentials.")
-                close_conn()
-                sys.exit(1)
-            import glob
+                logger.error("❌ Error: Could not retrieve Google Drive quota."); close_conn(); sys.exit(1)
 
-            matched_folders = glob.glob(os.path.join(STAGING_ROOT, f"*{latest_399_month}*"))
+            import glob
+            matched_folders = glob.glob(os.path.join(STAGING_ROOT, f"*{month}*"))
             if matched_folders:
                 staging_folder = matched_folders[0]
                 staging_size = 0
                 for root, dirs, files in os.walk(staging_folder):
                     for f in files:
-                        fp = os.path.join(root, f)
-                        staging_size += os.path.getsize(fp)
-                logger.info(f"Detected staging folder for month {latest_399_month}: {staging_folder}, size: {human_readable_size(staging_size)}")
+                        ext = os.path.splitext(f)[1].lower()
+                        if ext in SUPPORTED_EXTENSIONS:
+                            fp = os.path.join(root, f)
+                            staging_size += os.path.getsize(fp)
+                logger.info(f"Detected staging for {month}: {staging_folder}, size: {human_readable_size(staging_size)}")
             else:
-                staging_folder = None
-                staging_size = 0
-                logger.warning(f"No staging folder found for month {latest_399_month}")
+                staging_folder = None; staging_size = 0; logger.warning(f"No staging folder found for {month}")
 
-            # Fetch list of uploaded assets for the month from assets table
-            cursor.execute("""
-                SELECT original_filename
-                FROM assets
-                WHERE month = ?
-                  AND uploaded_to_google = 1
-                ORDER BY updated_at_utc
-            """, (latest_399_month,))
+            cursor.execute("SELECT original_filename FROM assets WHERE month = ? AND uploaded_to_google = 1", (month,))
             uploaded_assets = cursor.fetchall()
-
             latest_upload_size = 0
             if uploaded_assets and staging_folder:
                 for filename_tuple in uploaded_assets:
-                    filename = filename_tuple[0]
-                    file_path = os.path.join(staging_folder, filename)
+                    file_path = os.path.join(staging_folder, filename_tuple[0])
                     if os.path.exists(file_path):
-                        file_size = os.path.getsize(file_path)
-                        latest_upload_size += file_size
-                        logger.debug(f"Found uploaded asset: {file_path}, size: {human_readable_size(file_size)}")
-            logger.info(f"Total latest upload size for month {latest_399_month}: {human_readable_size(latest_upload_size)}")
+                        latest_upload_size += os.path.getsize(file_path)
+            logger.info(f"Total uploaded size for {month}: {human_readable_size(latest_upload_size)}")
 
             remaining_to_upload = max(0, staging_size - latest_upload_size)
-
-            if remaining_to_upload == 0 or free_space >= remaining_to_upload:
-                if remaining_to_upload == 0:
-                    logger.info(f"✅ All assets for {latest_399_month} appear to be uploaded already. Ready to finalize batch.")
+            if remaining_to_upload == 0:
+                logger.info(f"✅ All assets for {month} appear to be uploaded already.")
+                if auto_apply: proceed_transition = True
                 else:
-                    logger.info(f"Enough Google Drive space available to finish uploading month {latest_399_month}. "
-                                f"Free space: {human_readable_size(free_space)}, Remaining to upload: {human_readable_size(remaining_to_upload)}.")
-                
-                if auto_apply or remaining_to_upload == 0:
-                    proceed_transition = True
-                else:
-                    proceed_input = input(f"Transition month {latest_399_month} from status 399 to 400? [y/N]: ")
-                    proceed_transition = proceed_input.strip().lower() == 'y'
+                    ans = input(f"All assets uploaded - transition {month} to 400 status? [y/N]: ").strip().lower()
+                    proceed_transition = ans == 'y'
                 if proceed_transition:
-                    cursor.execute("UPDATE month_batches SET status_code = 400 WHERE month = ?", (latest_399_month,))
-                    conn.commit()
-                    logger.info(f"Month {latest_399_month} status updated to 400.")
+                    cursor.execute("UPDATE month_batches SET status_code = '400' WHERE month = ?", (month,))
+                    conn.commit(); logger.info(f"Month {month} updated to 400."); close_conn(); sys.exit(0)
+            elif free_space >= remaining_to_upload:
+                logger.info(f"🚀 Space available ({human_readable_size(free_space)}) to finish uploading {month}. Proceeding with pipeline candidates...")
+                break
             else:
-                logger.warning(f"⚠️ Still insufficient Google Drive space to finish {latest_399_month}. "
-                               f"Free space: {human_readable_size(free_space)}, Required: {human_readable_size(remaining_to_upload)}.")
-                logger.info("Retryable transition not possible. Falling back to pipeline transitions.")
-                selected_type = None
-        else:
-            logger.info("No months with status 399 found to retry transition.")
-
-    # After retryable block, if selected_type is None and there are pipeline candidates, pick latest pipeline candidate
-    if selected_type is None and pipeline_candidates:
-        selected_month, selected_transition = pick_latest(pipeline_candidates)
-        selected_code, selected_prev, selected_desc, selected_type, short_label = selected_transition
-        current_status = selected_prev
-        latest_month = selected_month
-
-    if selected_type == 'pipeline' or selected_type is None:
-        logger.info("🔍 Checking for pipeline transition candidates across all months...")
-        latest_pipeline_candidate = None
-        latest_pipeline_transitions = []
-
-        for month in months_descending:
-            status = next((s for m, s in batches if m == month), None)
-            if status is None:
+                logger.warning(f"⚠️ Insufficient space for {month}. Free: {human_readable_size(free_space)}, Need: {human_readable_size(remaining_to_upload)}.")
                 continue
-            pt = [t for t in transitions if t[3] == 'pipeline' and t[1] == status]
-            if pt:
-                latest_pipeline_candidate = (month, status)
-                latest_pipeline_transitions = pt
-                break  # first in descending order is newest
 
-        if not latest_pipeline_candidate:
-            logger.info("No pipeline transitions available for any month. Exiting.")
-            close_conn()
-            sys.exit(0)
+    logger.info("🔍 Evaluating pipeline transition candidates...")
+    if not pipeline_candidates:
+        logger.info("No pipeline transitions available. Exiting."); close_conn(); sys.exit(0)
 
-        latest_month, current_status = latest_pipeline_candidate
+    latest_month, selected_transition = pipeline_candidates[0]
+    selected_code, selected_prev, selected_desc, selected_type, short_label = selected_transition
+    current_status = selected_prev
+
+    if True:
         # Build the full transition path from current status, only including pipeline transitions
         full_transition_list = get_full_transition_path(
             [t for t in transitions if t[3] == 'pipeline'],

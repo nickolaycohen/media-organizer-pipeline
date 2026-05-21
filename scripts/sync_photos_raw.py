@@ -18,6 +18,18 @@ def sync_metadata(logger):
     conn_media.execute("PRAGMA busy_timeout = 30000;")
     cursor_media = conn_media.cursor()
 
+    # --- Add integrity check for Media Organizer DB ---
+    # logger.info("Performing quick integrity check on Media Organizer DB...")
+    # cursor_media.execute("PRAGMA quick_check;")
+    # integrity_result = cursor_media.fetchone()
+    # if integrity_result and integrity_result[0] != 'ok':
+    #     logger.error(f"❌ Media Organizer DB is malformed: {integrity_result[0]}")
+    #     logger.error(f"Please try to repair or delete the database file: {MEDIA_ORGANIZER_DB_PATH}")
+    #     logger.error("A common fix is to delete the database file and let the pipeline recreate it.")
+    #     raise sqlite3.DatabaseError("Media Organizer DB is malformed.")
+    # logger.info("✅ Media Organizer DB integrity check passed.")
+    # --- End integrity check ---
+
     try:
         logger.info("Connected to Media Organizer DB.")
 
@@ -36,6 +48,18 @@ def sync_metadata(logger):
         # Attach the Apple Photos database
         cursor_media.execute(f"ATTACH DATABASE '{APPLE_PHOTOS_DB_COPY_PATH}' AS photos_db;")
         logger.info("Attached Photos.sqlite database.")
+
+        # --- Add integrity check for attached DB ---
+        # logger.info("Performing quick integrity check on attached Apple Photos DB copy...")
+        # cursor_media.execute("PRAGMA photos_db.quick_check;")
+        # integrity_result_photos_db = cursor_media.fetchone()
+        # if integrity_result_photos_db and integrity_result_photos_db[0] != 'ok':
+        #     logger.error(f"❌ Attached Apple Photos DB copy is malformed: {integrity_result_photos_db[0]}")
+        #     logger.error(f"Please try to recopy the Apple Photos database by running 'python3 scripts/copy_all_media_photos_db.py' or check the source: {APPLE_PHOTOS_DB_PATH}")
+        #     raise sqlite3.DatabaseError("Attached Apple Photos DB copy is malformed.")
+        # logger.info("✅ Attached Apple Photos DB copy integrity check passed.")
+        # --- End integrity check for attached DB ---
+
 
         # Refresh local copies of heavy tables. ZIMPORTSESSION is optional in some Photos versions.
         for table in ["ZASSET", "ZADDITIONALASSETATTRIBUTES", "ZEXTENDEDATTRIBUTES", "ZIMPORTSESSION"]:

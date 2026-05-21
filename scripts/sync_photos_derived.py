@@ -21,6 +21,102 @@ def sync_assets(media_cursor, logger):
     media_cursor.execute(f"ATTACH DATABASE '{APPLE_PHOTOS_DB_COPY_PATH}' AS photos_db;")
     logger.info("Attached Photos.sqlite database.")
 
+    # --- Schema Migration: Ensure assets table uses asset_id as PRIMARY KEY ---
+    media_cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='assets'")
+    a_row = media_cursor.fetchone()
+
+    media_cursor.execute("PRAGMA table_info(assets)")
+    is_asset_id_pk = any(col[1] == 'asset_id' and col[5] == 1 for col in media_cursor.fetchall())
+
+    if a_row and (not is_asset_id_pk or "UNIQUE" in a_row[0]):
+        logger.info("Legacy UNIQUE constraint detected in 'assets' table schema. Migrating assets table...")
+        
+        media_cursor.execute("ALTER TABLE assets RENAME TO assets_old")
+        
+        media_cursor.execute("""
+            CREATE TABLE assets (
+                asset_id TEXT PRIMARY KEY,
+                original_filename TEXT,
+                month TEXT,
+                date_created_utc TEXT,
+                imported_date_utc TEXT,
+                import_id TEXT,
+                aesthetic_score REAL,
+                google_favorite INTEGER DEFAULT 0,
+                ignore_continuity_check INTEGER DEFAULT 0,
+                file_hash TEXT,
+                uploaded_to_google INTEGER DEFAULT 0,
+                score_imported_at_utc TEXT,
+                created_at_utc TEXT,
+                updated_at_utc TEXT
+            )
+        """)
+        
+        # Determine columns that exist in the old table to safely copy data
+        media_cursor.execute("PRAGMA table_info(assets_old)")
+        existing_cols = {row[1] for row in media_cursor.fetchall()}
+        target_cols = [
+            "asset_id", "original_filename", "month", "date_created_utc", "imported_date_utc",
+            "import_id", "aesthetic_score", "google_favorite", "ignore_continuity_check",
+            "file_hash", "uploaded_to_google", "score_imported_at_utc", "created_at_utc", "updated_at_utc"
+        ]
+        valid_cols = [c for c in target_cols if c in existing_cols]
+        col_str = ", ".join(valid_cols)
+        
+        media_cursor.execute(f"INSERT INTO assets ({col_str}) SELECT {col_str} FROM assets_old")
+        media_cursor.execute("DROP TABLE assets_old")
+        media_cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_assets_asset_id ON assets(asset_id)")
+        commit()
+        logger.info("Migration of 'assets' table completed successfully.")
+
+    # --- Schema Migration: Ensure imports table is clean of legacy constraints ---
+    media_cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='imports'")
+    i_row = media_cursor.fetchone()
+
+    media_cursor.execute("PRAGMA index_list(imports)")
+    has_new_idx = any(idx[1] == 'idx_imports_uuid_model' for idx in media_cursor.fetchall())
+
+    if i_row and (not has_new_idx or "import_timestamp_utc" in i_row[0]):
+        logger.info("Legacy UNIQUE constraint detected in 'imports' table. Migrating...")
+        media_cursor.execute("ALTER TABLE imports RENAME TO imports_old")
+        media_cursor.execute("""
+            CREATE TABLE imports (
+                import_uuid TEXT,
+                import_name TEXT,
+                import_timestamp_utc TEXT,
+                album TEXT,
+                assets_count INTEGER,
+                camera_make TEXT,
+                camera_model TEXT,
+                min_filename TEXT,
+                max_filename TEXT,
+                min_date TEXT,
+                max_date TEXT,
+                months_detected TEXT,
+                execution_id TEXT,
+                status_code TEXT,
+                sequencing_confirmed INTEGER DEFAULT 0
+            )
+        """)
+        media_cursor.execute("""
+            INSERT INTO imports (
+                import_uuid, import_name, import_timestamp_utc, album, assets_count, 
+                camera_make, camera_model, min_filename, max_filename, min_date, 
+                max_date, months_detected, sequencing_confirmed
+            )
+            SELECT 
+                import_uuid, import_name, import_timestamp_utc, album, assets_count, 
+                camera_make, camera_model, min_filename, max_filename, min_date, 
+                max_date, months_detected, sequencing_confirmed
+            FROM imports_old
+        """)
+        media_cursor.execute("DROP TABLE imports_old")
+        media_cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_imports_uuid_model ON imports(import_uuid, camera_model)")
+        commit()
+        logger.info("Migration of 'imports' table completed successfully.")
+
+    # Create unique index to support UPSERT on (import_uuid, camera_model) if not handled by migration
+    media_cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_imports_uuid_model ON imports(import_uuid, camera_model)")
 
     # We are fetching all assets that exist in ZASSET table,
     # but might not be in assets table and also do not have 
@@ -66,14 +162,21 @@ def sync_assets(media_cursor, logger):
                 imported_date_utc,
                 import_id,
                 month,
-                score_imported_at_utc
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
-            ON CONFLICT(original_filename, month) DO UPDATE SET
+                score_imported_at_utc,
+                updated_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+            ON CONFLICT(asset_id) DO UPDATE SET
                 asset_id = excluded.asset_id,
                 aesthetic_score = excluded.aesthetic_score,
+                date_created_utc = excluded.date_created_utc,
+                imported_date_utc = excluded.imported_date_utc,
+                import_id = excluded.import_id,
                 score_imported_at_utc = datetime('now'),
                 updated_at_utc = datetime('now')
-            WHERE aesthetic_score IS NULL OR aesthetic_score != excluded.aesthetic_score OR asset_id != excluded.asset_id;
+            WHERE asset_id IS NOT excluded.asset_id
+               OR ROUND(COALESCE(aesthetic_score, -1.0), 6) IS NOT ROUND(COALESCE(excluded.aesthetic_score, -1.0), 6)
+               OR COALESCE(CAST(import_id AS TEXT), '') IS NOT COALESCE(CAST(excluded.import_id AS TEXT), '')
+               OR COALESCE(date_created_utc, '') IS NOT COALESCE(excluded.date_created_utc, '');
         """, assets_to_insert)
         inserted_count = media_cursor.rowcount
         commit()
@@ -131,72 +234,6 @@ def sync_assets(media_cursor, logger):
     commit()
 
     logger.info("Smart albums synced successfully.")
-
-    logger.info("Ensuring imports table schema is up to date...")
-
-    # Detect if the table has the legacy UNIQUE constraint in its definition
-    media_cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='imports'")
-    row = media_cursor.fetchone()
-    if row and ("UNIQUE" in row[0] and "import_timestamp_utc" in row[0] and "import_uuid" in row[0]):
-        logger.info("Legacy UNIQUE constraint detected in 'imports' table schema. Migrating table to remove it...")
-        
-        # 1. Rename old table
-        media_cursor.execute("ALTER TABLE imports RENAME TO imports_old")
-        
-        # 2. Create new table without the legacy composite UNIQUE constraint
-        media_cursor.execute("""
-            CREATE TABLE imports (
-                import_uuid TEXT,
-                import_name TEXT,
-                import_timestamp_utc TEXT,
-                album TEXT,
-                assets_count INTEGER,
-                camera_make TEXT,
-                camera_model TEXT,
-                min_filename TEXT,
-                max_filename TEXT,
-                min_date TEXT,
-                max_date TEXT,
-                months_detected TEXT,
-                execution_id TEXT,
-                status_code TEXT,
-                sequencing_confirmed INTEGER DEFAULT 0
-            )
-        """)
-        
-        # 3. Copy existing data (mapping columns carefully)
-        media_cursor.execute("""
-            INSERT INTO imports (
-                import_uuid, import_name, import_timestamp_utc, album, assets_count, 
-                camera_make, camera_model, min_filename, max_filename, min_date, 
-                max_date, months_detected, sequencing_confirmed
-            )
-            SELECT 
-                import_uuid, import_name, import_timestamp_utc, album, assets_count, 
-                camera_make, camera_model, min_filename, max_filename, min_date, 
-                max_date, months_detected, sequencing_confirmed
-            FROM imports_old
-        """)
-        
-        # 4. Drop old table
-        media_cursor.execute("DROP TABLE imports_old")
-        commit()
-        logger.info("Migration of 'imports' table completed successfully.")
-
-    # Create unique index to support UPSERT on (import_uuid, camera_model)
-    try:
-        media_cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_imports_uuid_model ON imports(import_uuid, camera_model)")
-        logger.info("Ensured unique index on imports(import_uuid, camera_model) exists.")
-    except sqlite3.OperationalError as e:
-        logger.warning(f"Could not create unique index on imports: {e}. If there are duplicate rows, you may need to clear the imports table.")
-
-    # Ensure necessary columns exist in imports table
-    for col in ["min_date", "max_date", "months_detected"]:
-        try:
-            media_cursor.execute(f"ALTER TABLE imports ADD COLUMN {col} TEXT")
-            logger.info(f"Updated imports table schema with missing column: {col}")
-        except sqlite3.OperationalError:
-            pass  # Column already exists
 
     logger.info("Syncing import session records (inserting new and updating existing)...")
     media_cursor.execute('''

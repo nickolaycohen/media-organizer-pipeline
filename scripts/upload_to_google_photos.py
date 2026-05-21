@@ -57,7 +57,7 @@ def main(args):
 
     existing_metadata = {}
     cursor.execute("""
-        SELECT original_filename, month, import_id, aesthetic_score, date_created_utc, imported_date_utc
+        SELECT original_filename, month, import_id, aesthetic_score, date_created_utc, imported_date_utc, asset_id
         FROM assets
         WHERE month = ?
     """, (month,))
@@ -67,7 +67,8 @@ def main(args):
             "aesthetic_score": row[3],
             "original_filename": row[0],
             "date_created_utc": row[4],
-            "imported_date_utc": row[5]
+            "imported_date_utc": row[5],
+            "asset_id": row[6]
         }
 
     if args.dry_run:
@@ -165,6 +166,7 @@ def main(args):
                 logger.info(f"[{idx}/{total_files}] Uploaded: {filename}")
                 cursor.execute("""
                     INSERT INTO assets (
+                        asset_id,
                         file_hash, 
                         month, 
                         import_id,
@@ -176,12 +178,13 @@ def main(args):
                         uploaded_to_google, 
                         created_at_utc, 
                         updated_at_utc
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), 1, datetime('now'), datetime('now'))
-                    ON CONFLICT(original_filename, month) DO UPDATE SET
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), 1, datetime('now'), datetime('now'))
+                    ON CONFLICT(asset_id) DO UPDATE SET
                         file_hash = excluded.file_hash,
                         uploaded_to_google = 1,
                         updated_at_utc = datetime('now')
                 """, (
+                    metadata.get("asset_id"),
                     file_hash,
                     month,
                     metadata.get("import_id"),

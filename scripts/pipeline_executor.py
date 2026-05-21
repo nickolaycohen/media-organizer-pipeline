@@ -95,6 +95,15 @@ def run_regular_steps(bootstrap_steps, steps, from_index, to_index, dry_run, mon
                     continue
         # --- End status check logic ---
 
+        # Prompt for confirmation if about to pull favorites (Step 550)
+        if step.code == '550' and not dry_run:
+            print(f"\n⚠️  Manual verification required for {month} (Step: {step.label})")
+            confirm = input(f"Have all old assets for {month} NOT uploaded by this app been removed from Google Account? (Required to accurately pull Favorites) [y/N]: ").strip().lower()
+            if confirm != 'y':
+                logger.error(f"❌ Execution halted: Old assets for {month} must be removed from Google Account before pulling favorites to ensure matching accuracy.")
+                conn.close()
+                sys.exit(1)
+
         # Prepare command with current_month replaced if available
         command = [arg.replace("{month}", month) if month else arg for arg in step.command]
 

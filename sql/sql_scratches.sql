@@ -1,3 +1,15 @@
+PRAGMA quick_check
+
+-- How is Google tagging holding time determined
+SELECT MAX(updated_at_utc) FROM assets WHERE uploaded_to_google = 1 AND month = '2026-04'
+
+SELECT updated_at_utc,     z.original_filename , z.aesthetic_score, z."month" , z.google_favorite 
+FROM assets z
+WHERE uploaded_to_google = 1 AND month = '2026-01' 
+order by updated_at_utc desc
+
+
+
 update 
 assets 
 set uploaded_to_google =0

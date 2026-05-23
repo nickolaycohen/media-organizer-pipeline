@@ -42,6 +42,15 @@ def main():
     # Ensure assets are uniquely identified by their ZUUID to prevent filename collision fighting
     cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_assets_asset_id ON assets(asset_id)")
 
+    # Ensure the transition from favorites_pulled (550) to ranked (600) is defined as a pipeline step
+    cursor.execute("""
+        INSERT INTO batch_status (code, preceding_code, short_label, full_description, transition_type, script_name, pipeline_stage)
+        VALUES ('600', '550', 'ranked', 'Assets ranked and exported for human review', 'pipeline', 'rank_assets_by_score.py {month}', '3.4')
+        ON CONFLICT(code) DO UPDATE SET 
+            preceding_code = excluded.preceding_code,
+            transition_type = excluded.transition_type
+    """)
+
     get_migration_status(cursor)
     conn.commit()
     if "--migrate" in sys.argv:

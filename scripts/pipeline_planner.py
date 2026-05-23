@@ -56,6 +56,15 @@ def should_run_sync_metadata(cursor):
         cursor.connection.commit()
         return True
 
+    # Check if ranked_assets_view exists
+    try:
+        cursor.execute("SELECT score_normalized FROM ranked_assets_view LIMIT 1")
+    except sqlite3.OperationalError:
+        logger.info("Missing 'ranked_assets_view' detected. Resetting sync flags to force metadata sync.")
+        cursor.execute("UPDATE db_updates SET raw_synced = 0, derived_synced = 0")
+        cursor.connection.commit()
+        return True
+
     db_mod_time = os.path.getmtime(APPLE_PHOTOS_DB_COPY_PATH)
 
     if last_sync_time is None:
@@ -749,6 +758,9 @@ def main(auto_apply):
     retryable_candidates.sort(key=lambda x: x[0], reverse=True)
     pipeline_candidates.sort(key=lambda x: x[0], reverse=True)
 
+    selected_month = None
+    selected_transition = None
+
     logger.info("🔍 Evaluating manual transition candidates...")
     for month, transition in manual_candidates:
         selected_code, selected_prev, selected_desc, selected_type, short_label = transition
@@ -837,24 +849,28 @@ def main(auto_apply):
                     cursor.execute("UPDATE month_batches SET status_code = '400' WHERE month = ?", (month,))
                     conn.commit(); logger.info(f"Month {month} updated to 400."); close_conn(); sys.exit(0)
             elif free_space >= remaining_to_upload:
-                logger.info(f"🚀 Space available ({human_readable_size(free_space)}) to finish uploading {month}. Proceeding with pipeline candidates...")
+                logger.info(f"🚀 Space available ({human_readable_size(free_space)}) to finish uploading {month}. Priority given to retryable task.")
+                selected_month = month
+                selected_transition = transition
                 break
             else:
                 logger.warning(f"⚠️ Insufficient space for {month}. Free: {human_readable_size(free_space)}, Need: {human_readable_size(remaining_to_upload)}.")
                 continue
 
-    logger.info("🔍 Evaluating pipeline transition candidates...")
-    if not pipeline_candidates:
-        logger.info("No pipeline transitions available. Exiting."); close_conn(); sys.exit(0)
+    if not selected_month:
+        logger.info("🔍 Evaluating pipeline transition candidates...")
+        if not pipeline_candidates:
+            logger.info("No pipeline transitions available. Exiting."); close_conn(); sys.exit(0)
+        selected_month, selected_transition = pipeline_candidates[0]
 
-    latest_month, selected_transition = pipeline_candidates[0]
+    latest_month = selected_month
     selected_code, selected_prev, selected_desc, selected_type, short_label = selected_transition
     current_status = selected_prev
 
     if True:
         # Build the full transition path from current status, only including pipeline transitions
         full_transition_list = get_full_transition_path(
-            [t for t in transitions if t[3] == 'pipeline'],
+            [t for t in transitions if t[3] in ['pipeline', 'retryable']],
             str(current_status)
         )
 

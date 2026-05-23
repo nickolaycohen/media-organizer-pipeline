@@ -295,6 +295,25 @@ def sync_assets(media_cursor, logger):
 
     logger.info("View photos_assets_view recreated successfully.")
 
+    # Drop and recreate the ranked_assets_view
+    logger.info("Dropping and recreating ranked_assets_view...")
+    media_cursor.execute("DROP VIEW IF EXISTS main.ranked_assets_view;")
+
+    media_cursor.execute('''
+        CREATE VIEW main.ranked_assets_view AS
+        SELECT 
+            asset_id,
+            original_filename,
+            month,
+            aesthetic_score,
+            google_favorite,
+            (COALESCE(aesthetic_score, 0) * 0.875) + (google_favorite * 0.125) AS score_normalized
+        FROM main.assets;
+    ''')
+    commit()
+
+    logger.info("View ranked_assets_view recreated successfully.")
+
     # Now update the db_updates.derived_synced flag
     media_cursor.execute("UPDATE db_updates SET derived_synced = 1")
     commit()

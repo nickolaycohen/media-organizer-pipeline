@@ -87,7 +87,7 @@ def run_regular_steps(bootstrap_steps, steps, from_index, to_index, dry_run, mon
             row = cur_status.fetchone()
             if row:
                 batch_status_code = row[0]
-                cur_status.execute("SELECT preceding_code FROM batch_status WHERE code = ? AND transition_type = 'pipeline'", (step.code,))
+                cur_status.execute("SELECT preceding_code FROM batch_status WHERE code = ? AND transition_type IN ('pipeline', 'retryable')", (step.code,))
                 expected_prev = cur_status.fetchone()
                 expected_prev_code = expected_prev[0] if expected_prev else None
                 if expected_prev_code and batch_status_code != expected_prev_code:
@@ -257,7 +257,7 @@ def get_pipeline_steps(cursor, script_dir, use_mock_data=False):
             PipelineStep("2.2.5 Remove duplicate assets based on extension and size", "210", ["python3", os.path.join(script_dir, "deduplicate_assets.py"), "{month}"]),
             PipelineStep("2.4 Partial upload to Google Photos due to insufficient space", "399", ["python3", os.path.join(script_dir, "upload_to_google_photos.py"), "{month}"]),
             PipelineStep("3.2 Pull Google Photos Favorites and update asset flags", "550", ["python3", os.path.join(script_dir, "pull_google_favorites.py"), "{month}"]),
-            #PipelineStep("3.4 Rank Assets by Score", "550", ["python3", os.path.join(script_dir, "rank_assets_by_score.py"), "{month}"]),
+            PipelineStep("3.4 Rank Assets by Score", "600", ["python3", os.path.join(script_dir, "rank_assets_by_score.py"), "{month}"]),
         ]
 
     steps = []
@@ -279,7 +279,7 @@ def get_pipeline_steps(cursor, script_dir, use_mock_data=False):
             if "{month}" in script_name:
                 cmd.append("{month}")
         steps.append(PipelineStep(label, code, cmd))
-    return [step for step, (_, _, _, _, ttype) in zip(steps, rows) if ttype == 'pipeline']
+    return [step for step, (_, _, _, _, ttype) in zip(steps, rows) if ttype in ['pipeline', 'retryable']]
 
 
 def main(args):

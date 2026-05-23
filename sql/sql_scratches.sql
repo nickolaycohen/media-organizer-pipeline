@@ -1,3 +1,13 @@
+update 
+assets 
+set uploaded_to_google =0
+where month = '2025-11'
+
+
+select * 
+from assets a 
+where a.ignore_continuity_check 
+
 UPDATE month_batches 
 SET status_code = '400', updated_at_utc = datetime('now') 
 WHERE month = '2026-01';

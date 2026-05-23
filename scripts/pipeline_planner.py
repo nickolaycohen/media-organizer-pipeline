@@ -198,12 +198,14 @@ def check_active_sources_import_status(cursor, conn, month, auto_apply):
                     found_models.add(model)
 
                     # Reasonability check: parse numeric part from filenames (ignoring extensions)
+                    # We only attempt this if the filename looks like a standard sequential pattern (Prefix + Digits)
+                    seq_pattern = r'^([a-zA-Z_-]+)(\d+)$'
                     if f_min:
-                        nums = re.findall(r'(\d+)', os.path.splitext(f_min)[0])
-                        if nums: num_min = int(nums[-1])
+                        m = re.match(seq_pattern, os.path.splitext(f_min)[0])
+                        if m: num_min = int(m.group(2))
                     if f_max:
-                        nums = re.findall(r'(\d+)', os.path.splitext(f_max)[0])
-                        if nums: num_max = int(nums[-1])
+                        m = re.match(seq_pattern, os.path.splitext(f_max)[0])
+                        if m: num_max = int(m.group(2))
 
                     if num_min is not None and num_max is not None:
                         # We use abs because string MIN/MAX might flip if sequence is not zero-padded
@@ -282,12 +284,14 @@ def check_active_sources_import_status(cursor, conn, month, auto_apply):
 
                     #   TODO: Before the promt we should check confirmed months for each source in comparison to months in the past or in the future relative to the proposed month
                     if unconfirmed_count > 0:
-                        # Determine naming pattern (e.g., 'IMG_') to filter irrelevant conventions
+                        # Determine naming pattern to filter context to relevant conventions
                         pattern = "*"
                         if f_min:
-                            p_match = re.match(r'^([a-zA-Z_-]+)', f_min)
-                            if p_match:
-                                pattern = p_match.group(1) + "*"
+                            # Only use a prefix filter if it looks like a standard sequence (Prefix + Digits)
+                            stem = os.path.splitext(f_min)[0]
+                            m = re.match(r'^([a-zA-Z_-]+)\d+$', stem)
+                            if m:
+                                pattern = m.group(1) + "*"
 
                         # Fetch global boundaries for this model before and after the current month
                         cursor.execute("""
@@ -467,25 +471,37 @@ def verify_sequencing_for_planned_month(cursor, conn, month, auto_apply):
         if not model:
             model = "Unknown Model"
 
-        num_min_matches = re.findall(r'(\d+)', os.path.splitext(f_min)[0]) if f_min else []
-        num_min = int(num_min_matches[-1]) if num_min_matches else 0
-        num_max_matches = re.findall(r'(\d+)', os.path.splitext(f_max)[0]) if f_max else []
-        num_max = int(num_max_matches[-1]) if num_max_matches else 0
-        
-        expected = abs(num_max - num_min) + 1
-        gap = expected - count if expected > count else 0
-        gap_str = f" | ⚠️ Gap detected: {gap} items" if gap > 0 else ""
+        # Reasonability check: parse numeric part from filenames
+        seq_pattern = r'^([a-zA-Z_-]+)(\d+)$'
+        num_min = None
+        if f_min:
+            m = re.match(seq_pattern, os.path.splitext(f_min)[0])
+            if m: num_min = int(m.group(2))
+            
+        num_max = None
+        if f_max:
+            m = re.match(seq_pattern, os.path.splitext(f_max)[0])
+            if m: num_max = int(m.group(2))
+
+        gap_str = ""
+        if num_min is not None and num_max is not None:
+            expected = abs(num_max - num_min) + 1
+            gap = expected - count if expected > count else 0
+            if gap > 0:
+                gap_str = f" | ⚠️ Gap detected: {gap} items"
         logger.info(f"   - Session {uuid} ({model}): {f_min} -> {f_max} ({d_min} to {d_max}) ({count} files){gap_str}")
 
         if auto_apply:
             continue
 
-        # Determine naming pattern (e.g., 'IMG_') to filter irrelevant conventions
+        # Determine naming pattern to filter context to relevant conventions
         pattern = "*"
         if f_min:
-            p_match = re.match(r'^([a-zA-Z_-]+)', f_min)
-            if p_match:
-                pattern = p_match.group(1) + "*"
+            # Only use a prefix filter if it looks like a standard sequence (Prefix + Digits)
+            stem = os.path.splitext(f_min)[0]
+            m = re.match(r'^([a-zA-Z_-]+)\d+$', stem)
+            if m:
+                pattern = m.group(1) + "*"
 
         # Fetch global boundaries for this model before and after the current month
         cursor.execute("""
@@ -575,6 +591,7 @@ def get_stage_transitions(cursor):
         FROM batch_status
         WHERE preceding_code IS NOT NULL
           AND code NOT LIKE '%E'
+        ORDER BY code ASC
     """)
     return cursor.fetchall()
 
@@ -709,12 +726,11 @@ def main(auto_apply):
         if month_status is None:
             continue
 
-        cursor.execute("""
-            SELECT code, preceding_code, full_description, transition_type, short_label
-            FROM batch_status
-            WHERE preceding_code = ?
-        """, (month_status,))
-        transitions_for_month = cursor.fetchall()
+        # Filter the pre-fetched transitions list for this month's status using string comparison
+        transitions_for_month = [
+            t for t in transitions 
+            if str(t[1]) == str(month_status)
+        ]
 
         logger.debug(f"Inspecting transitions for month {month} with status {month_status}")
         for t in transitions_for_month:
@@ -839,7 +855,7 @@ def main(auto_apply):
         # Build the full transition path from current status, only including pipeline transitions
         full_transition_list = get_full_transition_path(
             [t for t in transitions if t[3] == 'pipeline'],
-            current_status
+            str(current_status)
         )
 
         # Check active sources import status for the proposed month

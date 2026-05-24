@@ -15,9 +15,9 @@ where parent_folder_name = 'Google Photos Moments'
 SELECT month, original_filename, date_created_utc 
 	aesthetic_score, google_favorite,
 	case when google_favorite then aesthetic_score + 0.125 else aesthetic_score
-	end as score_normalized
+	end as score_normalized, MomentsAlbumName 
 FROM ranked_assets_view
-WHERE month = :month 
+WHERE month in :months
 ORDER BY score_normalized DESC;
 
 -- PRAGMA quick_check

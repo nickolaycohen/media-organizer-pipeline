@@ -27,9 +27,11 @@ def main():
         return 1
 
     src_time = os.path.getmtime(APPLE_PHOTOS_DB_PATH)
+    # Check the modification time of the existing copy to be more resilient
+    dest_time = os.path.getmtime(APPLE_PHOTOS_DB_COPY_PATH) if os.path.exists(APPLE_PHOTOS_DB_COPY_PATH) else 0
 
     last_copied = read_marker()
-    if src_time > last_copied:
+    if src_time > last_copied or src_time != dest_time:
         logging.info(f"Copying newer DB from {APPLE_PHOTOS_DB_PATH} to {APPLE_PHOTOS_DB_COPY_PATH}")
         shutil.copy2(APPLE_PHOTOS_DB_PATH, APPLE_PHOTOS_DB_COPY_PATH)
         write_marker(src_time)

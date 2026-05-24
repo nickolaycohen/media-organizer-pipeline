@@ -1,4 +1,26 @@
-PRAGMA quick_check
+
+
+-- get all moments
+select *
+from moments
+
+-- get all albums
+select *
+from albums sa 
+where parent_folder_name = 'Google Photos Moments' 
+
+-- select combined score
+-- change selection approach
+-- google weight = a.google_favorite * 0.125
+SELECT month, original_filename, date_created_utc 
+	aesthetic_score, google_favorite,
+	case when google_favorite then aesthetic_score + 0.125 else aesthetic_score
+	end as score_normalized
+FROM ranked_assets_view
+WHERE month = :month 
+ORDER BY score_normalized DESC;
+
+-- PRAGMA quick_check
 
 -- How is Google tagging holding time determined
 SELECT MAX(updated_at_utc) FROM assets WHERE uploaded_to_google = 1 AND month = '2026-04'

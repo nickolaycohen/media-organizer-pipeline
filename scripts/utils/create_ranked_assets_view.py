@@ -12,20 +12,18 @@ def create_view():
         return
 
     view_sql = """
-    CREATE VIEW IF NOT EXISTS ranked_assets_view AS
+    DROP VIEW IF EXISTS ranked_assets_view;
+    CREATE VIEW ranked_assets_view AS
     SELECT
-        a.id AS asset_id,
+        a.asset_id,
         a.original_filename,
         a.month,
         a.aesthetic_score,
         a.google_favorite,
-        a.aesthetic_score + (a.google_favorite * 0.125) AS score_normalized
+        (COALESCE(a.aesthetic_score, 0) * 0.875) + (a.google_favorite * 0.125) AS score_normalized,
+        a.date_created_utc
     FROM
-        assets a
-    WHERE
-        a.aesthetic_score IS NOT NULL
-    ORDER BY
-        score_normalized DESC;
+        assets a;
     """
 
     try:

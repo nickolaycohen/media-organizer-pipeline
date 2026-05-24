@@ -38,6 +38,7 @@ def sync_assets(media_cursor, logger):
                 asset_id TEXT PRIMARY KEY,
                 original_filename TEXT,
                 month TEXT,
+                MomentsAlbumName TEXT,
                 date_created_utc TEXT,
                 imported_date_utc TEXT,
                 import_id TEXT,
@@ -56,7 +57,7 @@ def sync_assets(media_cursor, logger):
         media_cursor.execute("PRAGMA table_info(assets_old)")
         existing_cols = {row[1] for row in media_cursor.fetchall()}
         target_cols = [
-            "asset_id", "original_filename", "month", "date_created_utc", "imported_date_utc",
+            "asset_id", "original_filename", "month", "MomentsAlbumName", "date_created_utc", "imported_date_utc",
             "import_id", "aesthetic_score", "google_favorite", "ignore_continuity_check",
             "file_hash", "uploaded_to_google", "score_imported_at_utc", "created_at_utc", "updated_at_utc"
         ]
@@ -134,10 +135,13 @@ def sync_assets(media_cursor, logger):
             datetime(a.ZADDEDDATE + 978307200, 'unixepoch'),
             a.ZIMPORTSESSION as import_id,
             strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) as month,
-            COALESCE(ea.ZCAMERAMODEL, 'Unknown') as camera_model
+            COALESCE(ea.ZCAMERAMODEL, 'Unknown') as camera_model,
+            ga.ZTITLE as MomentsAlbumName
         FROM ZASSET a
         JOIN ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK
         LEFT JOIN ZEXTENDEDATTRIBUTES ea ON ea.ZASSET = a.Z_PK
+        left outer join z_30assets aa on aa.Z_3ASSETS = a.Z_PK 
+        left outer join ZGENERICALBUM ga on (ga.Z_PK = aa.Z_30ALBUMS and ga.ZPARENTFOLDER = 73008)
         WHERE a.ZIMPORTSESSION IS NOT NULL
     """)
     results = media_cursor.fetchall()
@@ -148,8 +152,8 @@ def sync_assets(media_cursor, logger):
     assets_to_insert = []
 
     for row in results:
-        asset_id, score, filename, date_created, imported_date, import_id, month, _ = row
-        assets_to_insert.append((asset_id, score, filename, date_created, imported_date, import_id, month))
+        asset_id, score, filename, date_created, imported_date, import_id, month, _, MomentsAlbumName = row
+        assets_to_insert.append((asset_id, score, filename, date_created, imported_date, import_id, month, MomentsAlbumName))
 
     if assets_to_insert:
         logger.info(f"Preparing to insert/update {len(assets_to_insert)} asset records...")
@@ -162,12 +166,14 @@ def sync_assets(media_cursor, logger):
                 imported_date_utc,
                 import_id,
                 month,
+                MomentsAlbumName,
                 score_imported_at_utc,
                 updated_at_utc
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
             ON CONFLICT(asset_id) DO UPDATE SET
                 asset_id = excluded.asset_id,
                 aesthetic_score = excluded.aesthetic_score,
+                MomentsAlbumName = excluded.MomentsAlbumName,
                 date_created_utc = excluded.date_created_utc,
                 imported_date_utc = excluded.imported_date_utc,
                 import_id = excluded.import_id,
@@ -176,7 +182,8 @@ def sync_assets(media_cursor, logger):
             WHERE asset_id IS NOT excluded.asset_id
                OR ROUND(COALESCE(aesthetic_score, -1.0), 6) IS NOT ROUND(COALESCE(excluded.aesthetic_score, -1.0), 6)
                OR COALESCE(CAST(import_id AS TEXT), '') IS NOT COALESCE(CAST(excluded.import_id AS TEXT), '')
-               OR COALESCE(date_created_utc, '') IS NOT COALESCE(excluded.date_created_utc, '');
+               OR COALESCE(date_created_utc, '') IS NOT COALESCE(excluded.date_created_utc, '')
+               OR COALESCE(MomentsAlbumName, '') IS NOT COALESCE(excluded.MomentsAlbumName, '');
         """, assets_to_insert)
         inserted_count = media_cursor.rowcount
         commit()
@@ -212,7 +219,8 @@ def sync_assets(media_cursor, logger):
         logger.info(f"🗑️ Purged {purged_imports_count} orphaned import session records.")
         commit()
 
-    # Clear and repopulate smart_albums
+    # Ensure smart_albums table exists and clear it before repopulating
+    media_cursor.execute("CREATE TABLE IF NOT EXISTS smart_albums (album_pk INTEGER, album_name TEXT, parent_folder_pk INTEGER, parent_folder_name TEXT)")
     logger.info("Clearing existing smart_albums entries...")
     media_cursor.execute("DELETE FROM smart_albums;")
 
@@ -228,6 +236,47 @@ def sync_assets(media_cursor, logger):
         LEFT JOIN photos_db.ZGENERICALBUM p ON a.ZPARENTFOLDER = p.Z_PK
         WHERE a.ZKIND = 1507
         AND (p.ZTITLE = 'MonthlyExports' OR a.ZPARENTFOLDER = 72235)
+        ORDER BY a.ZTITLE;
+    ''')
+
+    # Ensure albums table exists and clear it before repopulating
+    media_cursor.execute("CREATE TABLE IF NOT EXISTS albums (album_pk INTEGER, album_name TEXT, parent_folder_pk INTEGER, parent_folder_name TEXT)")
+    logger.info("Clearing existing albums entries...")
+    media_cursor.execute("DELETE FROM albums;")
+
+    logger.info("Populating albums from Apple Photos DB...")
+    media_cursor.execute('''
+        INSERT INTO albums (album_pk, album_name, parent_folder_pk, parent_folder_name)
+        SELECT 
+            a.Z_PK, 
+            a.ZTITLE, 
+            a.ZPARENTFOLDER, 
+            p.ZTITLE
+        FROM photos_db.ZGENERICALBUM a
+        LEFT JOIN photos_db.ZGENERICALBUM p ON a.ZPARENTFOLDER = p.Z_PK
+        WHERE a.ZKIND <> 1507
+        and a.ZTITLE is NOT NULL
+        ORDER BY a.ZTITLE;
+    ''')
+
+    # Ensure moments table exists and clear it before repopulating
+    media_cursor.execute("CREATE TABLE IF NOT EXISTS moments (album_pk INTEGER, album_name TEXT, parent_folder_pk INTEGER, parent_folder_name TEXT)")
+    logger.info("Clearing existing moments entries...")
+    media_cursor.execute("DELETE FROM moments;")
+
+    logger.info("Populating moments from Apple Photos DB...")
+    media_cursor.execute('''
+        INSERT INTO moments (album_pk, album_name, parent_folder_pk, parent_folder_name)
+        SELECT 
+            a.Z_PK, 
+            a.ZTITLE, 
+            a.ZPARENTFOLDER, 
+            p.ZTITLE
+        FROM photos_db.ZGENERICALBUM a
+        LEFT JOIN photos_db.ZGENERICALBUM p ON a.ZPARENTFOLDER = p.Z_PK
+        WHERE a.ZKIND <> 1507
+        and a.ZTITLE is NOT NULL
+        and p.ZTITLE = 'Moments' 
         ORDER BY a.ZTITLE;
     ''')
 
@@ -298,7 +347,6 @@ def sync_assets(media_cursor, logger):
     # Drop and recreate the ranked_assets_view
     logger.info("Dropping and recreating ranked_assets_view...")
     media_cursor.execute("DROP VIEW IF EXISTS main.ranked_assets_view;")
-
     media_cursor.execute('''
         CREATE VIEW main.ranked_assets_view AS
         SELECT 
@@ -307,7 +355,9 @@ def sync_assets(media_cursor, logger):
             month,
             aesthetic_score,
             google_favorite,
-            (COALESCE(aesthetic_score, 0) * 0.875) + (google_favorite * 0.125) AS score_normalized
+            (COALESCE(aesthetic_score, 0) * 0.875) + (google_favorite * 0.125) AS score_normalized,
+            date_created_utc,
+            MomentsAlbumName
         FROM main.assets;
     ''')
     commit()

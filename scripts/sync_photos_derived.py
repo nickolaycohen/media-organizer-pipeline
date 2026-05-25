@@ -355,7 +355,10 @@ def sync_assets(media_cursor, logger):
             month,
             aesthetic_score,
             google_favorite,
-            (COALESCE(aesthetic_score, 0) * 0.875) + (google_favorite * 0.125) AS score_normalized,
+            case when google_favorite 
+                then (COALESCE(aesthetic_score, 0) * 0.875) + (google_favorite * 0.125)
+                else aesthetic_score
+            end AS score_normalized,
             date_created_utc,
             MomentsAlbumName
         FROM main.assets;

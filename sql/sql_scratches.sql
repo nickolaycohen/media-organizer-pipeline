@@ -12,7 +12,8 @@ where parent_folder_name = 'Google Photos Moments'
 -- select combined score
 -- change selection approach
 -- google weight = a.google_favorite * 0.125
-SELECT month, original_filename, date_created_utc 
+-- :months - ('2026-04', '2026-03','2026-02','2026-01','2025-12','2025-11','2025-10')
+SELECT month, original_filename, date_created_utc , score_normalized 
 	aesthetic_score, google_favorite,
 	case when google_favorite then aesthetic_score + 0.125 else aesthetic_score
 	end as score_normalized, MomentsAlbumName 

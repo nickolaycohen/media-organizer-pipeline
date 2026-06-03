@@ -91,8 +91,12 @@ def run_regular_steps(bootstrap_steps, steps, from_index, to_index, dry_run, mon
                 expected_prev = cur_status.fetchone()
                 expected_prev_code = expected_prev[0] if expected_prev else None
                 if expected_prev_code and batch_status_code != expected_prev_code:
-                    logger.info(f"⏭️ Skipping step '{step.label}' for month {month}. Its status '{batch_status_code}' doesn't match the expected preceding status '{expected_prev_code}'.")
-                    continue
+                    # Allow retry if the batch is in the error state of the CURRENT step
+                    if batch_status_code == str(step.code) + 'E':
+                        logger.info(f"🔄 Retrying failed step '{step.label}' for month {month} (Current status: {batch_status_code}).")
+                    else:
+                        logger.info(f"⏭️ Skipping step '{step.label}' for month {month}. Its status '{batch_status_code}' doesn't match the expected preceding status '{expected_prev_code}'.")
+                        continue
         # --- End status check logic ---
 
         # Prompt for confirmation if about to pull favorites (Step 550)
@@ -103,6 +107,16 @@ def run_regular_steps(bootstrap_steps, steps, from_index, to_index, dry_run, mon
                 logger.error(f"❌ Execution halted: Old assets for {month} must be removed from Google Account before pulling favorites to ensure matching accuracy.")
                 conn.close()
                 sys.exit(1)
+
+        # Prompt for confirmation for Cleanup (Step 650)
+        if step.code == '650' and not dry_run:
+            print(f"\n⚠️  Action Required: Google Drive Storage Cleanup for {month}")
+            print("The pipeline is ready to transition this batch to 'Cleaned'.")
+            print("You must manually delete these photos from your Google Photos Library and Trash to free up space.")
+            confirm = input("Are you ready to proceed with the interactive cleanup script? [y/N]: ").strip().lower()
+            if confirm != 'y':
+                logger.warning(f"⏭️ Skipping cleanup for {month} at user request.")
+                continue
 
         # Prepare command with current_month replaced if available
         command = [arg.replace("{month}", month) if month else arg for arg in step.command]

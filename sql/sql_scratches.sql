@@ -1,5 +1,36 @@
 
 
+select a.*
+from assets a
+join month_batches mb on mb."month" = a."month" 
+where a.month = '2006-04'
+
+delete 
+from assets 
+where month = '2025-07' and date_created_utc is null
+-- select combined score
+-- change selection approach
+-- google weight = a.google_favorite * 0.125
+-- :months - ('2026-04', '2026-03','2026-02','2026-01','2025-12','2025-11','2025-10', '2025-09')
+
+SELECT month, original_filename, date_created_utc , aesthetic_score, score_normalized,
+	google_favorite, MomentsAlbumName  
+FROM ranked_assets_view
+WHERE month in :months
+ORDER BY score_normalized DESC;
+
+select a.date_created_utc , a.uploaded_to_google, * 
+from assets a 
+where 
+a."month" = '2025-07' or 
+(a.date_created_utc like '2025-07%')
+order by 1
+
+
+update assets  
+set uploaded_to_google = 0
+where "month" = '2025-07'
+
 -- get all moments
 select *
 from moments
@@ -7,19 +38,9 @@ from moments
 -- get all albums
 select *
 from albums sa 
-where parent_folder_name = 'Google Photos Moments' 
+-- where parent_folder_name = 'Google Photos Moments' 
+order by album_pk desc
 
--- select combined score
--- change selection approach
--- google weight = a.google_favorite * 0.125
--- :months - ('2026-04', '2026-03','2026-02','2026-01','2025-12','2025-11','2025-10')
-SELECT month, original_filename, date_created_utc , score_normalized 
-	aesthetic_score, google_favorite,
-	case when google_favorite then aesthetic_score + 0.125 else aesthetic_score
-	end as score_normalized, MomentsAlbumName 
-FROM ranked_assets_view
-WHERE month in :months
-ORDER BY score_normalized DESC;
 
 -- PRAGMA quick_check
 

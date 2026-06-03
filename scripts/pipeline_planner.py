@@ -2,6 +2,7 @@ import sys
 import os
 import subprocess
 import re
+import time
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import logging
@@ -741,6 +742,17 @@ def main(auto_apply):
             if str(t[1]) == str(month_status)
         ]
 
+        # If in an error state (e.g., 400E), find the transition that was attempted (code=400)
+        # so we can suggest a retry.
+        if not transitions_for_month and str(month_status).endswith('E'):
+            failed_code = str(month_status)[:-1]
+            # Find the transition where the target code is the one that failed
+            retry_candidates = [t for t in transitions if str(t[0]) == failed_code]
+            for t in retry_candidates:
+                logger.info(f"Found error state '{month_status}' for {month}. Suggesting retry of step {failed_code}.")
+                # Treat as a retryable candidate to prioritize resolving the failure
+                retryable_candidates.append((month, t))
+
         logger.debug(f"Inspecting transitions for month {month} with status {month_status}")
         for t in transitions_for_month:
             if t[3] == 'manual':
@@ -808,7 +820,11 @@ def main(auto_apply):
     logger.info("🔍 Evaluating retryable transition candidates...")
     for month, transition in retryable_candidates:
         selected_code, selected_prev, selected_desc, selected_type, short_label = transition
-        if selected_prev == '399':
+
+        # Only perform space-based analysis and branching for batches that haven't finished 
+        # their primary upload (stage < 400) and are targeting an upload operation.
+        is_upload_retry = selected_code in ['399', '400'] and int(selected_prev) < 400
+        if is_upload_retry:
             free_space = check_google_quota(creds=creds)
             if free_space is None:
                 logger.error("❌ Error: Could not retrieve Google Drive quota."); close_conn(); sys.exit(1)
@@ -824,7 +840,7 @@ def main(auto_apply):
                         if ext in SUPPORTED_EXTENSIONS:
                             fp = os.path.join(root, f)
                             staging_size += os.path.getsize(fp)
-                logger.info(f"Detected staging for {month}: {staging_folder}, size: {human_readable_size(staging_size)}")
+                logger.info(f"Staging folder content for {month}: {human_readable_size(staging_size)} total files.")
             else:
                 staging_folder = None; staging_size = 0; logger.warning(f"No staging folder found for {month}")
 
@@ -836,7 +852,7 @@ def main(auto_apply):
                     file_path = os.path.join(staging_folder, filename_tuple[0])
                     if os.path.exists(file_path):
                         latest_upload_size += os.path.getsize(file_path)
-            logger.info(f"Total uploaded size for {month}: {human_readable_size(latest_upload_size)}")
+            logger.info(f"Upload progress: {human_readable_size(latest_upload_size)} of {month} already in Google Photos.")
 
             remaining_to_upload = max(0, staging_size - latest_upload_size)
             if remaining_to_upload == 0:
@@ -849,12 +865,26 @@ def main(auto_apply):
                     cursor.execute("UPDATE month_batches SET status_code = '400' WHERE month = ?", (month,))
                     conn.commit(); logger.info(f"Month {month} updated to 400."); close_conn(); sys.exit(0)
             elif free_space >= remaining_to_upload:
-                logger.info(f"🚀 Space available ({human_readable_size(free_space)}) to finish uploading {month}. Priority given to retryable task.")
+                logger.info(f"🚀 Found {human_readable_size(remaining_to_upload)} left to upload for {month}. "
+                            f"Available space: {human_readable_size(free_space)}. Priority given to finishing this batch.")
                 selected_month = month
                 selected_transition = transition
                 break
             else:
                 logger.warning(f"⚠️ Insufficient space for {month}. Free: {human_readable_size(free_space)}, Need: {human_readable_size(remaining_to_upload)}.")
+                
+                # Branch and suggest cleanup for months at stage 600
+                cleanup_candidates = [m for m, s in batches if str(s) == '600']
+                if cleanup_candidates:
+                    logger.info(f"💡 Suggestion: Drive cleanup available for processed months: {', '.join(cleanup_candidates)}")
+                    for m_c, t_c in pipeline_candidates:
+                        if m_c in cleanup_candidates and str(t_c[1]) == '600':
+                            selected_month = m_c
+                            selected_transition = t_c
+                            logger.info(f"🔄 Branching to cleanup transition (600->650) for {selected_month} to free up space.")
+                            break
+                    if selected_month:
+                        break
                 continue
 
     if not selected_month:
@@ -874,14 +904,16 @@ def main(auto_apply):
             str(current_status)
         )
 
-        # Check active sources import status for the proposed month
-        check_active_sources_import_status(cursor, conn, latest_month, auto_apply)
+        # Only perform import continuity and sequencing checks for batches that haven't reached the upload stage (400)
+        # This prevents redundant prompts for batches that are already processed or being curated.
+        if current_status and str(current_status) < '400':
+            check_active_sources_import_status(cursor, conn, latest_month, auto_apply)
 
-        # --- Check sequencing before recording the plan ---
-        if not verify_sequencing_for_planned_month(cursor, conn, latest_month, auto_apply):
-            logger.warning(f"Sequencing not confirmed for {latest_month}. Aborting plan recording.")
-            close_conn()
-            sys.exit(0)
+            # --- Check sequencing before recording the plan ---
+            if not verify_sequencing_for_planned_month(cursor, conn, latest_month, auto_apply):
+                logger.warning(f"Sequencing not confirmed for {latest_month}. Aborting plan recording.")
+                close_conn()
+                sys.exit(0)
 
         logger.info(f"Run pipeline for: Month={latest_month}, Transitions={full_transition_list}")
 

@@ -93,24 +93,8 @@ def authenticate(scopes=None, force_refresh=False):
     return creds
 
 def create_or_get_album(creds, album_title):
-    headers = {'Authorization': f'Bearer {creds.token}'}
-    albums = []
-    page_token = None
-
-    # Paginate through all albums
-    while True:
-        params = {'pageSize': 50}
-        if page_token:
-            params['pageToken'] = page_token
-
-        response = requests.get(f'{API_BASE_URL}/albums', headers=headers, params=params)
-        if response.status_code != 200:
-            raise Exception(f'Failed to list albums: {response.text}')
-        data = response.json()
-        albums.extend(data.get('albums', []))
-        page_token = data.get('nextPageToken')
-        if not page_token:
-            break
+    # Find all matches using the list_albums generator (Method: albums.list)
+    albums = list(list_albums(creds))
 
     # Find all matches
     matches = [a for a in albums if a.get('title') == album_title]
@@ -267,3 +251,57 @@ def list_albums(creds):
         page_token = data.get('nextPageToken')
         if not page_token:
             break
+
+def get_album_items(creds, album_id):
+    """Fetches all media items from a specific album."""
+    headers = {'Authorization': f'Bearer {creds.token}', 'Content-type': 'application/json'}
+    url = f'{API_BASE_URL}/mediaItems:search'
+    body = {'albumId': album_id, 'pageSize': 100}
+
+    items = []
+    while True:
+        response = requests.post(url, headers=headers, json=body)
+        if response.status_code != 200:
+            logger.error(f"Failed to fetch album items: {response.text}")
+            break
+        data = response.json()
+        items.extend(data.get('mediaItems', []))
+        next_page_token = data.get('nextPageToken')
+        if not next_page_token:
+            break
+        body['pageToken'] = next_page_token
+    return items
+
+def remove_media_from_album(creds, album_id, media_item_ids):
+    """
+    Removes media items from an album using batchRemoveMediaItems.
+    Note: This does NOT delete items from the user's library.
+    
+    The API requires that both the album and the items were created by 
+    this application. Per API docs, partial success is not supported 
+    within a single request payload.
+    """
+    url = f'{API_BASE_URL}/albums/{album_id}:batchRemoveMediaItems'
+    headers = {
+        'Authorization': f'Bearer {creds.token}',
+        'Content-type': 'application/json'
+    }
+
+    # API allows max 50 items per call
+    chunk_size = 50
+    success_count = 0
+    
+    for i in range(0, len(media_item_ids), chunk_size):
+        chunk = media_item_ids[i:i + chunk_size]
+        body = {'mediaItemIds': chunk}
+        
+        try:
+            response = requests.post(url, headers=headers, json=body)
+            if response.status_code == 200:
+                success_count += len(chunk)
+            else:
+                logger.error(f"Batch remove failed for chunk starting at {i}: {response.text}")
+        except Exception as e:
+            logger.error(f"Request error during batch remove: {e}")
+
+    logger.info(f"Removed {success_count}/{len(media_item_ids)} items from album.")

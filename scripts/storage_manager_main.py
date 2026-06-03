@@ -55,6 +55,15 @@ def main():
             transition_type = excluded.transition_type
     """)
 
+    # Ensure the transition from ranked (600) to cleaned (650) is defined
+    cursor.execute("""
+        INSERT INTO batch_status (code, preceding_code, short_label, full_description, transition_type, script_name, pipeline_stage)
+        VALUES ('650', '600', 'cleaned', 'Manual cleanup of Google Photos assets to free storage', 'pipeline', 'delete_google_assets.py {month}', '4.2')
+        ON CONFLICT(code) DO UPDATE SET 
+            preceding_code = excluded.preceding_code,
+            transition_type = excluded.transition_type
+    """)
+
     get_migration_status(cursor)
     conn.commit()
     if "--migrate" in sys.argv:

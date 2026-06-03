@@ -10,7 +10,7 @@ from constants import MEDIA_ORGANIZER_DB_PATH, STAGING_ROOT, LOG_PATH
 from db.queries import get_planned_month
 from db.connections import get_connection, get_cursor, commit, close as close_conn
 from utils.logger import setup_logger
-from google_photos import create_or_get_album, upload_media, human_readable_size, check_google_quota, authenticate, GOOGLE_PHOTOS_READONLY_SCOPES, GOOGLE_PHOTOS_APPEND_ONLY_SCOPES
+from google_photos import create_or_get_album, upload_media, human_readable_size, check_google_quota, authenticate, GOOGLE_PHOTOS_READONLY_SCOPES, GOOGLE_PHOTOS_APPEND_ONLY_SCOPES, PLANNER_REQUIRED_SCOPES
 from datetime import datetime
 import logging
 from utils.logger import compute_file_hash
@@ -57,7 +57,7 @@ def main(args):
 
     existing_metadata = {}
     cursor.execute("""
-        SELECT original_filename, month, import_id, aesthetic_score, date_created_utc, imported_date_utc, asset_id
+        SELECT original_filename, month, import_id, aesthetic_score, date_created_utc, imported_date_utc, asset_id, uploaded_to_google
         FROM assets
         WHERE month = ?
     """, (month,))
@@ -68,11 +68,36 @@ def main(args):
             "original_filename": row[0],
             "date_created_utc": row[4],
             "imported_date_utc": row[5],
-            "asset_id": row[6]
+            "asset_id": row[6],
+            "uploaded_to_google": row[7]
         }
 
+    # Filter physical files: ignore those that DB says belong to other months or are already uploaded
+    files_to_process = []
+    for file_path, file_size in files:
+        filename = os.path.basename(file_path)
+        metadata = existing_metadata.get((filename.lower(), month))
+        
+        if not metadata:
+            logger.warning(f"⏭️ Skipping {filename}: Not found in database for month {month}. It may belong to another batch.")
+            continue
+            
+        if metadata.get("uploaded_to_google") == 1:
+            continue
+            
+        files_to_process.append((file_path, file_size, metadata))
+
+    if not files_to_process:
+        logger.info(f"✅ No new files to upload for month {month}. All assets in staging are either already uploaded or belong to different batches.")
+        files = []
+    else:
+        files = [(f[0], f[1]) for f in files_to_process]
+        logger.info(f"Filtered to {len(files)} files that actually need uploading for batch {month}.")
+
     if args.dry_run:
-        logger.info("Dry run enabled. Skipping authentication and upload.")
+        logger.info("[Dry Run] Dry run enabled. Skipping authentication and upload.")
+    elif not files:
+        logger.info("No files to upload. Skipping authentication flow.")
     else:
         # Use the centralized quota check, which handles its own authentication
         remaining_quota_bytes = check_google_quota()
@@ -90,14 +115,7 @@ def main(args):
             remaining_gb = remaining_quota_bytes / (1024 ** 3)
             logger.warning(f"Not enough space on Google Drive to upload the entire batch. Batch requires {batch_size_gb:.2f} GB but only {remaining_gb:.2f} GB is available.")
             # Sort files by aesthetic_score descending
-            files_with_scores = []
-            for file_path, file_size in files:
-                filename = os.path.basename(file_path).lower()
-                metadata = existing_metadata.get((filename, month), {})
-                score = metadata.get("aesthetic_score")
-                if score is None:
-                    score = -float('inf')  # Treat missing score as lowest
-                files_with_scores.append((file_path, file_size, score))
+            files_with_scores = [(f[0], f[1], f[2].get("aesthetic_score") or -float('inf')) for f in files_to_process]
             files_with_scores.sort(key=lambda x: x[2], reverse=True)
 
             selected_files = []
@@ -118,15 +136,19 @@ def main(args):
             logger.info(f"Selected {len(selected_files)} files to upload based on aesthetic score to fit available quota. Skipped {skipped_count} files.")
             files = selected_files
 
-            # Mark batch as partial upload if not all files fit
-            if len(files) < len(get_files_to_upload(album_path)):
+            # Mark batch as partial upload if not all files fit AND it's not already further along (e.g. 500)
+            cursor.execute("SELECT status_code FROM month_batches WHERE month = ?", (month,))
+            current_status_row = cursor.fetchone()
+            current_status = current_status_row[0] if current_status_row else '000'
+            
+            if len(files) < len(files_to_process) and current_status < '400':
                 cursor.execute("""
                     UPDATE month_batches
                     SET status_code = '399'
                     WHERE month = ?
                 """, (month,))
                 conn.commit()
-                logger.info(f"Batch {month} marked as partial upload (399) due to Google Drive quota limits.")
+                logger.info(f"Batch {month} status set to partial upload (399).")
 
         album_title = f"Currently Curating - {month}"
         # Authenticate with a scope that can list albums
@@ -142,20 +164,8 @@ def main(args):
         file_size_mb = file_size / (1024 * 1024)
         file_hash = compute_file_hash(file_path)
 
-        cursor.execute("""
-            SELECT uploaded_to_google FROM assets
-            WHERE original_filename = ? AND month = ?
-            LIMIT 1
-        """, (filename, month))
-        row = cursor.fetchone()
-        if row and row[0] == 1:
-            logger.info(f"[{idx}/{total_files}] Skipping already-uploaded file: {filename} ({file_size_mb:.2f} MB)")
-            continue
-
         normalized_filename = filename.lower()
-        metadata = existing_metadata.get((normalized_filename, month), {})
-        if not metadata:
-            logger.warning(f"⚠️ No metadata found for {filename} in month {month}")
+        metadata = existing_metadata.get((normalized_filename, month))
 
         if args.dry_run:
             logger.info(f"[Dry Run] [{idx}/{total_files}] Would upload: {filename} ({file_size_mb:.2f} MB)")
@@ -165,34 +175,12 @@ def main(args):
                 upload_media(creds_append, file_path, album_id)
                 logger.info(f"[{idx}/{total_files}] Uploaded: {filename}")
                 cursor.execute("""
-                    INSERT INTO assets (
-                        asset_id,
-                        file_hash, 
-                        month, 
-                        import_id,
-                        aesthetic_score, 
-                        original_filename, 
-                        date_created_utc, 
-                        imported_date_utc, 
-                        score_imported_at_utc, 
-                        uploaded_to_google, 
-                        created_at_utc, 
-                        updated_at_utc
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), 1, datetime('now'), datetime('now'))
-                    ON CONFLICT(asset_id) DO UPDATE SET
-                        file_hash = excluded.file_hash,
+                    UPDATE assets SET
+                        file_hash = ?,
                         uploaded_to_google = 1,
                         updated_at_utc = datetime('now')
-                """, (
-                    metadata.get("asset_id"),
-                    file_hash,
-                    month,
-                    metadata.get("import_id"),
-                    metadata.get("aesthetic_score"),
-                    metadata.get("original_filename", filename),
-                    metadata.get("date_created_utc"),
-                    metadata.get("imported_date_utc")
-                ))
+                    WHERE asset_id = ?
+                """, (file_hash, metadata.get("asset_id")))
                 conn.commit()
             except Exception as e:
                 logger.error(f"[{idx}/{total_files}] Failed to upload {filename}: {e}")

@@ -1,9 +1,23 @@
+select *
+from month_batches mb 
+order by 2 desc;
+
+-- Pick assets to add moments - locate first item with null Moment and added it to a new album in Apple Photos Library
+SELECT v.original_filename, v.month, v.MomentsAlbumName, v.score_normalized
+FROM ranked_assets_view v
+JOIN month_batches mb ON v.month = mb.month
+WHERE mb.status_code >= '600'
+ORDER BY v.score_normalized DESC;
 
 
-select a.*
+SELECT original_filename, uploaded_to_google, * FROM assets WHERE original_filename = 'IMG_2580.HEIC';
+
+
+select mb.status_code, a.google_favorite, a.aesthetic_score, '---', a.*
 from assets a
 join month_batches mb on mb."month" = a."month" 
-where a.month = '2006-04'
+where a.month = '2026-04'
+order by a.google_favorite desc, a.aesthetic_score desc;
 
 delete 
 from assets 
@@ -16,7 +30,7 @@ where month = '2025-07' and date_created_utc is null
 SELECT month, original_filename, date_created_utc , aesthetic_score, score_normalized,
 	google_favorite, MomentsAlbumName  
 FROM ranked_assets_view
-WHERE month in :months
+WHERE month in (select "month" from month_batches mb where mb.status_code >= 600)
 ORDER BY score_normalized DESC;
 
 select a.date_created_utc , a.uploaded_to_google, * 

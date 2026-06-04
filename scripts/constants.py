@@ -14,6 +14,10 @@ CURATED_EXPORT_DIR = '/Volumes/LaCie/Media Organizer/Google Photos/02-AICurrateL
 APPLE_PHOTOS_DB_COPY_PATH = "/Volumes/Macintosh HD/Users/nickolaycohen/Photos Library DB/All-Media-Extreme/database/Photos.sqlite"
 APPLE_PHOTOS_DB_MARKER = APPLE_PHOTOS_DB_COPY_PATH + ".lastcopy"
 
+# Scoring Weights
+Aestetic_Score_Weight = 0.875
+Google_Favorites_Weight = 0.125
+
 # --- Google API Scopes ---
 # https://developers.google.com/photos/overview/authorization
 # https://developers.google.com/photos/library/reference/rest/v1/albums/get

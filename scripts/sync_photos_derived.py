@@ -5,7 +5,7 @@ import argparse
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from utils.logger import setup_logger, close_logger
-from constants import LOG_PATH, MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_COPY_PATH
+from constants import LOG_PATH, MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_COPY_PATH, Aestetic_Score_Weight, Google_Favorites_Weight
 from db.connections import get_connection, get_cursor, commit, close as close_conn
 
 MODULE_TAG = 'sync_photos_derived'
@@ -347,7 +347,7 @@ def sync_assets(media_cursor, logger):
     # Drop and recreate the ranked_assets_view
     logger.info("Dropping and recreating ranked_assets_view...")
     media_cursor.execute("DROP VIEW IF EXISTS main.ranked_assets_view;")
-    media_cursor.execute('''
+    media_cursor.execute(f'''
         CREATE VIEW main.ranked_assets_view AS
         SELECT 
             asset_id,
@@ -356,7 +356,7 @@ def sync_assets(media_cursor, logger):
             aesthetic_score,
             google_favorite,
             case when google_favorite 
-                then (COALESCE(aesthetic_score, 0) * 0.875) + (google_favorite * 0.125)
+                then (COALESCE(aesthetic_score, 0) * {Aestetic_Score_Weight}) + (google_favorite * {Google_Favorites_Weight})
                 else aesthetic_score
             end AS score_normalized,
             date_created_utc,

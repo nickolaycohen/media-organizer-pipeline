@@ -695,6 +695,20 @@ def main(auto_apply):
     # Run bootstrap steps before proceeding
     run_bootstrap_steps(auto_apply, logger)
 
+    # Prompt for session mode: Moments Export or Standard Pipeline
+    if not auto_apply:
+        print("\n--- 🛠️  Session Mode ---")
+        mode = input("Select mode: [P] Standard Pipeline Planner (default) | [M] Moments Export: ").strip().lower()
+        if mode == 'm':
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            logger.info("🚀 Initiating Moments Export mode...")
+            try:
+                subprocess.run(["python3", os.path.join(script_dir, "export_moments.py")], check=True)
+                logger.info("✅ Moments Export session finished.")
+            except subprocess.CalledProcessError as e:
+                logger.error(f"❌ Moments Export process failed: {e}")
+            sys.exit(0)
+
     conn = get_connection()
     conn.execute("PRAGMA busy_timeout = 30000")
     cursor = get_cursor()

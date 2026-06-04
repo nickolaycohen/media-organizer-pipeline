@@ -6,6 +6,7 @@ import mimetypes
 import sqlite3
 import argparse
 import hashlib
+import re
 from constants import MEDIA_ORGANIZER_DB_PATH, STAGING_ROOT, LOG_PATH
 from db.queries import get_planned_month
 from db.connections import get_connection, get_cursor, commit, close as close_conn
@@ -55,50 +56,78 @@ def main(args):
 
     logger.info(f"Found {len(files)} media files to upload from batch {month}")
 
-    existing_metadata = {}
+    # Store metadata by original_filename. Multiple sources can have the same original_filename.
+    # We store them in a list to match against exported files (which might have suffixes like ' 2').
+    existing_metadata = {} 
     cursor.execute("""
         SELECT original_filename, month, import_id, aesthetic_score, date_created_utc, imported_date_utc, asset_id, uploaded_to_google
         FROM assets
         WHERE month = ?
     """, (month,))
     for row in cursor.fetchall():
-        existing_metadata[(row[0].lower(), row[1])] = {
+        fname_lower = row[0].lower()
+        if fname_lower not in existing_metadata:
+            existing_metadata[fname_lower] = []
+            
+        existing_metadata[fname_lower].append({
             "import_id": row[2],
             "aesthetic_score": row[3],
             "original_filename": row[0],
             "date_created_utc": row[4],
             "imported_date_utc": row[5],
             "asset_id": row[6],
-            "uploaded_to_google": row[7]
-        }
+            "uploaded_to_google": row[7],
+            "matched": False # internal flag to track matches for disk files with suffixes
+        })
+
+    def find_metadata_match(filename):
+        # Strip the " 2", " 3" suffix added by Apple Photos export to find the original DB record
+        clean_name = re.sub(r'\s\d+(\.[^.]+)$', r'\1', filename.lower())
+        for m in existing_metadata.get(clean_name, []):
+            if not m['matched']:
+                m['matched'] = True
+                return m
+        return None
 
     # Filter physical files: ignore those that DB says belong to other months or are already uploaded
     files_to_process = []
+    already_uploaded_size = 0
+    total_eligible_size = 0
+    skipped_count = 0
     for file_path, file_size in files:
-        filename = os.path.basename(file_path)
-        metadata = existing_metadata.get((filename.lower(), month))
+        disk_filename = os.path.basename(file_path)
+        metadata = find_metadata_match(disk_filename)
         
         if not metadata:
-            logger.warning(f"⏭️ Skipping {filename}: Not found in database for month {month}. It may belong to another batch.")
+            logger.warning(f"⏭️ Skipping {disk_filename}: Not found in database for month {month}. It may belong to another batch.")
             continue
             
+        total_eligible_size += file_size
+
         if metadata.get("uploaded_to_google") == 1:
+            already_uploaded_size += file_size
+            skipped_count += 1
+            logger.debug(f"⏭️ Skipping {disk_filename}: Already marked as uploaded in database.")
             continue
             
         files_to_process.append((file_path, file_size, metadata))
 
     if not files_to_process:
-        logger.info(f"✅ No new files to upload for month {month}. All assets in staging are either already uploaded or belong to different batches.")
-        files = []
+        logger.info(f"✅ No new files to upload for month {month}. (Checked {len(files)} files, {skipped_count} already uploaded).")
+        return
     else:
-        files = [(f[0], f[1]) for f in files_to_process]
-        logger.info(f"Filtered to {len(files)} files that actually need uploading for batch {month}.")
+        logger.info(f"🔍 Batch Analysis: {len(files_to_process) + skipped_count} total files found. {skipped_count} skipped (already uploaded), {len(files_to_process)} remaining in queue.")
+
+    # Calculate total size of the remaining files
+    batch_remaining_size = sum(f[1] for f in files_to_process)
 
     if args.dry_run:
         logger.info("[Dry Run] Dry run enabled. Skipping authentication and upload.")
-    elif not files:
-        logger.info("No files to upload. Skipping authentication flow.")
     else:
+        logger.info(f"Batch {month} Upload Progress: Total: {human_readable_size(total_eligible_size)}, "
+                    f"Already Uploaded: {human_readable_size(already_uploaded_size)}, "
+                    f"Remaining: {human_readable_size(batch_remaining_size)}")
+
         # Use the centralized quota check, which handles its own authentication
         remaining_quota_bytes = check_google_quota()
         if remaining_quota_bytes is None:
@@ -106,25 +135,21 @@ def main(args):
             close_conn()
             sys.exit(1)
 
-        # Calculate total size of current batch
-        batch_size = sum(size for _, size in files)
-        batch_size_gb = batch_size / (1024 ** 3)
-        logger.info(f"Current batch size: {batch_size_gb:.2f} GB")
-
-        if remaining_quota_bytes is not None and batch_size > remaining_quota_bytes:
-            remaining_gb = remaining_quota_bytes / (1024 ** 3)
-            logger.warning(f"Not enough space on Google Drive to upload the entire batch. Batch requires {batch_size_gb:.2f} GB but only {remaining_gb:.2f} GB is available.")
-            # Sort files by aesthetic_score descending
-            files_with_scores = [(f[0], f[1], f[2].get("aesthetic_score") or -float('inf')) for f in files_to_process]
-            files_with_scores.sort(key=lambda x: x[2], reverse=True)
+        if remaining_quota_bytes is not None and batch_remaining_size > remaining_quota_bytes:
+            batch_remaining_gb = batch_remaining_size / (1024 ** 3)
+            remaining_quota_gb = remaining_quota_bytes / (1024 ** 3)
+            logger.warning(f"Not enough space on Google Drive to upload the remaining files. Need {batch_remaining_gb:.2f} GB but only {remaining_quota_gb:.2f} GB is available.")
+            
+            # Sort files_to_process by aesthetic_score descending
+            files_to_process.sort(key=lambda x: x[2].get("aesthetic_score") or -float('inf'), reverse=True)
 
             selected_files = []
             total_selected_size = 0
             remaining_quota = remaining_quota_bytes
-            for file_path, file_size, score in files_with_scores:
-                if total_selected_size + file_size <= remaining_quota:
-                    selected_files.append((file_path, file_size))
-                    total_selected_size += file_size
+            for f_item in files_to_process:
+                if total_selected_size + f_item[1] <= remaining_quota:
+                    selected_files.append(f_item)
+                    total_selected_size += f_item[1]
                 else:
                     break
 
@@ -132,9 +157,9 @@ def main(args):
                 logger.error(f"Not enough space on Google Drive to upload even the smallest file. Aborting upload.")
                 return
 
-            skipped_count = len(files) - len(selected_files)
+            skipped_count = len(files_to_process) - len(selected_files)
             logger.info(f"Selected {len(selected_files)} files to upload based on aesthetic score to fit available quota. Skipped {skipped_count} files.")
-            files = selected_files
+            files_to_process = selected_files
 
             # Mark batch as partial upload if not all files fit AND it's not already further along (e.g. 500)
             cursor.execute("SELECT status_code FROM month_batches WHERE month = ?", (month,))
@@ -158,14 +183,11 @@ def main(args):
         # Authenticate with append-only scope for uploading
         creds_append = authenticate(scopes=GOOGLE_PHOTOS_APPEND_ONLY_SCOPES)
 
-    total_files = len(files)
-    for idx, (file_path, file_size) in enumerate(files, start=1):
+    total_files = len(files_to_process)
+    for idx, (file_path, file_size, metadata) in enumerate(files_to_process, start=1):
         filename = os.path.basename(file_path)
         file_size_mb = file_size / (1024 * 1024)
         file_hash = compute_file_hash(file_path)
-
-        normalized_filename = filename.lower()
-        metadata = existing_metadata.get((normalized_filename, month))
 
         if args.dry_run:
             logger.info(f"[Dry Run] [{idx}/{total_files}] Would upload: {filename} ({file_size_mb:.2f} MB)")
@@ -187,23 +209,23 @@ def main(args):
                 logger.error("Halting upload process due to error.")
                 sys.exit(1)
 
-    # Final check: Determine if the month is now fully uploaded to finalize status.
-    files_in_staging = get_files_to_upload(album_path)
-    total_count = len(files_in_staging)
+    # Final check: Verify if the entire DB batch for this month is now uploaded.
+    cursor.execute("SELECT COUNT(*) FROM assets WHERE month = ?", (month,))
+    total_assets_expected = cursor.fetchone()[0]
 
     cursor.execute("SELECT COUNT(*) FROM assets WHERE month = ? AND uploaded_to_google = 1", (month,))
     uploaded_count = cursor.fetchone()[0]
 
-    if uploaded_count >= total_count:
-        logger.info(f"🎊 All {total_count} files for {month} are verified as uploaded in the database.")
-        # If the batch was in a partial state (399), move it to full upload (400)
+    if uploaded_count >= total_assets_expected:
+        logger.info(f"🎊 All {total_assets_expected} assets for {month} are verified as uploaded in the database.")
+        # Finalize status from partial (399) or error (400E) to complete (400)
         cursor.execute("SELECT status_code FROM month_batches WHERE month = ?", (month,))
         row = cursor.fetchone()
-        if row and row[0] == '399':
+        if row and row[0] in ['399', '400E']:
             cursor.execute("UPDATE month_batches SET status_code = '400' WHERE month = ?", (month,))
-            logger.info(f"✅ Batch {month} status finalized from 399 to 400.")
+            logger.info(f"✅ Batch {month} status finalized to 400.")
     else:
-        logger.info(f"⚠️ Month {month} remains partially uploaded ({uploaded_count}/{total_count} files).")
+        logger.info(f"⚠️ Month {month} remains partially uploaded ({uploaded_count}/{total_assets_expected} assets).")
 
     conn.commit()
     logger.info(f"✅ Upload process completed at {datetime.utcnow().isoformat()}Z")

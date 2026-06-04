@@ -37,7 +37,8 @@ The pipeline is split into two phases: **Planning** and **Execution**.
 
 ```bash
 # Interactive mode (recommended)
-c
+python3 scripts/pipeline_planner.py
+
 # Headless mode (automatically applies bootstrap and confirms transitions)
 python3 scripts/pipeline_planner.py --auto-apply
 ```

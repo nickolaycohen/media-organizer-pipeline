@@ -729,6 +729,22 @@ def main(auto_apply):
 
     display_summary(transitions, batches, cursor, remote_favs_cache)
 
+    # Proactive check for new month readiness
+    if batches:
+        latest_month_str, latest_status = batches[0]  # Ordered DESC
+        if str(latest_status) >= '600':
+            now = datetime.now()
+            current_month_str = now.strftime('%Y-%m')
+            if latest_month_str < current_month_str:
+                latest_dt = datetime.strptime(latest_month_str, '%Y-%m')
+                next_dt = (latest_dt + timedelta(days=32)).replace(day=1)
+                next_month_str = next_dt.strftime('%Y-%m')
+                
+                # Only suggest if the next month hasn't even started (not in batches)
+                if next_month_str not in [b[0] for b in batches]:
+                    logger.info(f"✨ Current pipeline progress: {latest_month_str} is complete.")
+                    logger.info(f"💡 Suggestion: Ready to start {next_month_str}. Ensure all active sources ({', '.join(ACTIVE_CAMERA_MODELS)}) are imported into Apple Photos.")
+
     logger.info("=== ✅ Suggested Action ===")
 
     # Fetch all months in descending order

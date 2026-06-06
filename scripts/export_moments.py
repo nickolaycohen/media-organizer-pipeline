@@ -8,7 +8,7 @@ from pathlib import Path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from utils.logger import setup_logger
-from constants import MEDIA_ORGANIZER_DB_PATH, CURATED_EXPORT_DIR, STAGING_ROOT, LOG_PATH
+from constants import MEDIA_ORGANIZER_DB_PATH, MOMENTS_EXPORT_DIR, STAGING_ROOT, LOG_PATH
 
 MODULE_TAG = "export_moments"
 logger = setup_logger(LOG_PATH, MODULE_TAG)
@@ -59,7 +59,8 @@ def main():
     logger.info(f"✨ Found {len(export_list)} assets categorized into Moments to export.")
     
     # Format: <MomentName/file> under the MomentsExport directory
-    export_root = os.path.join(CURATED_EXPORT_DIR, "MomentsExport")
+    # Moved one level up from CURATED_EXPORT_DIR (02-AICurrateList)
+    export_root = MOMENTS_EXPORT_DIR
     os.makedirs(export_root, exist_ok=True)
 
     success_count = 0

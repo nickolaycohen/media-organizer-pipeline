@@ -24,9 +24,9 @@ def export_ranked_assets(month, threshold_score=0.6):
 
     # Query from view
     query = """
-        SELECT original_filename, score_normalized, google_favorite, aesthetic_score
+        SELECT original_filename, score_normalized, google_favorite, aesthetic_score, apple_photos_monthly_selection
         FROM ranked_assets_view
-        WHERE month = ? AND (score_normalized >= ? OR google_favorite = 1)
+        WHERE month = ? AND (score_normalized >= ? OR google_favorite = 1 OR apple_photos_monthly_selection = 1)
         ORDER BY score_normalized DESC;
     """
 
@@ -39,7 +39,7 @@ def export_ranked_assets(month, threshold_score=0.6):
         return
 
     # Prepare source and destination folders
-    fav_count = sum(1 for _, _, is_fav, _ in ranked_assets if is_fav)
+    fav_count = sum(1 for _, _, is_fav, _, is_sel in ranked_assets if is_fav or is_sel)
     high_score_count = len(ranked_assets) - fav_count
     
     export_path = os.path.join(CURATED_EXPORT_DIR, month)
@@ -55,9 +55,10 @@ def export_ranked_assets(month, threshold_score=0.6):
     logger.info(f"🚀 Exporting curated assets to {export_path}...")
 
     exported_count = 0
-    for filename, score, is_fav, apple_score in ranked_assets:
+    for filename, score, is_fav, apple_score, is_sel in ranked_assets:
         fav_status = "Yes" if is_fav else "No"
-        logger.info(f"  - {filename:40} | Total Score: {score:.4f} (Apple: {apple_score or 0.0:.4f}, Fav: {fav_status})")
+        sel_status = "Yes" if is_sel else "No"
+        logger.info(f"  - {filename:40} | Total Score: {score:.4f} (Apple: {apple_score or 0.0:.4f}, Fav: {fav_status}, Sel: {sel_status})")
 
         source_file = os.path.join(source_root, filename)
         dest_file = os.path.join(export_path, filename)

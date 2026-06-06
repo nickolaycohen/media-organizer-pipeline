@@ -10,6 +10,7 @@ LOG_PATH = os.path.join(BASE_DIR, '../logs/media_organizer.log')
 APPLE_PHOTOS_DB_PATH = '/Volumes/Extreme Pro/Photos Library/All-Media.photoslibrary/database/Photos.sqlite'
 STAGING_ROOT = '/Volumes/LaCie/Media Organizer/Google Photos/01-MonthlyExports/'
 CURATED_EXPORT_DIR = '/Volumes/LaCie/Media Organizer/Google Photos/02-AICurrateList/'
+MOMENTS_EXPORT_DIR = '/Volumes/LaCie/Media Organizer/MomentsExport/'
 
 APPLE_PHOTOS_DB_COPY_PATH = "/Volumes/Macintosh HD/Users/nickolaycohen/Photos Library DB/All-Media-Extreme/database/Photos.sqlite"
 APPLE_PHOTOS_DB_MARKER = APPLE_PHOTOS_DB_COPY_PATH + ".lastcopy"
@@ -17,6 +18,7 @@ APPLE_PHOTOS_DB_MARKER = APPLE_PHOTOS_DB_COPY_PATH + ".lastcopy"
 # Scoring Weights
 Aestetic_Score_Weight = 0.875
 Google_Favorites_Weight = 0.125
+Apple_Selection_Weight = 0.15
 
 # --- Google API Scopes ---
 # https://developers.google.com/photos/overview/authorization

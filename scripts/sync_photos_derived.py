@@ -5,7 +5,7 @@ import argparse
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from utils.logger import setup_logger, close_logger
-from constants import LOG_PATH, MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_COPY_PATH, Aestetic_Score_Weight, Google_Favorites_Weight
+from constants import LOG_PATH, MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_COPY_PATH, Aestetic_Score_Weight, Google_Favorites_Weight, Apple_Selection_Weight
 from db.connections import get_connection, get_cursor, commit, close as close_conn
 
 MODULE_TAG = 'sync_photos_derived'
@@ -44,6 +44,7 @@ def sync_assets(media_cursor, logger):
                 import_id TEXT,
                 aesthetic_score REAL,
                 google_favorite INTEGER DEFAULT 0,
+                apple_photos_monthly_selection INTEGER DEFAULT 0,
                 ignore_continuity_check INTEGER DEFAULT 0,
                 file_hash TEXT,
                 uploaded_to_google INTEGER DEFAULT 0,
@@ -58,7 +59,7 @@ def sync_assets(media_cursor, logger):
         existing_cols = {row[1] for row in media_cursor.fetchall()}
         target_cols = [
             "asset_id", "original_filename", "month", "MomentsAlbumName", "date_created_utc", "imported_date_utc",
-            "import_id", "aesthetic_score", "google_favorite", "ignore_continuity_check",
+            "import_id", "aesthetic_score", "google_favorite", "apple_photos_monthly_selection", "ignore_continuity_check",
             "file_hash", "uploaded_to_google", "score_imported_at_utc", "created_at_utc", "updated_at_utc"
         ]
         valid_cols = [c for c in target_cols if c in existing_cols]
@@ -135,13 +136,14 @@ def sync_assets(media_cursor, logger):
             datetime(a.ZADDEDDATE + 978307200, 'unixepoch'),
             a.ZIMPORTSESSION as import_id,
             strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) as month,
-            COALESCE(ea.ZCAMERAMODEL, 'Unknown') as camera_model,
-            ga.ZTITLE as MomentsAlbumName
+            (SELECT ga.ZTITLE FROM ZGENERICALBUM ga 
+             JOIN Z_30ASSETS aa ON aa.Z_30ALBUMS = ga.Z_PK 
+             WHERE aa.Z_3ASSETS = a.Z_PK AND ga.ZPARENTFOLDER = 73008 LIMIT 1) as MomentsAlbumName,
+            (SELECT 1 FROM Z_30ASSETS aa 
+             JOIN ZGENERICALBUM ga ON ga.Z_PK = aa.Z_30ALBUMS 
+             WHERE aa.Z_3ASSETS = a.Z_PK AND ga.ZPARENTFOLDER = 72924 LIMIT 1) as apple_photos_monthly_selection
         FROM ZASSET a
         JOIN ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK
-        LEFT JOIN ZEXTENDEDATTRIBUTES ea ON ea.ZASSET = a.Z_PK
-        left outer join z_30assets aa on aa.Z_3ASSETS = a.Z_PK 
-        left outer join ZGENERICALBUM ga on (ga.Z_PK = aa.Z_30ALBUMS and ga.ZPARENTFOLDER = 73008)
         WHERE a.ZIMPORTSESSION IS NOT NULL
     """)
     results = media_cursor.fetchall()
@@ -152,8 +154,11 @@ def sync_assets(media_cursor, logger):
     assets_to_insert = []
 
     for row in results:
-        asset_id, score, filename, date_created, imported_date, import_id, month, _, MomentsAlbumName = row
-        assets_to_insert.append((asset_id, score, filename, date_created, imported_date, import_id, month, MomentsAlbumName))
+        asset_id, score, filename, date_created, imported_date, import_id, month, MomentsAlbumName, selection_flag = row
+        assets_to_insert.append((
+            asset_id, score, filename, date_created, imported_date, 
+            import_id, month, MomentsAlbumName, selection_flag or 0
+        ))
 
     if assets_to_insert:
         logger.info(f"Preparing to insert/update {len(assets_to_insert)} asset records...")
@@ -167,9 +172,10 @@ def sync_assets(media_cursor, logger):
                 import_id,
                 month,
                 MomentsAlbumName,
+                apple_photos_monthly_selection,
                 score_imported_at_utc,
                 updated_at_utc
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
             ON CONFLICT(asset_id) DO UPDATE SET
                 asset_id = excluded.asset_id,
                 aesthetic_score = excluded.aesthetic_score,
@@ -177,13 +183,15 @@ def sync_assets(media_cursor, logger):
                 date_created_utc = excluded.date_created_utc,
                 imported_date_utc = excluded.imported_date_utc,
                 import_id = excluded.import_id,
+                apple_photos_monthly_selection = excluded.apple_photos_monthly_selection,
                 score_imported_at_utc = datetime('now'),
                 updated_at_utc = datetime('now')
             WHERE asset_id IS NOT excluded.asset_id
                OR ROUND(COALESCE(aesthetic_score, -1.0), 6) IS NOT ROUND(COALESCE(excluded.aesthetic_score, -1.0), 6)
                OR COALESCE(CAST(import_id AS TEXT), '') IS NOT COALESCE(CAST(excluded.import_id AS TEXT), '')
                OR COALESCE(date_created_utc, '') IS NOT COALESCE(excluded.date_created_utc, '')
-               OR COALESCE(MomentsAlbumName, '') IS NOT COALESCE(excluded.MomentsAlbumName, '');
+               OR COALESCE(MomentsAlbumName, '') IS NOT COALESCE(excluded.MomentsAlbumName, '')
+               OR COALESCE(apple_photos_monthly_selection, 0) IS NOT COALESCE(excluded.apple_photos_monthly_selection, 0);
         """, assets_to_insert)
         inserted_count = media_cursor.rowcount
         commit()
@@ -355,10 +363,13 @@ def sync_assets(media_cursor, logger):
             month,
             aesthetic_score,
             google_favorite,
-            case when google_favorite 
-                then (COALESCE(aesthetic_score, 0) * {Aestetic_Score_Weight}) + (google_favorite * {Google_Favorites_Weight})
-                else aesthetic_score
-            end AS score_normalized,
+            apple_photos_monthly_selection,
+            apple_photos_monthly_selection,
+            (
+                (COALESCE(aesthetic_score, 0) * {Aestetic_Score_Weight}) + 
+                (google_favorite * {Google_Favorites_Weight}) + 
+                (apple_photos_monthly_selection * {Apple_Selection_Weight})
+            ) AS score_normalized,
             date_created_utc,
             MomentsAlbumName
         FROM main.assets;

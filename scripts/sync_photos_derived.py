@@ -138,7 +138,8 @@ def sync_assets(media_cursor, logger):
             strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) as month,
             (SELECT ga.ZTITLE FROM ZGENERICALBUM ga 
              JOIN Z_30ASSETS aa ON aa.Z_30ALBUMS = ga.Z_PK 
-             WHERE aa.Z_3ASSETS = a.Z_PK AND ga.ZPARENTFOLDER = 73008 LIMIT 1) as MomentsAlbumName,
+             WHERE aa.Z_3ASSETS = a.Z_PK AND ga.ZPARENTFOLDER IN (73008, 72924) 
+             ORDER BY (CASE WHEN ga.ZPARENTFOLDER = 73008 THEN 0 ELSE 1 END) ASC LIMIT 1) as MomentsAlbumName,
             (SELECT 1 FROM Z_30ASSETS aa 
              JOIN ZGENERICALBUM ga ON ga.Z_PK = aa.Z_30ALBUMS 
              WHERE aa.Z_3ASSETS = a.Z_PK AND ga.ZPARENTFOLDER = 72924 LIMIT 1) as apple_photos_monthly_selection
@@ -363,7 +364,6 @@ def sync_assets(media_cursor, logger):
             month,
             aesthetic_score,
             google_favorite,
-            apple_photos_monthly_selection,
             apple_photos_monthly_selection,
             (
                 (COALESCE(aesthetic_score, 0) * {Aestetic_Score_Weight}) + 

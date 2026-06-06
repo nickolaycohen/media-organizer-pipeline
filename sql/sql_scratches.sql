@@ -1,9 +1,13 @@
+select * 
+from assets
+where 
+
 select *
 from month_batches mb 
 order by 2 desc;
 
 -- Pick assets to add moments - locate first item with null Moment and added it to a new album in Apple Photos Library
-SELECT v.original_filename, v.month, v.MomentsAlbumName, v.score_normalized, v.aesthetic_score, v.google_favorite , 
+SELECT v.original_filename, v.month, v.MomentsAlbumName, v.score_normalized, v.aesthetic_score, v.google_favorite , v.apple_photos_monthly_selection 
 FROM ranked_assets_view v
 JOIN month_batches mb ON v.month = mb.month
 WHERE mb.status_code >= '600'

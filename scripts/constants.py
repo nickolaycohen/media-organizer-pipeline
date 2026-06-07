@@ -16,9 +16,9 @@ APPLE_PHOTOS_DB_COPY_PATH = "/Volumes/Macintosh HD/Users/nickolaycohen/Photos Li
 APPLE_PHOTOS_DB_MARKER = APPLE_PHOTOS_DB_COPY_PATH + ".lastcopy"
 
 # Scoring Weights
-Aestetic_Score_Weight = 0.875
-Google_Favorites_Weight = 0.125
-Apple_Selection_Weight = 0.15
+AESTHETIC_SCORE_WEIGHT = 0.875
+GOOGLE_FAVORITES_WEIGHT = 0.125
+APPLE_SELECTION_WEIGHT = 0.15
 
 # --- Google API Scopes ---
 # https://developers.google.com/photos/overview/authorization

@@ -5,7 +5,7 @@ import argparse
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from utils.logger import setup_logger, close_logger
-from constants import LOG_PATH, MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_COPY_PATH, Aestetic_Score_Weight, Google_Favorites_Weight, Apple_Selection_Weight
+from constants import LOG_PATH, MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_COPY_PATH, AESTHETIC_SCORE_WEIGHT, GOOGLE_FAVORITES_WEIGHT, APPLE_SELECTION_WEIGHT
 from db.connections import get_connection, get_cursor, commit, close as close_conn
 
 MODULE_TAG = 'sync_photos_derived'
@@ -138,11 +138,13 @@ def sync_assets(media_cursor, logger):
             strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) as month,
             (SELECT ga.ZTITLE FROM ZGENERICALBUM ga 
              JOIN Z_30ASSETS aa ON aa.Z_30ALBUMS = ga.Z_PK 
-             WHERE aa.Z_3ASSETS = a.Z_PK AND ga.ZPARENTFOLDER IN (73008, 72924) 
-             ORDER BY (CASE WHEN ga.ZPARENTFOLDER = 73008 THEN 0 ELSE 1 END) ASC LIMIT 1) as MomentsAlbumName,
+             LEFT JOIN ZGENERICALBUM pga ON ga.ZPARENTFOLDER = pga.Z_PK
+             WHERE aa.Z_3ASSETS = a.Z_PK AND (ga.ZPARENTFOLDER IN (73008, 72924) OR pga.ZPARENTFOLDER IN (73008, 72924))
+             ORDER BY (CASE WHEN ga.ZPARENTFOLDER = 73008 OR pga.ZPARENTFOLDER = 73008 THEN 0 ELSE 1 END) ASC LIMIT 1) as MomentsAlbumName,
             (SELECT 1 FROM Z_30ASSETS aa 
              JOIN ZGENERICALBUM ga ON ga.Z_PK = aa.Z_30ALBUMS 
-             WHERE aa.Z_3ASSETS = a.Z_PK AND ga.ZPARENTFOLDER = 72924 LIMIT 1) as apple_photos_monthly_selection
+             LEFT JOIN ZGENERICALBUM pga ON ga.ZPARENTFOLDER = pga.Z_PK
+             WHERE aa.Z_3ASSETS = a.Z_PK AND (ga.ZPARENTFOLDER = 72924 OR pga.ZPARENTFOLDER = 72924) LIMIT 1) as apple_photos_monthly_selection
         FROM ZASSET a
         JOIN ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK
         WHERE a.ZIMPORTSESSION IS NOT NULL
@@ -366,9 +368,9 @@ def sync_assets(media_cursor, logger):
             google_favorite,
             apple_photos_monthly_selection,
             (
-                (COALESCE(aesthetic_score, 0) * {Aestetic_Score_Weight}) + 
-                (google_favorite * {Google_Favorites_Weight}) + 
-                (apple_photos_monthly_selection * {Apple_Selection_Weight})
+                (COALESCE(aesthetic_score, 0) * {AESTHETIC_SCORE_WEIGHT}) + 
+                (google_favorite * {GOOGLE_FAVORITES_WEIGHT}) + 
+                (apple_photos_monthly_selection * {APPLE_SELECTION_WEIGHT})
             ) AS score_normalized,
             date_created_utc,
             MomentsAlbumName

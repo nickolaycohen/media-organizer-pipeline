@@ -747,9 +747,11 @@ def main(auto_apply):
 
     logger.info("=== ✅ Suggested Action ===")
 
-    # Fetch all months in descending order
+    # Fetch all months in descending order, excluding the current calendar month
+    # as it is considered incomplete for processing.
     # TODO - month selection also should be done after the transition type is determined 
-    cursor.execute("SELECT DISTINCT month FROM month_batches ORDER BY month DESC")
+    current_month_str = datetime.now().strftime('%Y-%m')
+    cursor.execute("SELECT DISTINCT month FROM month_batches WHERE month < ? ORDER BY month DESC", (current_month_str,))
     months_descending = [row[0] for row in cursor.fetchall()]
 
     # Collect candidates for each transition type, across all months

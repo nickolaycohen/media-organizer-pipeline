@@ -1,3 +1,8 @@
+select *
+from ranked_assets_view
+where -- MomentsAlbumName is not null and
+	original_filename = 'IMG_7959.HEIC'
+
 select * 
 from assets
 where 

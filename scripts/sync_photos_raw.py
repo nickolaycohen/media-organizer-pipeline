@@ -4,7 +4,7 @@ import time
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import sqlite3
 import logging
-from constants import BASE_DIR, MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_COPY_PATH, LOG_PATH
+from constants import BASE_DIR, MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_COPY_PATH, LOG_PATH, MAX_RETRIES, RETRY_DELAY
 from utils.logger import setup_logger, close_logger
 
 MODULE_TAG = 'sync_photos_raw'
@@ -14,10 +14,7 @@ def sync_metadata(logger):
         logger.error(f"Apple Photos database not found at {APPLE_PHOTOS_DB_COPY_PATH}")
         return
 
-    max_retries = 5
-    retry_delay = 10
-
-    for attempt in range(1, max_retries + 1):
+    for attempt in range(1, MAX_RETRIES + 1):
         conn_media = None
         try:
             conn_media = sqlite3.connect(MEDIA_ORGANIZER_DB_PATH, timeout=30)
@@ -25,7 +22,7 @@ def sync_metadata(logger):
             conn_media.execute("PRAGMA busy_timeout = 30000;")
             cursor_media = conn_media.cursor()
 
-            logger.info(f"Connected to Media Organizer DB (Attempt {attempt}/{max_retries}).")
+            logger.info(f"Connected to Media Organizer DB (Attempt {attempt}/{MAX_RETRIES}).")
 
             # Check db_updates.raw_synced flag
             cursor_media.execute("SELECT raw_synced FROM db_updates ORDER BY id DESC LIMIT 1")
@@ -69,11 +66,11 @@ def sync_metadata(logger):
             return
 
         except Exception as e:
-            if attempt < max_retries:
-                logger.warning(f"⚠️ Attempt {attempt} failed: {e}. Retrying in {retry_delay} seconds...")
-                time.sleep(retry_delay)
+            if attempt < MAX_RETRIES:
+                logger.warning(f"⚠️ Attempt {attempt} failed: {e}. Retrying in {RETRY_DELAY} seconds...")
+                time.sleep(RETRY_DELAY)
             else:
-                logger.error(f"❌ Error during metadata sync after {max_retries} attempts: {e}")
+                logger.error(f"❌ Error during metadata sync after {MAX_RETRIES} attempts: {e}")
                 raise
         finally:
             if conn_media:

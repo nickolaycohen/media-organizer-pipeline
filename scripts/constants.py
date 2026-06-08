@@ -20,6 +20,10 @@ AESTHETIC_SCORE_WEIGHT = 0.875
 GOOGLE_FAVORITES_WEIGHT = 0.125
 APPLE_SELECTION_WEIGHT = 0.15
 
+# Syncing Settings
+MAX_RETRIES = 5
+RETRY_DELAY = 30
+
 # --- Google API Scopes ---
 # https://developers.google.com/photos/overview/authorization
 # https://developers.google.com/photos/library/reference/rest/v1/albums/get

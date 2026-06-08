@@ -64,7 +64,7 @@ def main_process(logger, month=None, dry_run=False):
         # set_batch_status(cursor, month, '100')
         conn.commit()
     else:
-        logger.error(f"❌ Smart Album '{month}' does not exist. Please create it manually in Apple Photos.")
+        logger.error(f"❌ Smart Album '{month}' does not exist in the synced database. Please ensure it is created manually in Apple Photos inside the 'MonthlyExports' folder. If it already exists, re-run the pipeline planner to refresh the database.")
         sys.exit(1)  # Block further processing
 
     conn.close()

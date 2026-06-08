@@ -588,9 +588,14 @@ def verify_sequencing_for_planned_month(cursor, conn, month, auto_apply):
     # Final check: are there any remaining unconfirmed sessions for this month?
     cursor.execute("""
         SELECT COUNT(*)
-        FROM imports i
-        JOIN assets a ON a.import_id = i.import_uuid
-        WHERE a.month = ? AND (i.sequencing_confirmed = 0 OR i.sequencing_confirmed IS NULL)
+        FROM assets a
+        JOIN ZASSET za ON za.ZUUID = a.asset_id
+        LEFT JOIN ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
+        JOIN imports i ON i.import_uuid = a.import_id 
+          AND COALESCE(i.camera_model, 'Unknown') = COALESCE(zea.ZCAMERAMODEL, 'Unknown')
+        WHERE a.month = ? 
+          AND (a.ignore_continuity_check = 0 OR a.ignore_continuity_check IS NULL)
+          AND (i.sequencing_confirmed = 0 OR i.sequencing_confirmed IS NULL)
     """, (month,))
     remaining = cursor.fetchone()[0]
     return remaining == 0

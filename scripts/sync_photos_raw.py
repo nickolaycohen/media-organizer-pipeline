@@ -35,6 +35,13 @@ def sync_metadata(logger):
             cursor_media.execute(f"ATTACH DATABASE '{APPLE_PHOTOS_DB_COPY_PATH}' AS photos_db;")
             logger.info("Attached Photos.sqlite database.")
 
+            # Verify attached database integrity
+            # logger.info("Verifying attached database integrity (this may take a while)...")
+            # cursor_media.execute("PRAGMA photos_db.quick_check;")
+            # integrity_res = cursor_media.fetchone()
+            # if integrity_res and integrity_res[0] != 'ok':
+            #     raise sqlite3.DatabaseError(f"Attached Photos DB copy is malformed: {integrity_res[0]}")
+
             # Refresh local copies of heavy tables.
             for table in ["ZASSET", "ZADDITIONALASSETATTRIBUTES", "ZEXTENDEDATTRIBUTES", "ZIMPORTSESSION"]:
                 cursor_media.execute("SELECT name FROM photos_db.sqlite_master WHERE type='table' AND name=?", (table,))

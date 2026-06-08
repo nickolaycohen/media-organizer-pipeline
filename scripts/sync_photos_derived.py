@@ -21,6 +21,12 @@ def sync_assets(media_cursor, logger):
     media_cursor.execute(f"ATTACH DATABASE '{APPLE_PHOTOS_DB_COPY_PATH}' AS photos_db;")
     logger.info("Attached Photos.sqlite database.")
 
+    # Verify attached database integrity
+    # media_cursor.execute("PRAGMA photos_db.quick_check;")
+    # integrity_res = media_cursor.fetchone()
+    # if integrity_res and integrity_res[0] != 'ok':
+    #     raise sqlite3.DatabaseError(f"Attached Photos DB copy is malformed: {integrity_res[0]}")
+
     # --- Schema Migration: Ensure assets table uses asset_id as PRIMARY KEY ---
     media_cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='assets'")
     a_row = media_cursor.fetchone()
@@ -246,7 +252,7 @@ def sync_assets(media_cursor, logger):
         FROM photos_db.ZGENERICALBUM a
         LEFT JOIN photos_db.ZGENERICALBUM p ON a.ZPARENTFOLDER = p.Z_PK
         WHERE a.ZKIND = 1507
-        AND (p.ZTITLE = 'MonthlyExports' OR a.ZPARENTFOLDER = 72235)
+        AND (p.ZTITLE = 'MonthlyExports' OR a.ZPARENTFOLDER IN (SELECT Z_PK FROM photos_db.ZGENERICALBUM WHERE ZTITLE = 'MonthlyExports'))
         ORDER BY a.ZTITLE;
     ''')
 

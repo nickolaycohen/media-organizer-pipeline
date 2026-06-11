@@ -143,14 +143,17 @@ def sync_assets(media_cursor, logger):
             a.ZIMPORTSESSION as import_id,
             strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) as month,
             (SELECT ga.ZTITLE FROM ZGENERICALBUM ga 
-             JOIN Z_30ASSETS aa ON aa.Z_30ALBUMS = ga.Z_PK 
-             LEFT JOIN ZGENERICALBUM pga ON ga.ZPARENTFOLDER = pga.Z_PK
-             WHERE aa.Z_3ASSETS = a.Z_PK AND (ga.ZPARENTFOLDER IN (73008, 72924) OR pga.ZPARENTFOLDER IN (73008, 72924))
-             ORDER BY (CASE WHEN ga.ZPARENTFOLDER = 73008 OR pga.ZPARENTFOLDER = 73008 THEN 0 ELSE 1 END) ASC LIMIT 1) as MomentsAlbumName,
+            JOIN Z_30ASSETS aa ON aa.Z_30ALBUMS = ga.Z_PK 
+            LEFT JOIN ZGENERICALBUM p ON ga.ZPARENTFOLDER = p.Z_PK 
+            WHERE aa.Z_3ASSETS = a.Z_PK 
+            AND (p.ZTITLE IN ('Moments' ) )
+            ORDER BY (CASE WHEN p.ZTITLE = 'Moments' THEN 0 ELSE 1 END) ASC LIMIT 1) as MomentsAlbumName,
             (SELECT 1 FROM Z_30ASSETS aa 
-             JOIN ZGENERICALBUM ga ON ga.Z_PK = aa.Z_30ALBUMS 
-             LEFT JOIN ZGENERICALBUM pga ON ga.ZPARENTFOLDER = pga.Z_PK
-             WHERE aa.Z_3ASSETS = a.Z_PK AND (ga.ZPARENTFOLDER = 72924 OR pga.ZPARENTFOLDER = 72924) LIMIT 1) as apple_photos_monthly_selection
+            JOIN ZGENERICALBUM ga ON ga.Z_PK = aa.Z_30ALBUMS 
+            LEFT JOIN ZGENERICALBUM p ON ga.ZPARENTFOLDER = p.Z_PK
+            LEFT JOIN ZGENERICALBUM gp ON p.ZPARENTFOLDER = gp.Z_PK
+            WHERE aa.Z_3ASSETS = a.Z_PK 
+            AND (p.ZTITLE = 'Apple Photos Month Selection') LIMIT 1) as apple_photos_monthly_selection
         FROM ZASSET a
         JOIN ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK
         WHERE a.ZIMPORTSESSION IS NOT NULL

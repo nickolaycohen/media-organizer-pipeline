@@ -26,6 +26,7 @@ Carries out the "Stage" steps for the planned month:
 - **400 - Upload**: `upload_to_google_photos.py`
 - **550 - Favorites**: `pull_google_favorites.py`
 - **600 - Rank**: `rank_assets_by_score.py`
+- **650 - Cleanup**: `delete_google_assets.py`
 
 ---
 
@@ -102,12 +103,12 @@ python3 scripts/pipeline_executor.py --dry-run
 
 ### Stage 4 – Final Curation & Cleanup
 
-| #     | Step                           | Description                                                           | Tool / Script                       | Status     |
-| ----- | ------------------------------ | --------------------------------------------------------------------- | ----------------------------------- | ---------- |
-| 4.1   | Final Human Review             | Manual curation of exported assets (visual/manual check)              | Manual                              | ✅ Manual  |
-| 4.1.5 | Export Human-Approved Assets   | Copy human-approved subset to a separate monthly subfolder in staging | _(TBD: `export_curated_subset.py`)_ | ❌ Pending |
-| 4.2   | Delete Non-Favorites in Google | Compare exported approved set with Google Photos and delete others    | `delete_nonfavorites_google.py`     | ❌ Pending |
-| 4.3   | Archive Final Staging Folder   | Move finished folders to archive location or external storage         | `archive_staging_folder.py`         | ❌ Pending |
+| #     | Step                         | Description                                                           | Tool / Script                       | Status     |
+| ----- | ---------------------------- | --------------------------------------------------------------------- | ----------------------------------- | ---------- |
+| 4.1   | Final Human Review           | Manual curation of exported assets (visual/manual check)              | Manual                              | ✅ Manual  |
+| 4.1.5 | Export Human-Approved Assets | Copy human-approved subset to a separate monthly subfolder in staging | _(TBD: `export_curated_subset.py`)_ | ❌ Pending |
+| 4.2   | Drive Cleanup                | Manual cleanup of Google Photos assets to free storage                | `delete_google_assets.py`           | ✅ Manual  |
+| 4.3   | Archive Final Staging Folder | Move finished folders to archive location or external storage         | `archive_staging_folder.py`         | ❌ Pending |
 
 ### Stage 5 – Publishing & Sharing
 

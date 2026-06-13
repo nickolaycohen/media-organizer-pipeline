@@ -21,63 +21,11 @@ def sync_assets(media_cursor, logger):
     media_cursor.execute(f"ATTACH DATABASE '{APPLE_PHOTOS_DB_COPY_PATH}' AS photos_db;")
     logger.info("Attached Photos.sqlite database.")
 
-    # Verify attached database integrity
-    # media_cursor.execute("PRAGMA photos_db.quick_check;")
-    # integrity_res = media_cursor.fetchone()
-    # if integrity_res and integrity_res[0] != 'ok':
-    #     raise sqlite3.DatabaseError(f"Attached Photos DB copy is malformed: {integrity_res[0]}")
+    # Drop the broken view immediately if it exists to clear schema errors
+    # that prevent subsequent queries from running.
+    media_cursor.execute("DROP VIEW IF EXISTS main.ranked_assets_view;")
+    media_cursor.execute("DROP VIEW IF EXISTS main.photos_assets_view;")
 
-    # --- Schema Migration: Ensure assets table uses asset_id as PRIMARY KEY ---
-    media_cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='assets'")
-    a_row = media_cursor.fetchone()
-
-    media_cursor.execute("PRAGMA table_info(assets)")
-    is_asset_id_pk = any(col[1] == 'asset_id' and col[5] == 1 for col in media_cursor.fetchall())
-
-    if a_row and (not is_asset_id_pk or "UNIQUE" in a_row[0]):
-        logger.info("Legacy UNIQUE constraint detected in 'assets' table schema. Migrating assets table...")
-        
-        media_cursor.execute("ALTER TABLE assets RENAME TO assets_old")
-        
-        media_cursor.execute("""
-            CREATE TABLE assets (
-                asset_id TEXT PRIMARY KEY,
-                original_filename TEXT,
-                month TEXT,
-                MomentsAlbumName TEXT,
-                date_created_utc TEXT,
-                imported_date_utc TEXT,
-                import_id TEXT,
-                aesthetic_score REAL,
-                google_favorite INTEGER DEFAULT 0,
-                apple_photos_monthly_selection INTEGER DEFAULT 0,
-                ignore_continuity_check INTEGER DEFAULT 0,
-                file_hash TEXT,
-                uploaded_to_google INTEGER DEFAULT 0,
-                score_imported_at_utc TEXT,
-                created_at_utc TEXT,
-                updated_at_utc TEXT
-            )
-        """)
-        
-        # Determine columns that exist in the old table to safely copy data
-        media_cursor.execute("PRAGMA table_info(assets_old)")
-        existing_cols = {row[1] for row in media_cursor.fetchall()}
-        target_cols = [
-            "asset_id", "original_filename", "month", "MomentsAlbumName", "date_created_utc", "imported_date_utc",
-            "import_id", "aesthetic_score", "google_favorite", "apple_photos_monthly_selection", "ignore_continuity_check",
-            "file_hash", "uploaded_to_google", "score_imported_at_utc", "created_at_utc", "updated_at_utc"
-        ]
-        valid_cols = [c for c in target_cols if c in existing_cols]
-        col_str = ", ".join(valid_cols)
-        
-        media_cursor.execute(f"INSERT INTO assets ({col_str}) SELECT {col_str} FROM assets_old")
-        media_cursor.execute("DROP TABLE assets_old")
-        media_cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_assets_asset_id ON assets(asset_id)")
-        commit()
-        logger.info("Migration of 'assets' table completed successfully.")
-
-    # --- Schema Migration: Ensure imports table is clean of legacy constraints ---
     media_cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='imports'")
     i_row = media_cursor.fetchone()
 
@@ -137,6 +85,7 @@ def sync_assets(media_cursor, logger):
         SELECT 
             a.ZUUID, 
             a.ZOVERALLAESTHETICSCORE, 
+            a.ZFAVORITE,
             aaa.ZORIGINALFILENAME, 
             datetime(a.ZDATECREATED + 978307200, 'unixepoch'),
             datetime(a.ZADDEDDATE + 978307200, 'unixepoch'),
@@ -166,9 +115,9 @@ def sync_assets(media_cursor, logger):
     assets_to_insert = []
 
     for row in results:
-        asset_id, score, filename, date_created, imported_date, import_id, month, MomentsAlbumName, selection_flag = row
+        asset_id, score, is_fav, filename, date_created, imported_date, import_id, month, MomentsAlbumName, selection_flag = row
         assets_to_insert.append((
-            asset_id, score, filename, date_created, imported_date, 
+            asset_id, score, is_fav, filename, date_created, imported_date, 
             import_id, month, MomentsAlbumName, selection_flag or 0
         ))
 
@@ -178,6 +127,7 @@ def sync_assets(media_cursor, logger):
             INSERT INTO assets (
                 asset_id, 
                 aesthetic_score, 
+                apple_favorite,
                 original_filename, 
                 date_created_utc,
                 imported_date_utc,
@@ -187,10 +137,11 @@ def sync_assets(media_cursor, logger):
                 apple_photos_monthly_selection,
                 score_imported_at_utc,
                 updated_at_utc
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
             ON CONFLICT(asset_id) DO UPDATE SET
                 asset_id = excluded.asset_id,
                 aesthetic_score = excluded.aesthetic_score,
+                apple_favorite = excluded.apple_favorite,
                 MomentsAlbumName = excluded.MomentsAlbumName,
                 date_created_utc = excluded.date_created_utc,
                 imported_date_utc = excluded.imported_date_utc,
@@ -200,6 +151,7 @@ def sync_assets(media_cursor, logger):
                 updated_at_utc = datetime('now')
             WHERE asset_id IS NOT excluded.asset_id
                OR ROUND(COALESCE(aesthetic_score, -1.0), 6) IS NOT ROUND(COALESCE(excluded.aesthetic_score, -1.0), 6)
+               OR COALESCE(apple_favorite, 0) IS NOT COALESCE(excluded.apple_favorite, 0)
                OR COALESCE(CAST(import_id AS TEXT), '') IS NOT COALESCE(CAST(excluded.import_id AS TEXT), '')
                OR COALESCE(date_created_utc, '') IS NOT COALESCE(excluded.date_created_utc, '')
                OR COALESCE(MomentsAlbumName, '') IS NOT COALESCE(excluded.MomentsAlbumName, '')
@@ -375,11 +327,13 @@ def sync_assets(media_cursor, logger):
             month,
             aesthetic_score,
             google_favorite,
+            apple_favorite,
             apple_photos_monthly_selection,
             (
                 (COALESCE(aesthetic_score, 0) * {AESTHETIC_SCORE_WEIGHT}) + 
                 (google_favorite * {GOOGLE_FAVORITES_WEIGHT}) + 
                 (apple_photos_monthly_selection * {APPLE_SELECTION_WEIGHT})
+                + (apple_favorite * {GOOGLE_FAVORITES_WEIGHT})
             ) AS score_normalized,
             date_created_utc,
             MomentsAlbumName

@@ -3,6 +3,7 @@ import os
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MEDIA_ORGANIZER_DB_PATH = os.path.join(BASE_DIR, '../db/media_organizer.db')
 LOG_PATH = os.path.join(BASE_DIR, '../logs/media_organizer.log')
+APPLE_SCRIPT_LOG_PATH = os.path.join(BASE_DIR, '../logs/applescript_execution.log')
 
 # Paths to the Apple Photos database and Media Organizer database
 # For safety - during DEV will use a copy of the All-Media DB 

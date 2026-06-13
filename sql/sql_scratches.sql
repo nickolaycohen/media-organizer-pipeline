@@ -1,4 +1,27 @@
 select *
+from moment_exports me 
+
+SELECT v.asset_id, v.MomentsAlbumName, v.score_normalized
+FROM ranked_assets_view v
+JOIN month_batches mb ON v.month = mb.month
+WHERE mb.status_code >= '600'
+ORDER BY v.score_normalized DESC;
+
+
+SELECT v.asset_id, v.MomentsAlbumName
+FROM ranked_assets_view v
+JOIN month_batches mb ON v.month = mb.month
+WHERE mb.status_code >= '600' 
+  AND v.MomentsAlbumName IS NOT NULL
+  AND v.MomentsAlbumName != ''
+limit 50;
+
+        
+select * 
+from schema_migrations 
+        
+
+select *
 from ranked_assets_view
 where -- MomentsAlbumName is not null and
 	original_filename = 'IMG_7959.HEIC'
@@ -16,6 +39,7 @@ SELECT v.original_filename, v.month, v.MomentsAlbumName, v.score_normalized, v.a
 FROM ranked_assets_view v
 JOIN month_batches mb ON v.month = mb.month
 WHERE mb.status_code >= '600'
+and not exists (select 1 from )
 ORDER BY v.score_normalized DESC;
 
 

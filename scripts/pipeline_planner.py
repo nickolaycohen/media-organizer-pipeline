@@ -662,7 +662,7 @@ def main(auto_apply):
             script_dir = os.path.dirname(os.path.abspath(__file__))
             logger.info("🚀 Initiating Moments Export mode...")
             try:
-                subprocess.run(["python3", os.path.join(script_dir, "export_moments.py")], check=True)
+                subprocess.run(["python3", os.path.join(script_dir, "create_apple_moments_albums.py")], check=True)
                 logger.info("✅ Moments Export session finished.")
             except subprocess.CalledProcessError as e:
                 logger.error(f"❌ Moments Export process failed: {e}")

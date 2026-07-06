@@ -8,7 +8,7 @@ from pathlib import Path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from utils.logger import setup_logger
-from constants import MEDIA_ORGANIZER_DB_PATH, LOG_PATH, APPLE_SCRIPT_LOG_PATH
+from constants import MEDIA_ORGANIZER_DB_PATH, LOG_PATH, APPLE_SCRIPT_LOG_PATH, MOMENTS_EXPORT_DIR
 
 MODULE_TAG = "apple_moments_sync"
 logger = setup_logger(LOG_PATH, MODULE_TAG)
@@ -68,13 +68,36 @@ def main():
         conn.close()
         return
 
-    # Filter list: assets with a Moment, score higher than threshold, and NOT already exported (index 3 is me.asset_id)
-    export_list = [r for r in rows if r[2] > threshold_score and r[1] and r[3] is None]
+    # Check filesystem folder existence for each unique album name
+    album_folder_exists = {}
+    for r in rows:
+        album_name = r[1]
+        if album_name and album_name not in album_folder_exists:
+            safe_moment_name = "".join([c for c in album_name if c.isalnum() or c in (' ', '-', '_')]).strip()
+            folder_path = os.path.join(MOMENTS_EXPORT_DIR, safe_moment_name)
+            album_folder_exists[album_name] = os.path.exists(folder_path)
+
+    # Filter list: assets with a Moment, score higher than threshold.
+    # An asset should be exported if it has not been recorded as exported in DB (r[3] is None) OR
+    # the filesystem folder for its target Moment does not exist.
+    export_list = []
+    reexport_albums = set()
+    for r in rows:
+        asset_id, album_name, score, db_exported_id = r
+        if score > threshold_score and album_name:
+            folder_exists = album_folder_exists.get(album_name, False)
+            if db_exported_id is None or not folder_exists:
+                export_list.append(r)
+                if db_exported_id is not None and not folder_exists:
+                    reexport_albums.add(album_name)
 
     if not export_list:
-        logger.warning(f"No new assets found to organize. All candidates above {threshold_score:.4f} are already recorded as exported.")
+        logger.warning(f"No new assets found to organize. All candidates above {threshold_score:.4f} are already recorded as exported and their folders exist on the filesystem.")
         conn.close()
         return
+
+    if reexport_albums:
+        logger.info(f"Re-exporting assets for albums because their folders do not exist on the filesystem: {', '.join(reexport_albums)}")
 
     # Group asset IDs by suggested Moment name
     album_map = {}
@@ -116,7 +139,15 @@ def main():
             set assetsToAdd to {{}}
             repeat with anId in assetIds
                 try
-                    set foundItems to (media items whose id contains anId)
+                    set foundItems to {{}}
+                    try
+                        -- Attempt fast exact UUID lookup using the standard Apple Photos local identifier suffix
+                        set end of foundItems to media item id (anId & "/L0/001")
+                    on error
+                        -- Fallback to slow substring search if direct lookup fails
+                        set foundItems to (media items whose id contains anId)
+                    end try
+                    
                     if (count of foundItems) > 0 then
                         copy item 1 of foundItems to end of assetsToAdd
             			logMessage("Copying: " & anId)

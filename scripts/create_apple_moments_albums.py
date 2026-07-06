@@ -91,11 +91,12 @@ def main():
         
         # AppleScript to create hierarchy and add assets by ID (no re-import)
         script = f'''
+        property debugLogPath : "/Users/nickolaycohen/dev/media-organizer-pipeline/logs/applescript_execution.log"
         tell application "Photos"
             set topFolderName to "Media Organizer on LaCie"
             set subFolderName to "MomentExport"
             set targetAlbumName to "{safe_album_name}"
-            
+
             if not (exists folder topFolderName) then
                 make new folder named topFolderName
             end if
@@ -118,6 +119,7 @@ def main():
                     set foundItems to (media items whose id contains anId)
                     if (count of foundItems) > 0 then
                         copy item 1 of foundItems to end of assetsToAdd
+            			logMessage("Copying: " & anId)
                     end if
                 end try
             end repeat
@@ -126,6 +128,14 @@ def main():
                 add assetsToAdd to targetAlbum
             end if
         end tell
+
+        -- ========================================
+        -- Helper Functions
+        -- ========================================
+        on logMessage(messageText)
+            do shell script "echo " & quoted form of messageText & " >> " & quoted form of debugLogPath
+        end logMessage
+
         '''
         run_applescript(script)
         logger.info(f"  ✅ Sync complete for album: {album_name} ({len(asset_ids)} assets)")

@@ -1,7 +1,7 @@
 select *
 from moment_exports me 
 
-SELECT v.asset_id, v.MomentsAlbumName, v.score_normalized
+SELECT v.asset_id, v.original_filename, v."month", v.MomentsAlbumName, v.score_normalized
 FROM ranked_assets_view v
 JOIN month_batches mb ON v.month = mb.month
 WHERE mb.status_code >= '600'

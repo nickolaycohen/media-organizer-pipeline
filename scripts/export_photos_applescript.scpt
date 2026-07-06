@@ -5,7 +5,7 @@ property topFolderName : "Media Organizer on LaCie"
 property midFolderName : "Google Photos Pipeline"
 property bottomFolderName : "MonthlyExports"
 property destinationFolderPath : "/Volumes/LaCie/Media Organizer/Google Photos/01-MonthlyExports"
-property debugLogPath : "/Users/nickolaycohen/dev/media-organizer-pipeline/logs/media_organizer.log"
+property debugLogPath : "/Users/nickolaycohen/dev/media-organizer-pipeline/logs/applescript_execution.log"
 
 -- ========================================
 -- Main
@@ -14,8 +14,8 @@ on run argv
 	with timeout of 600 seconds
 		set albumName to item 1 of argv
 		
-		-- Clear previous debug log
-		do shell script "echo '' > " & quoted form of debugLogPath
+		-- Clear previous debug log - we want to preserve the log
+		-- do shell script "echo '' > " & quoted form of debugLogPath
 		
 		-- Prepare destination folder
 		set fullDestinationPath to destinationFolderPath & "/" & albumName

@@ -1,32 +1,28 @@
 # 📋 Media Organizer Pipeline Overview
 
-This pipeline handles the curation, export, and publishing of family photos, from organizing assets in Apple Photos to exporting and sharing curated memories.
+This pipeline handles the curation, export, and publishing of family photos, using a two-track workflow to manage monthly photo ingest/cleanup and weekly event-based memory curation.
 
-## 🚀 Pipeline Execution Map
+## 🚀 Two-Track Pipeline Architecture
 
-The system is orchestrated by two primary scripts.
+The system is orchestrated by `scripts/pipeline_planner.py` which prompts you to select your track after running the initial bootstrap steps:
 
-### 1. Planning Phase (`scripts/pipeline_planner.py`)
-
-Runs every time you start a session. It handles the "Bootstrap" steps:
-
-1.  **Refresh DB**: `copy_all_media_photos_db.py`
-2.  **Schema Check**: `storage_manager_main.py`
-3.  **Raw Sync**: `sync_photos_raw.py`
-4.  **Derived Sync**: `sync_photos_derived.py`
-5.  **Batch Detection**: `generate_month_batches.py`
-
-### 2. Execution Phase (`scripts/pipeline_executor.py`)
-
-Carries out the "Stage" steps for the planned month:
-
-- **100 - Verify**: `verify_smart_album.py`
-- **200 - Export**: `export_photos_applescript.py`
+### Track 1: Batch Management (Mode `[B]`)
+Handles the monthly ingest, sync, upload to Google Photos, ranking, and storage cleanup.
+- **100 - Verify**: `verify_export_album.py`
+- **200 - Export**: `export_photos_wrapper.py`
 - **210 - Dedupe**: `deduplicate_assets.py`
 - **400 - Upload**: `upload_to_google_photos.py`
 - **550 - Favorites**: `pull_google_favorites.py`
 - **600 - Rank**: `rank_assets_by_score.py`
 - **650 - Cleanup**: `delete_google_assets.py`
+
+### Track 2: Memory Feature & Publishing (Mode `[M]`)
+An independent, time-based workflow for curating and publishing specific events/memories.
+- **Identify Candidate**: Ranks Moments by average aesthetic score to suggest a weekly featured Moment.
+- **Sync Proposed**: Automatically creates `ToBeCurated/[MomentName]` in Apple Photos and populates it with top ranked assets.
+- **Manual Curation**: User reviews and copies final selection to `Curated/[MomentName]` inside Apple Photos.
+- **Local Export**: Automatically exports the Apple Photos `Curated` album to the LaCie drive filesystem.
+- **Publication Tracking**: Tracks when files are manually uploaded/published to Shutterfly.
 
 ---
 
@@ -39,24 +35,18 @@ The pipeline is split into two phases: **Planning** and **Execution**.
 ```bash
 # Interactive mode (recommended)
 python3 scripts/pipeline_planner.py
-
-# Headless mode (automatically applies bootstrap and confirms transitions)
-python3 scripts/pipeline_planner.py --auto-apply
 ```
+This runs the bootstrap phase and prompts you to select either Batch Management (`[B]`) or Memory Feature & Publishing (`[M]`).
 
-### 2. Execute the Plan
-
-Once a month is "planned," run the executor to perform the actual file operations (exporting, deduplicating, uploading).
-
+### Step 2: Execute the Plan (For Batch Management)
+Once a monthly batch is planned under Batch Management, run the executor to perform the file operations.
 ```bash
-# Run the planned execution
 python3 scripts/pipeline_executor.py
-
-# Safety check - log actions without performing them
-python3 scripts/pipeline_executor.py --dry-run
 ```
 
 ---
+
+
 
 ## 📂 Stage 0 – Initialization & Setup
 
@@ -231,3 +221,18 @@ Latest observations from 10/11/2025 development:
 
 - older months Ex 2025-02 and 2025-01 do not properly pull the favorites from Google Photos - most likely related to the API deprication and scope. Need to develop a plan to reupload those assets.
   -- following planner suggestion - 2024-12 should upload new files to Photos ...
+
+---
+
+## 📌 Track 2 – Memory Feature & Publishing Workflow (Weekly Schedule)
+
+This is an independent workflow focused on curating and publishing specific events/memories (Moments) once their source batches have been processed (status ≥ 600).
+
+### Curation Lifecycle Stages:
+- **M100 - Selected / Candidate**: Moment is ranked and selected for weekly promotion based on aesthetic quality.
+- **M200 - Sync Proposed**: Pipeline runs AppleScript to sync proposed ranked assets from Apple Photos to the `ToBeCurated/[MomentName]` folder.
+- **M300 - Curating**: User manually selects assets inside Apple Photos and copies them to the `Curated/[MomentName]` folder.
+- **M400 - Exported**: Pipeline runs `export_curated_album.py` to copy Apple Photos `Curated` assets to the filesystem curated directory `/Volumes/LaCie/Media Organizer/Curated/[MomentName]`.
+- **M500 - Published**: User uploads the curated assets to Shutterfly, and the publication is tracked in the database.
+
+To manage memories, run `python3 scripts/pipeline_planner.py` and select `[M]`.

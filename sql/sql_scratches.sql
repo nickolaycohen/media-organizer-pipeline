@@ -1,6 +1,13 @@
+-- rate Identified Moments
+select me.album_name, avg(a.aesthetic_score), count(*)
+from moment_exports me 
+join assets a on a.asset_id = me.asset_id 
+group by album_name 
+
 select *
 from moment_exports me 
 
+-- find next asset to be added to Moments
 SELECT v.asset_id, v.original_filename, v."month", v.MomentsAlbumName, v.score_normalized
 FROM ranked_assets_view v
 JOIN month_batches mb ON v.month = mb.month

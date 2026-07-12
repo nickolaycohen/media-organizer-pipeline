@@ -42,7 +42,7 @@ def main():
         SELECT v.asset_id, v.MomentsAlbumName, v.score_normalized, me.asset_id
         FROM ranked_assets_view v
         JOIN month_batches mb ON v.month = mb.month
-        LEFT JOIN moment_exports me ON v.asset_id = me.asset_id
+        LEFT JOIN moment_exports me ON v.asset_id = me.asset_id AND me.curation_stage = 'to_be_curated'
         WHERE mb.status_code >= '600'
         ORDER BY v.score_normalized DESC;
     """
@@ -117,7 +117,7 @@ def main():
         property debugLogPath : "/Users/nickolaycohen/dev/media-organizer-pipeline/logs/applescript_execution.log"
         tell application "Photos"
             set topFolderName to "Media Organizer on LaCie"
-            set subFolderName to "MomentExport"
+            set subFolderName to "ToBeCurated"
             set targetAlbumName to "{safe_album_name}"
 
             if not (exists folder topFolderName) then
@@ -172,10 +172,10 @@ def main():
         logger.info(f"  ✅ Sync complete for album: {album_name} ({len(asset_ids)} assets)")
         
         # Record the export in the database
-        export_data = [(aid, album_name) for aid in asset_ids]
+        export_data = [(aid, album_name, 'to_be_curated') for aid in asset_ids]
         cursor.executemany("""
-            INSERT OR REPLACE INTO moment_exports (asset_id, album_name, exported_at_utc)
-            VALUES (?, ?, datetime('now'))
+            INSERT OR REPLACE INTO moment_exports (asset_id, album_name, curation_stage, exported_at_utc)
+            VALUES (?, ?, ?, datetime('now'))
         """, export_data)
         conn.commit()
 

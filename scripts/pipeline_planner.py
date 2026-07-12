@@ -635,6 +635,294 @@ def display_summary(transitions, batches, cursor, remote_favs_cache=None):
             for month in sorted(fav_counts.keys(), reverse=True):
                 print(f"Month: {month}, Favorites: {fav_counts[month]}")
 
+def run_memory_publishing_flow(cursor, conn):
+    logger.info("🎨 Starting Memory Feature & Publishing session...")
+    from constants import CURATED_LACIE_DIR, TO_BE_CURATED_DIR
+    import math
+    
+    # 1. Fetch the cutoff threshold score
+    cursor.execute("""
+        SELECT v.score_normalized FROM ranked_assets_view v
+        JOIN month_batches mb ON v.month = mb.month
+        WHERE mb.status_code >= '600' AND (v.MomentsAlbumName IS NULL OR v.MomentsAlbumName = '') 
+        ORDER BY v.score_normalized DESC LIMIT 1
+    """)
+    row = cursor.fetchone()
+    cutoff_score = row[0] if row and row[0] is not None else 0.0
+    logger.info(f"Cutoff threshold score: {cutoff_score:.4f}")
+
+    # Check for highly ranked assets that do not belong to any Moment in Apple Photos
+    cursor.execute("""
+        SELECT v.original_filename, v.score_normalized, v.month, v.date_created_utc
+        FROM ranked_assets_view v
+        JOIN month_batches mb ON v.month = mb.month
+        WHERE mb.status_code >= '600' AND (v.MomentsAlbumName IS NULL OR v.MomentsAlbumName = '')
+          AND v.score_normalized > 0.55
+        ORDER BY v.score_normalized DESC
+        LIMIT 5
+    """)
+    unassigned = cursor.fetchall()
+    if unassigned:
+        print("\n==================================================")
+        print("⚠️  Unassigned High-Rank Assets (Need Moment Naming Decision)")
+        print("==================================================")
+        print("The following highly-ranked assets are not assigned to any Moment album in Apple Photos:")
+        for fname, score, month, date_created in unassigned:
+            captured_str = "—"
+            if date_created:
+                try:
+                    dt_utc = None
+                    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                        try:
+                            dt_utc = datetime.strptime(date_created, fmt)
+                            break
+                        except ValueError:
+                            continue
+                    if dt_utc:
+                        dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+                        dt_local = dt_utc.astimezone()
+                        captured_str = dt_local.strftime("%Y-%m-%d %H:%M:%S")
+                    else:
+                        captured_str = date_created[:19]
+                except Exception:
+                    captured_str = date_created[:19]
+            print(f" - {fname:<25} (Score: {score:.4f}, Captured: {captured_str}, Month: {month})")
+        print("👉 Please consider creating a corresponding album under 'Media Organizer on LaCie / Moments' in Apple Photos and placing these files into it.\n")
+
+    while True:
+        # 2. Query assets that have Moments and are in status >= 600
+        query = """
+            SELECT v.asset_id, v.MomentsAlbumName, v.score_normalized, v.original_filename,
+                   (SELECT 1 FROM moment_exports me WHERE me.asset_id = v.asset_id AND me.curation_stage = 'to_be_curated') as is_proposed,
+                   (SELECT 1 FROM moment_exports me WHERE me.asset_id = v.asset_id AND me.curation_stage = 'curated') as is_curated
+            FROM ranked_assets_view v
+            JOIN month_batches mb ON v.month = mb.month
+            WHERE mb.status_code >= '600' AND v.MomentsAlbumName IS NOT NULL AND v.MomentsAlbumName != ''
+              AND v.score_normalized > ?
+            ORDER BY v.score_normalized DESC
+        """
+        cursor.execute(query, (cutoff_score,))
+        rows = cursor.fetchall()
+        
+        # Group by moment name
+        moments_data = {}
+        for asset_id, moment_name, score, filename, is_proposed, is_curated in rows:
+            if moment_name not in moments_data:
+                moments_data[moment_name] = {
+                    'total_qualified': 0,
+                    'proposed_count': 0,
+                    'curated_count': 0,
+                    'scores': []
+                }
+            moments_data[moment_name]['total_qualified'] += 1
+            if is_proposed:
+                moments_data[moment_name]['proposed_count'] += 1
+            if is_curated:
+                moments_data[moment_name]['curated_count'] += 1
+            moments_data[moment_name]['scores'].append(score)
+
+        # 3. Query Apple Photos albums inside Curated and ToBeCurated (to match existence)
+        applescript_code = """
+        tell application "Photos"
+            set results to {}
+            set parentFolderNames to {"Curated", "ToBeCurated"}
+            repeat with fName in parentFolderNames
+                if exists folder fName of folder "Media Organizer on LaCie" then
+                    set subFolder to folder fName of folder "Media Organizer on LaCie"
+                    set albNames to name of albums of subFolder
+                    repeat with aName in albNames
+                        copy (fName & ":" & aName) to end of results
+                    end repeat
+                end if
+            end repeat
+            return results
+        end tell
+        """
+        photos_albums = {}
+        try:
+            process = subprocess.Popen(['osascript', '-e', applescript_code], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            stdout, stderr = process.communicate()
+            if stdout:
+                parts = [p.strip() for p in stdout.strip().split(',')]
+                for p in parts:
+                    if ':' in p:
+                        folder_name, album_name = p.split(':', 1)
+                        photos_albums[album_name.strip()] = folder_name.strip()
+        except Exception as e:
+            logger.warning(f"Could not list Apple Photos albums: {e}")
+
+        # 4. Fetch memory_stage from curated_moments table
+        cursor.execute("SELECT moment_name, memory_stage FROM curated_moments")
+        stages = dict(cursor.fetchall())
+
+        # 4.5 Fetch publication information
+        cursor.execute("SELECT moment_name, MAX(published_at_utc), COUNT(*) FROM publications GROUP BY moment_name")
+        pub_info = {row[0]: (row[1], row[2]) for row in cursor.fetchall()}
+
+        # 5. Format and display status report
+        print("\n==================================================")
+        print("🌟 Weekly Memory Feature & Publishing (Mode [M])")
+        print("==================================================")
+        
+        ranked_moments = []
+        for name, data in moments_data.items():
+            avg_score = sum(data['scores']) / len(data['scores']) if data['scores'] else 0.0
+            stage = stages.get(name, 'M100')
+            
+            # Check Apple Photos existence
+            to_be_curated_exists = (photos_albums.get(name) == 'ToBeCurated')
+            curated_exists = (photos_albums.get(name) == 'Curated')
+            
+            # Check filesystem curated directory existence
+            fs_curated_exists = os.path.exists(os.path.join(CURATED_LACIE_DIR, name))
+            
+            # Count-weighted rank score to prevent small/single-asset moments from dominating
+            rank_score = avg_score * math.log(data['total_qualified'] + 1)
+            
+            last_pub_date, pub_count = pub_info.get(name, (None, 0))
+            last_pub_str = last_pub_date[:10] if last_pub_date else "—"
+            
+            # Check if featured/published in less than a month (30 days)
+            too_recent = False
+            if last_pub_date:
+                try:
+                    pub_dt = datetime.strptime(last_pub_date.split('.')[0], "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    try:
+                        pub_dt = datetime.strptime(last_pub_date, "%Y-%m-%d")
+                    except ValueError:
+                        pub_dt = None
+                
+                if pub_dt:
+                    diff = datetime.now() - pub_dt
+                    if diff.days < 30:
+                        too_recent = True
+            
+            if too_recent:
+                can_publish_str = "❌ Recent (<30d)"
+            else:
+                # Can be published if local folder exists, has assets, and we have more curated assets than published ones
+                can_publish_str = "✅ Yes" if (fs_curated_exists and data['curated_count'] > 0 and data['curated_count'] > pub_count) else "❌ No"
+            
+            ranked_moments.append({
+                'name': name,
+                'total_qualified': data['total_qualified'],
+                'proposed_count': data['proposed_count'],
+                'curated_count': data['curated_count'],
+                'avg_score': avg_score,
+                'rank_score': rank_score,
+                'stage': stage,
+                'to_be_curated_exists': to_be_curated_exists,
+                'curated_exists': curated_exists,
+                'fs_curated_exists': fs_curated_exists,
+                'last_pub_str': last_pub_str,
+                'can_publish_str': can_publish_str
+            })
+
+        # Sort by: 1. Needs update (proposed < total_qualified), 2. Stage (M100 first), 3. Rank score descending
+        ranked_moments.sort(key=lambda x: (
+            x['proposed_count'] < x['total_qualified'],
+            x['stage'] == 'M500',  # Put published at the bottom
+            x['rank_score']
+        ), reverse=True)
+
+        print(f"{'No.':<4} {'Moment Name':<30} {'Rank Score':<12} {'Avg Score':<10} {'Assets':<8} {'ToBeCurated?':<13} {'Curated?':<9} {'Published?':<11} {'Can Publish?':<13} {'Last Published':<15}")
+        print("-" * 135)
+        for idx, m in enumerate(ranked_moments, 1):
+            to_be_curated_str = "✅ Yes" if m['to_be_curated_exists'] else "❌ No"
+            if m['proposed_count'] < m['total_qualified'] and m['to_be_curated_exists']:
+                to_be_curated_str = "🔄 Update needed"
+            
+            curated_str = "✅ Yes" if m['curated_exists'] else "❌ No"
+            if m['curated_exists'] and not m['fs_curated_exists']:
+                curated_str = "📁 Needs Folder"
+                
+            published_str = "✅ Yes" if m['stage'] == 'M500' else "❌ No"
+            print(f"{idx:<4} {m['name']:<30} {m['rank_score']:<12.4f} {m['avg_score']:<10.4f} {m['total_qualified']:<8} {to_be_curated_str:<13} {curated_str:<9} {published_str:<11} {m['can_publish_str']:<13} {m['last_pub_str']:<15}")
+
+        print("\n--- Actions ---")
+        print(" [1] Sync proposed assets to ToBeCurated albums in Apple Photos")
+        print(" [2] Export Curated album from Apple Photos to LaCie filesystem")
+        print(" [3] Record publication in the database (Mark as Published to Shutterfly)")
+        print(" [E] Exit")
+        
+        choice = input("\nSelect action: ").strip().lower()
+        if choice == '1':
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            logger.info("Syncing proposed assets to Apple Photos...")
+            try:
+                subprocess.run(["python3", os.path.join(script_dir, "create_apple_moments_albums.py")], check=True)
+                logger.info("Sync complete.")
+            except subprocess.CalledProcessError as e:
+                logger.error(f"Sync failed: {e}")
+        elif choice == '2':
+            moment_name = input("Enter Moment Name to export (or index from list): ").strip()
+            if moment_name.isdigit():
+                idx = int(moment_name) - 1
+                if 0 <= idx < len(ranked_moments):
+                    moment_name = ranked_moments[idx]['name']
+            
+            if not moment_name:
+                continue
+                
+            dest_folder = os.path.join(CURATED_LACIE_DIR, moment_name)
+            if not os.path.exists(dest_folder):
+                create_confirm = input(f"📁 Folder '{dest_folder}' does not exist. Do you want to create it? [y/N]: ").strip().lower()
+                if create_confirm == 'y':
+                    os.makedirs(dest_folder, exist_ok=True)
+                    logger.info(f"Created folder: {dest_folder}")
+                else:
+                    logger.warning("Aborted export.")
+                    continue
+                    
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            try:
+                subprocess.run(["python3", os.path.join(script_dir, "export_curated_album.py"), moment_name], check=True)
+            except subprocess.CalledProcessError as e:
+                logger.error(f"Export failed: {e}")
+        elif choice == '3':
+            moment_name = input("Enter Moment Name to publish (or index from list): ").strip()
+            if moment_name.isdigit():
+                idx = int(moment_name) - 1
+                if 0 <= idx < len(ranked_moments):
+                    moment_name = ranked_moments[idx]['name']
+            
+            if not moment_name:
+                continue
+                
+            cursor.execute("""
+                SELECT asset_id FROM moment_exports 
+                WHERE album_name = ? AND curation_stage = 'curated'
+            """, (moment_name,))
+            curated_assets = [row[0] for row in cursor.fetchall()]
+            
+            if not curated_assets:
+                print(f"⚠️ No curated assets found in the DB for '{moment_name}'. Please export the Curated album first.")
+                continue
+                
+            confirm = input(f"Confirm publication of {len(curated_assets)} assets of '{moment_name}' to Shutterfly? [y/N]: ").strip().lower()
+            if confirm == 'y':
+                try:
+                    pub_data = [(aid, moment_name, 'Shutterfly') for aid in curated_assets]
+                    cursor.executemany("""
+                        INSERT INTO publications (asset_id, moment_name, platform, published_at_utc)
+                        VALUES (?, ?, ?, datetime('now'))
+                    """, pub_data)
+                    
+                    cursor.execute("""
+                        INSERT INTO curated_moments (moment_name, memory_stage)
+                        VALUES (?, 'M500')
+                        ON CONFLICT(moment_name) DO UPDATE SET memory_stage = 'M500'
+                    """, (moment_name,))
+                    
+                    conn.commit()
+                    print(f"✅ Recorded publication of {len(curated_assets)} assets for '{moment_name}' in database.")
+                except Exception as e:
+                    logger.warning(f"Failed to record publication: {e}")
+                    conn.rollback()
+        elif choice == 'e':
+            break
+
 def main(auto_apply):
     # Set up logger with line number in format
 
@@ -654,18 +942,16 @@ def main(auto_apply):
     # Run bootstrap steps before proceeding
     run_bootstrap_steps(auto_apply, logger)
 
-    # Prompt for session mode: Moments Export or Standard Pipeline
+    # Prompt for session mode: Memory Feature & Publishing or Batch Management
     if not auto_apply:
         print("\n--- 🛠️  Session Mode ---")
-        mode = input("Select mode: [P] Standard Pipeline Planner (default) | [M] Moments Export: ").strip().lower()
+        mode = input("Select mode: [B] Batch Management (default) | [M] Memory Feature & Publishing: ").strip().lower()
         if mode == 'm':
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            logger.info("🚀 Initiating Moments Export mode...")
-            try:
-                subprocess.run(["python3", os.path.join(script_dir, "create_apple_moments_albums.py")], check=True)
-                logger.info("✅ Moments Export session finished.")
-            except subprocess.CalledProcessError as e:
-                logger.error(f"❌ Moments Export process failed: {e}")
+            conn = get_connection()
+            conn.execute("PRAGMA busy_timeout = 30000")
+            cursor = get_cursor()
+            run_memory_publishing_flow(cursor, conn)
+            close_conn()
             sys.exit(0)
 
     conn = get_connection()

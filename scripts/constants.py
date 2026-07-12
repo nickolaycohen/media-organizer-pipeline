@@ -11,7 +11,9 @@ APPLE_SCRIPT_LOG_PATH = os.path.join(BASE_DIR, '../logs/applescript_execution.lo
 APPLE_PHOTOS_DB_PATH = '/Volumes/Extreme Pro/Photos Library/All-Media.photoslibrary/database/Photos.sqlite'
 STAGING_ROOT = '/Volumes/LaCie/Media Organizer/Google Photos/01-MonthlyExports/'
 CURATED_EXPORT_DIR = '/Volumes/LaCie/Media Organizer/Google Photos/02-AICurrateList/'
-MOMENTS_EXPORT_DIR = '/Volumes/LaCie/Media Organizer/MomentsExport/'
+TO_BE_CURATED_DIR = '/Volumes/LaCie/Media Organizer/ToBeCurated/'
+CURATED_LACIE_DIR = '/Volumes/LaCie/Media Organizer/Curated/'
+MOMENTS_EXPORT_DIR = TO_BE_CURATED_DIR
 
 APPLE_PHOTOS_DB_COPY_PATH = "/Volumes/Macintosh HD/Users/nickolaycohen/Photos Library DB/All-Media-Extreme/database/Photos.sqlite"
 APPLE_PHOTOS_DB_MARKER = APPLE_PHOTOS_DB_COPY_PATH + ".lastcopy"

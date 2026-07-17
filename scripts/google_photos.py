@@ -122,18 +122,39 @@ def create_or_get_album(creds, album_title):
     raise Exception(f'Failed to create album: {response.text}')
 
 
-def upload_media(creds, file_path, album_id):
+def upload_media(creds, file_path, album_id, max_retries=5):
+    import time
     headers = {
         'Authorization': f'Bearer {creds.token}',
         'Content-type': 'application/octet-stream',
         'X-Goog-Upload-File-Name': os.path.basename(file_path),
         'X-Goog-Upload-Protocol': 'raw',
     }
-    with open(file_path, 'rb') as file:
-        upload_token_res = requests.post(f'{API_BASE_URL}/uploads', headers=headers, data=file)
-    if upload_token_res.status_code != 200:
-        raise Exception(f'Upload failed: {upload_token_res.text}')
-    upload_token = upload_token_res.text
+    
+    # 1. Upload raw bytes to get upload token (with retries)
+    upload_token = None
+    delay = 2
+    for attempt in range(1, max_retries + 1):
+        try:
+            with open(file_path, 'rb') as file:
+                upload_token_res = requests.post(f'{API_BASE_URL}/uploads', headers=headers, data=file)
+            if upload_token_res.status_code == 200:
+                upload_token = upload_token_res.text
+                break
+            else:
+                logger.warning(f"Upload bytes attempt {attempt} failed ({upload_token_res.status_code}): {upload_token_res.text}")
+        except Exception as e:
+            logger.warning(f"Upload bytes attempt {attempt} encountered error: {e}")
+        
+        if attempt < max_retries:
+            logger.info(f"Retrying bytes upload in {delay} seconds...")
+            time.sleep(delay)
+            delay *= 2
+            
+    if not upload_token:
+        raise Exception(f"Failed to upload file bytes after {max_retries} attempts.")
+
+    # 2. Create media item in album (with retries)
     create_body = {
         'newMediaItems': [
             {
@@ -145,12 +166,38 @@ def upload_media(creds, file_path, album_id):
         ],
         'albumId': album_id
     }
-    create_response = requests.post(f'{API_BASE_URL}/mediaItems:batchCreate', headers={
-        'Authorization': f'Bearer {creds.token}',
-        'Content-type': 'application/json'
-    }, json=create_body)
-    if create_response.status_code != 200:
-        raise Exception(f'Failed to create media item: {create_response.text}')
+    
+    delay = 2
+    for attempt in range(1, max_retries + 1):
+        try:
+            create_response = requests.post(f'{API_BASE_URL}/mediaItems:batchCreate', headers={
+                'Authorization': f'Bearer {creds.token}',
+                'Content-type': 'application/json'
+            }, json=create_body)
+            
+            if create_response.status_code == 200:
+                # Check for individual media item creation status (sometimes response is 200 but creation status is not OK)
+                res_json = create_response.json()
+                results = res_json.get('newMediaItemResults', [])
+                if results:
+                    status = results[0].get('status', {})
+                    # If status message is Success/OK (or status is empty/not present meaning success)
+                    if not status or status.get('message') in ('Success', 'Success.', None) or status.get('code') in (0, None):
+                        return
+                    else:
+                        raise Exception(f"Creation result status error: {status}")
+                return
+            else:
+                logger.warning(f"Create media item attempt {attempt} failed ({create_response.status_code}): {create_response.text}")
+        except Exception as e:
+            logger.warning(f"Create media item attempt {attempt} encountered error: {e}")
+            
+        if attempt < max_retries:
+            logger.info(f"Retrying media item creation in {delay} seconds...")
+            time.sleep(delay)
+            delay *= 2
+
+    raise Exception(f"Failed to create media item after {max_retries} attempts.")
 
 def get_all_favorites(creds):
     headers = {'Authorization': f'Bearer {creds.token}', 'Content-type': 'application/json'}

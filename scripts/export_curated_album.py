@@ -47,14 +47,16 @@ def run_applescript(moment_name, dest_dir):
                 return "ERROR: Mid folder Curated not found"
             end if
             
-            -- Find Album
+            -- Find Album (check flat album first, then check folder of the same name)
             set targetAlbum to missing value
-            repeat with a in albums of midFolder
-                if name of a is equal to albumName then
-                    set targetAlbum to a
-                    exit repeat
+            if exists album albumName of midFolder then
+                set targetAlbum to album albumName of midFolder
+            else if exists folder albumName of midFolder then
+                set nestedFolder to folder albumName of midFolder
+                if exists album albumName of nestedFolder then
+                    set targetAlbum to album albumName of nestedFolder
                 end if
-            end repeat
+            end if
             if targetAlbum is missing value then
                 return "ERROR: Album not found"
             end if

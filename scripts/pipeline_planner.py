@@ -721,7 +721,7 @@ def run_memory_publishing_flow(cursor, conn):
                 moments_data[moment_name]['curated_count'] += 1
             moments_data[moment_name]['scores'].append(score)
 
-        # 3. Query Apple Photos albums inside Curated and ToBeCurated (to match existence)
+        # 3. Query Apple Photos albums and folders inside Curated and ToBeCurated (to match existence)
         applescript_code = """
         tell application "Photos"
             set results to {}
@@ -733,21 +733,36 @@ def run_memory_publishing_flow(cursor, conn):
                     repeat with aName in albNames
                         copy (fName & ":" & aName) to end of results
                     end repeat
+                    set fNames to name of folders of subFolder
+                    repeat with aName in fNames
+                        copy (fName & ":" & aName) to end of results
+                    end repeat
                 end if
             end repeat
-            return results
+            
+            set oldDelims to AppleScript's text item delimiters
+            set AppleScript's text item delimiters to "\n"
+            set resultsString to results as string
+            set AppleScript's text item delimiters to oldDelims
+            return resultsString
         end tell
         """
-        photos_albums = {}
+        to_be_curated_albums = set()
+        curated_albums = set()
         try:
             process = subprocess.Popen(['osascript', '-e', applescript_code], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             stdout, stderr = process.communicate()
             if stdout:
-                parts = [p.strip() for p in stdout.strip().split(',')]
+                parts = [p.strip() for p in stdout.strip().split('\n')]
                 for p in parts:
                     if ':' in p:
                         folder_name, album_name = p.split(':', 1)
-                        photos_albums[album_name.strip()] = folder_name.strip()
+                        folder_name_clean = folder_name.strip()
+                        album_name_clean = album_name.strip()
+                        if folder_name_clean == 'ToBeCurated':
+                            to_be_curated_albums.add(album_name_clean)
+                        elif folder_name_clean == 'Curated':
+                            curated_albums.add(album_name_clean)
         except Exception as e:
             logger.warning(f"Could not list Apple Photos albums: {e}")
 
@@ -770,8 +785,8 @@ def run_memory_publishing_flow(cursor, conn):
             stage = stages.get(name, 'M100')
             
             # Check Apple Photos existence
-            to_be_curated_exists = (photos_albums.get(name) == 'ToBeCurated')
-            curated_exists = (photos_albums.get(name) == 'Curated')
+            to_be_curated_exists = (name in to_be_curated_albums)
+            curated_exists = (name in curated_albums)
             
             # Check filesystem curated directory existence
             fs_curated_exists = os.path.exists(os.path.join(CURATED_LACIE_DIR, name))
@@ -819,9 +834,9 @@ def run_memory_publishing_flow(cursor, conn):
                 'can_publish_str': can_publish_str
             })
 
-        # Sort by: 1. Needs update (proposed < total_qualified), 2. Stage (M100 first), 3. Rank score descending
+        # Sort by: 1. Needs update (proposed + curated < total_qualified), 2. Stage (M100 first), 3. Rank score descending
         ranked_moments.sort(key=lambda x: (
-            x['proposed_count'] < x['total_qualified'],
+            (x['proposed_count'] + x['curated_count']) < x['total_qualified'],
             x['stage'] == 'M500',  # Put published at the bottom
             x['rank_score']
         ), reverse=True)
@@ -830,7 +845,7 @@ def run_memory_publishing_flow(cursor, conn):
         print("-" * 135)
         for idx, m in enumerate(ranked_moments, 1):
             to_be_curated_str = "✅ Yes" if m['to_be_curated_exists'] else "❌ No"
-            if m['proposed_count'] < m['total_qualified'] and m['to_be_curated_exists']:
+            if (m['proposed_count'] + m['curated_count']) < m['total_qualified'] and m['to_be_curated_exists']:
                 to_be_curated_str = "🔄 Update needed"
             
             curated_str = "✅ Yes" if m['curated_exists'] else "❌ No"
@@ -957,6 +972,32 @@ def main(auto_apply):
     conn = get_connection()
     conn.execute("PRAGMA busy_timeout = 30000")
     cursor = get_cursor()
+
+    # Check for completed batches that have new assets imported since their last update
+    cursor.execute("""
+        SELECT mb.month, mb.updated_at_utc, MAX(a.imported_date_utc), COUNT(a.asset_id)
+        FROM month_batches mb
+        JOIN assets a ON a.month = mb.month
+        WHERE mb.status_code >= '600'
+        GROUP BY mb.month
+        HAVING MAX(a.imported_date_utc) > mb.updated_at_utc
+    """)
+    outdated_batches = cursor.fetchall()
+    if outdated_batches:
+        print("\n==================================================")
+        print("🔄 Detected New Assets in Completed Batches")
+        print("==================================================")
+        print("The following processed/finalized batches have new imported photos:")
+        for month, finalized_at, newest_import, asset_count in outdated_batches:
+            print(f" - {month}: Finalized on {finalized_at}, Newest import: {newest_import}")
+        
+        for month, finalized_at, newest_import, asset_count in outdated_batches:
+            if not auto_apply:
+                reset_input = input(f"\nDo you want to reset batch {month} to status '000' (added) to re-process new assets? [y/N]: ").strip().lower()
+                if reset_input == 'y':
+                    cursor.execute("UPDATE month_batches SET status_code = '000', updated_at_utc = CURRENT_TIMESTAMP WHERE month = ?", (month,))
+                    conn.commit()
+                    logger.info(f"✅ Reset batch {month} to status '000'.")
 
     # Shared credentials for all Google API calls in this planner session
     creds = authenticate(scopes=PLANNER_REQUIRED_SCOPES)
@@ -1184,6 +1225,16 @@ def main(auto_apply):
         # Only perform import continuity and sequencing checks for batches that haven't reached the upload stage (400)
         # This prevents redundant prompts for batches that are already processed or being curated.
         if current_status and str(current_status) < '400':
+            # Check if Apple Photos Smart Album exists before proposing migration off of 000 / 100E
+            if str(current_status) in ('000', '100E'):
+                cursor.execute("SELECT COUNT(*) FROM smart_albums WHERE LOWER(album_name) = ?", (latest_month.lower(),))
+                if cursor.fetchone()[0] == 0:
+                    logger.error(f"❌ Smart Album '{latest_month}' does not exist in Apple Photos.")
+                    logger.info(f"👉 Please create the Smart Album '{latest_month}' inside 'MonthlyExports' in Apple Photos first.")
+                    logger.info("Then, re-run the pipeline planner to sync the changes and proceed.")
+                    close_conn()
+                    sys.exit(0)
+
             check_active_sources_import_status(cursor, conn, latest_month, auto_apply)
 
             # --- Check sequencing before recording the plan ---

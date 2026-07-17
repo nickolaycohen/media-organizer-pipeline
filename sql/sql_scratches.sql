@@ -1,16 +1,45 @@
+-- all google favs by month
+select month, count(*)
+from assets a 
+where a.google_favorite 
+group by "month" 
+order by "month" DESC 
+
+-- check status of favs
+select a."month", count(*)
+from assets a 
+where a.google_favorite =  1 or a.uploaded_to_google =1
+group by "month" 
+
+-- rest uploaded flag for months in 000 status
+/*
+update assets 
+set uploaded_to_google = 0
+where assets."month" in ('2024-12', '2025-01', '2025-02', '2025-04')
+and uploaded_to_google = 1
+*/
+
+-- get batch statuses
+SELECT month, status_code, latest_import_id 
+FROM month_batches
+order by month desc;
+
+
 -- rate Identified Moments
-select me.album_name, avg(a.aesthetic_score), count(*)
+select me.album_name, avg(a.), count(*)
 from moment_exports me 
 join assets a on a.asset_id = me.asset_id 
 group by album_name 
+order by 2 desc
 
 select *
 from moment_exports me 
 
 -- find next asset to be added to Moments
-SELECT v.asset_id, v.original_filename, v."month", v.MomentsAlbumName, v.score_normalized
+SELECT v.asset_id, v.original_filename, v."month", a.date_created_utc , v.MomentsAlbumName, v.score_normalized
 FROM ranked_assets_view v
 JOIN month_batches mb ON v.month = mb.month
+join assets a on a.asset_id = v.asset_id 
 WHERE mb.status_code >= '600'
 ORDER BY v.score_normalized DESC;
 
@@ -41,12 +70,12 @@ select *
 from month_batches mb 
 order by 2 desc;
 
--- Pick assets to add moments - locate first item with null Moment and added it to a new album in Apple Photos Library
+-- FAILING: Pick assets to add moments - locate first item with null Moment and added it to a new album in Apple Photos Library
 SELECT v.original_filename, v.month, v.MomentsAlbumName, v.score_normalized, v.aesthetic_score, v.google_favorite , v.apple_photos_monthly_selection 
 FROM ranked_assets_view v
 JOIN month_batches mb ON v.month = mb.month
 WHERE mb.status_code >= '600'
-and not exists (select 1 from )
+-- and not exists (select 1 from )
 ORDER BY v.score_normalized DESC;
 
 
@@ -725,10 +754,6 @@ WHERE preceding_code IS NOT NULL
 order by code desc
 limit 1;
 
--- get batch statuses
-SELECT month, status_code, latest_import_id 
-FROM month_batches
-order by month desc;
 
 -- get latest import and month
 select * 

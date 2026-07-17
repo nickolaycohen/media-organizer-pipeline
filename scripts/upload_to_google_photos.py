@@ -33,6 +33,60 @@ def get_files_to_upload(folder_path):
             files.append((full_path, file_size))
     return files
 
+def calculate_historical_throughput():
+    import time
+    historical_speed = 0.7 * 1024 * 1024 # default fallback: 0.7 MB/s
+    try:
+        log_dir = os.path.dirname(LOG_PATH)
+        if os.path.exists(log_dir):
+            log_files = [os.path.join(log_dir, f) for f in os.listdir(log_dir) if f.startswith("media_organizer.log")]
+            total_history_bytes = 0
+            total_history_seconds = 0
+            
+            for log_path in log_files:
+                with open(log_path, 'r', errors='ignore') as lf:
+                    lines = lf.readlines()
+                
+                uploading_events = {}
+                for line in lines:
+                    if 'Uploading:' in line and 'MB)' in line:
+                        match_time = re.match(r'^([\d\-]+\s[\d:,]+)', line)
+                        match_file = re.search(r'Uploading:\s+(\S+)\s+\(([\d.]+)\s+MB\)', line)
+                        if match_time and match_file:
+                            try:
+                                t_str = match_time.group(1)
+                                dt = datetime.strptime(t_str.split(',')[0], "%Y-%m-%d %H:%M:%S")
+                                ms = float(t_str.split(',')[1]) / 1000.0
+                                ts = dt.timestamp() + ms
+                                fname = match_file.group(1)
+                                fsize_mb = float(match_file.group(2))
+                                uploading_events[fname] = (ts, fsize_mb)
+                            except Exception:
+                                continue
+                    elif 'Uploaded:' in line:
+                        match_time = re.match(r'^([\d\-]+\s[\d:,]+)', line)
+                        match_file = re.search(r'Uploaded:\s+(\S+)', line)
+                        if match_time and match_file:
+                            fname = match_file.group(1)
+                            if fname in uploading_events:
+                                try:
+                                    t_str = match_time.group(1)
+                                    dt = datetime.strptime(t_str.split(',')[0], "%Y-%m-%d %H:%M:%S")
+                                    ms = float(t_str.split(',')[1]) / 1000.0
+                                    ts_end = dt.timestamp() + ms
+                                    ts_start, fsize_mb = uploading_events[fname]
+                                    duration = ts_end - ts_start
+                                    if 0.1 < duration < 300: # filter out outliers
+                                        total_history_bytes += fsize_mb * 1024 * 1024
+                                        total_history_seconds += duration
+                                except Exception:
+                                    continue
+            if total_history_seconds > 0:
+                historical_speed = total_history_bytes / total_history_seconds
+    except Exception as le:
+        logger.debug(f"Failed to calculate historical speed from logs: {le}")
+    return historical_speed
+
 def main(args):
     logger.info(f"📤 Starting upload to Google Photos for month: {args.month}")
     for handler in logger.handlers:
@@ -183,7 +237,13 @@ def main(args):
         # Authenticate with append-only scope for uploading
         creds_append = authenticate(scopes=GOOGLE_PHOTOS_APPEND_ONLY_SCOPES)
 
+    import time
+    historical_speed = calculate_historical_throughput()
     total_files = len(files_to_process)
+    total_remaining_size = sum(f[1] for f in files_to_process)
+    uploaded_size_this_session = 0
+    session_durations = 0.0
+
     for idx, (file_path, file_size, metadata) in enumerate(files_to_process, start=1):
         filename = os.path.basename(file_path)
         file_size_mb = file_size / (1024 * 1024)
@@ -193,9 +253,41 @@ def main(args):
             logger.info(f"[Dry Run] [{idx}/{total_files}] Would upload: {filename} ({file_size_mb:.2f} MB)")
         else:
             try:
-                logger.info(f"[{idx}/{total_files}] Uploading: {filename} ({file_size_mb:.2f} MB)")
+                from datetime import timedelta
+                # Use current session's speed if we have enough sample size, otherwise historical fallback
+                if idx > 3 and session_durations > 0:
+                    current_speed = uploaded_size_this_session / session_durations
+                else:
+                    current_speed = historical_speed
+
+                eta_seconds = total_remaining_size / current_speed if current_speed > 0 else 0
+                eta_minutes = eta_seconds / 60
+                eta_completion_time = datetime.now() + timedelta(seconds=eta_seconds)
+                eta_completion_str = eta_completion_time.strftime("%H:%M:%S")
+                
+                logger.info(f"[{idx}/{total_files}] Uploading: {filename} ({file_size_mb:.2f} MB) - Est. Completion: {eta_completion_str} ({eta_minutes:.1f}m remaining at {human_readable_size(current_speed)}/s)")
+                
+                t_start = time.time()
                 upload_media(creds_append, file_path, album_id)
-                logger.info(f"[{idx}/{total_files}] Uploaded: {filename}")
+                duration = time.time() - t_start
+
+                uploaded_size_this_session += file_size
+                total_remaining_size -= file_size
+                session_durations += duration
+
+                # Recalculate ETA for the remaining files after this file finishes
+                if idx >= 3 and session_durations > 0:
+                    current_speed = uploaded_size_this_session / session_durations
+                else:
+                    current_speed = historical_speed
+
+                remaining_eta_seconds = total_remaining_size / current_speed if current_speed > 0 else 0
+                remaining_eta_minutes = remaining_eta_seconds / 60
+                remaining_completion_time = datetime.now() + timedelta(seconds=remaining_eta_seconds)
+                remaining_completion_str = remaining_completion_time.strftime("%H:%M:%S")
+
+                logger.info(f"[{idx}/{total_files}] Uploaded: {filename} - Est. Completion: {remaining_completion_str} ({remaining_eta_minutes:.1f}m remaining)")
+                
                 cursor.execute("""
                     UPDATE assets SET
                         file_hash = ?,

@@ -47,7 +47,7 @@ GOOGLE_DRIVE_READ_ONLY_SCOPES = ['https://www.googleapis.com/auth/drive.readonly
 PLANNER_REQUIRED_SCOPES = GOOGLE_PHOTOS_EDIT_ACCESS_SCOPES + GOOGLE_PHOTOS_READONLY_SCOPES  + GOOGLE_DRIVE_READ_ONLY_SCOPES + GOOGLE_PHOTOS_APPEND_ONLY_SCOPES
 
 # List of camera models considered "active sources" for import checks
-ACTIVE_CAMERA_MODELS = ['iPhone 13 Pro Max', 'Canon EOS Rebel T7', 'iPhone 16 Pro', 'iPhone 12 Pro Max']
+ACTIVE_CAMERA_MODELS = ['iPhone 13 Pro Max', 'Canon EOS Rebel T7', 'iPhone 16 Pro', 'iPhone 12 Pro Max', 'iPhone 17 Pro Max']
 
 # DEPRECATED/UNUSED - Kept for reference, but should be removed in the future.
 # GOOGLE_PHOTOS_GENERAL_SCOPES = ["https://www.googleapis.com/auth/photoslibrary.readonly", "https://www.googleapis.com/auth/photoslibrary.appendonly"]

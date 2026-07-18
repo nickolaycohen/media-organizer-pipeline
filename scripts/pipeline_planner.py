@@ -651,45 +651,108 @@ def run_memory_publishing_flow(cursor, conn):
     cutoff_score = row[0] if row and row[0] is not None else 0.0
     logger.info(f"Cutoff threshold score: {cutoff_score:.4f}")
 
-    # Check for highly ranked assets that do not belong to any Moment in Apple Photos
-    cursor.execute("""
-        SELECT v.original_filename, v.score_normalized, v.month, v.date_created_utc
-        FROM ranked_assets_view v
-        JOIN month_batches mb ON v.month = mb.month
-        WHERE mb.status_code >= '600' AND (v.MomentsAlbumName IS NULL OR v.MomentsAlbumName = '')
-          AND v.score_normalized > 0.55
-        ORDER BY v.score_normalized DESC
-        LIMIT 5
-    """)
-    unassigned = cursor.fetchall()
-    if unassigned:
-        print("\n==================================================")
-        print("⚠️  Unassigned High-Rank Assets (Need Moment Naming Decision)")
-        print("==================================================")
-        print("The following highly-ranked assets are not assigned to any Moment album in Apple Photos:")
-        for fname, score, month, date_created in unassigned:
-            captured_str = "—"
-            if date_created:
-                try:
-                    dt_utc = None
-                    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
-                        try:
-                            dt_utc = datetime.strptime(date_created, fmt)
-                            break
-                        except ValueError:
-                            continue
-                    if dt_utc:
-                        dt_utc = dt_utc.replace(tzinfo=timezone.utc)
-                        dt_local = dt_utc.astimezone()
-                        captured_str = dt_local.strftime("%Y-%m-%d %H:%M:%S")
-                    else:
-                        captured_str = date_created[:19]
-                except Exception:
-                    captured_str = date_created[:19]
-            print(f" - {fname:<25} (Score: {score:.4f}, Captured: {captured_str}, Month: {month})")
-        print("👉 Please consider creating a corresponding album under 'Media Organizer on LaCie / Moments' in Apple Photos and placing these files into it.\n")
-
     while True:
+        # Clear/rollback any open transactions to get a fresh snapshot of the database
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+        # Check for highly ranked assets that do not belong to any Moment in Apple Photos
+        # Try attaching Apple Photos DB copy to fetch Apple's auto-generated moments
+        photos_db_attached = False
+        try:
+            from constants import APPLE_PHOTOS_DB_COPY_PATH
+            # Pre-open direct connection to force SQLite recovery/WAL resolution on the copy
+            try:
+                temp_conn = sqlite3.connect(APPLE_PHOTOS_DB_COPY_PATH, timeout=5)
+                temp_conn.execute("SELECT 1;")  # quick query to force file access/recovery
+                temp_conn.close()
+            except Exception as e:
+                logger.debug(f"Pre-open of Photos.sqlite copy failed/warned: {e}")
+
+            cursor.execute(f"ATTACH DATABASE '{APPLE_PHOTOS_DB_COPY_PATH}' AS photos_db;")
+            photos_db_attached = True
+        except Exception as e:
+            logger.warning(f"Could not attach Photos.sqlite for Apple moment lookup: {e}")
+
+        if photos_db_attached:
+            cursor.execute("""
+                SELECT 
+                    v.original_filename, 
+                    v.score_normalized, 
+                    v.month, 
+                    v.date_created_utc,
+                    m.ZTITLE,
+                    m.ZSUBTITLE
+                FROM ranked_assets_view v
+                JOIN month_batches mb ON v.month = mb.month
+                LEFT JOIN photos_db.ZASSET a ON a.ZUUID = v.asset_id
+                LEFT JOIN photos_db.ZMOMENT m ON a.ZMOMENT = m.Z_PK
+                WHERE mb.status_code >= '600' AND (v.MomentsAlbumName IS NULL OR v.MomentsAlbumName = '')
+                  AND v.score_normalized > 0.55
+                ORDER BY v.score_normalized DESC
+                LIMIT 5
+            """)
+        else:
+            cursor.execute("""
+                SELECT v.original_filename, v.score_normalized, v.month, v.date_created_utc, NULL, NULL
+                FROM ranked_assets_view v
+                JOIN month_batches mb ON v.month = mb.month
+                WHERE mb.status_code >= '600' AND (v.MomentsAlbumName IS NULL OR v.MomentsAlbumName = '')
+                  AND v.score_normalized > 0.55
+                ORDER BY v.score_normalized DESC
+                LIMIT 5
+            """)
+
+        unassigned = cursor.fetchall()
+
+        if photos_db_attached:
+            try:
+                cursor.execute("DETACH DATABASE photos_db;")
+            except Exception as e:
+                logger.warning(f"Could not detach Photos.sqlite: {e}")
+
+        if unassigned:
+            print("\n==================================================")
+            print("⚠️  Unassigned High-Rank Assets (Need Moment Naming Decision)")
+            print("==================================================")
+            print("The following highly-ranked assets are not assigned to any Moment album in Apple Photos:")
+            for fname, score, month, date_created, moment_title, moment_subtitle in unassigned:
+                captured_str = "—"
+                if date_created:
+                    try:
+                        dt_utc = None
+                        for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                            try:
+                                dt_utc = datetime.strptime(date_created, fmt)
+                                break
+                            except ValueError:
+                                continue
+                        if dt_utc:
+                            dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+                            dt_local = dt_utc.astimezone()
+                            captured_str = dt_local.strftime("%Y-%m-%d %H:%M:%S")
+                        else:
+                            captured_str = date_created[:19]
+                    except Exception:
+                        captured_str = date_created[:19]
+
+                # Construct suggested album name if moment information is available
+                moment_parts = []
+                if moment_title:
+                    moment_parts.append(moment_title.replace('\xa0', ' ').strip())
+                if moment_subtitle:
+                    moment_parts.append(moment_subtitle.replace('\xa0', ' ').strip())
+
+                suggested_info = ""
+                if moment_parts:
+                    captured_date = captured_str[:10] if captured_str != "—" else (date_created[:10] if date_created else month)
+                    suggested_name = f"{captured_date} - {' - '.join(moment_parts)}"
+                    suggested_info = f", Suggested Album: {suggested_name}"
+
+                print(f" - {fname:<25} (Score: {score:.4f}, Captured: {captured_str}, Month: {month}{suggested_info})")
+            print("👉 Please consider creating a corresponding album under 'Media Organizer on LaCie / Moments' in Apple Photos (creating the album is sufficient, no need to place the files inside).\n")
         # 2. Query assets that have Moments and are in status >= 600
         query = """
             SELECT v.asset_id, v.MomentsAlbumName, v.score_normalized, v.original_filename,
@@ -721,7 +784,7 @@ def run_memory_publishing_flow(cursor, conn):
                 moments_data[moment_name]['curated_count'] += 1
             moments_data[moment_name]['scores'].append(score)
 
-        # 3. Query Apple Photos albums and folders inside Curated and ToBeCurated (to match existence)
+        # 3. Query Apple Photos albums and folders inside Curated and ToBeCurated (to match existence and get counts)
         applescript_code = """
         tell application "Photos"
             set results to {}
@@ -729,40 +792,55 @@ def run_memory_publishing_flow(cursor, conn):
             repeat with fName in parentFolderNames
                 if exists folder fName of folder "Media Organizer on LaCie" then
                     set subFolder to folder fName of folder "Media Organizer on LaCie"
-                    set albNames to name of albums of subFolder
-                    repeat with aName in albNames
-                        copy (fName & ":" & aName) to end of results
+                    set subAlbums to albums of subFolder
+                    repeat with anAlbum in subAlbums
+                        set aName to name of anAlbum
+                        try
+                            set aCount to count of media items of anAlbum
+                        on error
+                            set aCount to 0
+                        end try
+                        copy (fName & "|" & aName & "|" & (aCount as string)) to end of results
                     end repeat
-                    set fNames to name of folders of subFolder
-                    repeat with aName in fNames
-                        copy (fName & ":" & aName) to end of results
+                    set subFolders to folders of subFolder
+                    repeat with aFolder in subFolders
+                        set aName to name of aFolder
+                        copy (fName & "|" & aName & "|0") to end of results
                     end repeat
                 end if
             end repeat
             
             set oldDelims to AppleScript's text item delimiters
-            set AppleScript's text item delimiters to "\n"
+            set AppleScript's text item delimiters to "\\n"
             set resultsString to results as string
             set AppleScript's text item delimiters to oldDelims
             return resultsString
         end tell
         """
-        to_be_curated_albums = set()
-        curated_albums = set()
+        to_be_curated_albums = {}
+        curated_albums = {}
         try:
             process = subprocess.Popen(['osascript', '-e', applescript_code], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             stdout, stderr = process.communicate()
             if stdout:
                 parts = [p.strip() for p in stdout.strip().split('\n')]
                 for p in parts:
-                    if ':' in p:
-                        folder_name, album_name = p.split(':', 1)
-                        folder_name_clean = folder_name.strip()
-                        album_name_clean = album_name.strip()
-                        if folder_name_clean == 'ToBeCurated':
-                            to_be_curated_albums.add(album_name_clean)
-                        elif folder_name_clean == 'Curated':
-                            curated_albums.add(album_name_clean)
+                    if '|' in p:
+                        subparts = p.split('|')
+                        if len(subparts) >= 2:
+                            folder_name_clean = subparts[0].strip()
+                            album_name_clean = subparts[1].strip()
+                            item_count = 0
+                            if len(subparts) >= 3:
+                                try:
+                                    item_count = int(subparts[2].strip())
+                                except ValueError:
+                                    pass
+                            
+                            if folder_name_clean == 'ToBeCurated':
+                                to_be_curated_albums[album_name_clean] = item_count
+                            elif folder_name_clean == 'Curated':
+                                curated_albums[album_name_clean] = item_count
         except Exception as e:
             logger.warning(f"Could not list Apple Photos albums: {e}")
 
@@ -819,6 +897,30 @@ def run_memory_publishing_flow(cursor, conn):
                 # Can be published if local folder exists, has assets, and we have more curated assets than published ones
                 can_publish_str = "✅ Yes" if (fs_curated_exists and data['curated_count'] > 0 and data['curated_count'] > pub_count) else "❌ No"
             
+            # Determine asset count to display (use filesystem count if curated folder exists,
+            # fallback to database curated count if present, otherwise total qualified proposed assets)
+            fs_curated_path = os.path.join(CURATED_LACIE_DIR, name)
+            fs_count = 0
+            if os.path.exists(fs_curated_path):
+                try:
+                    all_files = [f for f in os.listdir(fs_curated_path) 
+                                 if os.path.isfile(os.path.join(fs_curated_path, f)) 
+                                 and not f.startswith('.')]
+                    # Group by base name to treat Live Photos (HEIC + MOV) as a single asset
+                    fs_count = len(set(os.path.splitext(f)[0].lower() for f in all_files))
+                except Exception:
+                    pass
+
+            if fs_count > 0:
+                assets_display = str(fs_count)
+            elif name in curated_albums:
+                # Use count from Apple Photos Curated album if available (before filesystem export)
+                assets_display = str(curated_albums[name])
+            elif data['curated_count'] > 0:
+                assets_display = str(data['curated_count'])
+            else:
+                assets_display = str(data['total_qualified'])
+
             ranked_moments.append({
                 'name': name,
                 'total_qualified': data['total_qualified'],
@@ -831,7 +933,8 @@ def run_memory_publishing_flow(cursor, conn):
                 'curated_exists': curated_exists,
                 'fs_curated_exists': fs_curated_exists,
                 'last_pub_str': last_pub_str,
-                'can_publish_str': can_publish_str
+                'can_publish_str': can_publish_str,
+                'assets_display': assets_display
             })
 
         # Sort by: 1. Needs update (proposed + curated < total_qualified), 2. Stage (M100 first), 3. Rank score descending
@@ -853,7 +956,7 @@ def run_memory_publishing_flow(cursor, conn):
                 curated_str = "📁 Needs Folder"
                 
             published_str = "✅ Yes" if m['stage'] == 'M500' else "❌ No"
-            print(f"{idx:<4} {m['name']:<30} {m['rank_score']:<12.4f} {m['avg_score']:<10.4f} {m['total_qualified']:<8} {to_be_curated_str:<13} {curated_str:<9} {published_str:<11} {m['can_publish_str']:<13} {m['last_pub_str']:<15}")
+            print(f"{idx:<4} {m['name']:<30} {m['rank_score']:<12.4f} {m['avg_score']:<10.4f} {m['assets_display']:<8} {to_be_curated_str:<13} {curated_str:<9} {published_str:<11} {m['can_publish_str']:<13} {m['last_pub_str']:<15}")
 
         print("\n--- Actions ---")
         print(" [1] Sync proposed assets to ToBeCurated albums in Apple Photos")

@@ -96,13 +96,17 @@ def sync_assets(media_cursor, logger):
             LEFT JOIN ZGENERICALBUM p ON ga.ZPARENTFOLDER = p.Z_PK 
             WHERE aa.Z_3ASSETS = a.Z_PK 
             AND (p.ZTITLE IN ('Moments' ) )
+            AND ga.ZTRASHEDSTATE = 0
+            AND ga.ZKIND <> 1507
             ORDER BY (CASE WHEN p.ZTITLE = 'Moments' THEN 0 ELSE 1 END) ASC LIMIT 1) as MomentsAlbumName,
             (SELECT 1 FROM Z_30ASSETS aa 
             JOIN ZGENERICALBUM ga ON ga.Z_PK = aa.Z_30ALBUMS 
             LEFT JOIN ZGENERICALBUM p ON ga.ZPARENTFOLDER = p.Z_PK
             LEFT JOIN ZGENERICALBUM gp ON p.ZPARENTFOLDER = gp.Z_PK
             WHERE aa.Z_3ASSETS = a.Z_PK 
-            AND (p.ZTITLE = 'Apple Photos Month Selection') LIMIT 1) as apple_photos_monthly_selection
+            AND (p.ZTITLE = 'Apple Photos Month Selection')
+            AND ga.ZTRASHEDSTATE = 0
+            AND ga.ZKIND <> 1507 LIMIT 1) as apple_photos_monthly_selection
         FROM ZASSET a
         JOIN ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK
         WHERE a.ZIMPORTSESSION IS NOT NULL
@@ -207,6 +211,7 @@ def sync_assets(media_cursor, logger):
         FROM photos_db.ZGENERICALBUM a
         LEFT JOIN photos_db.ZGENERICALBUM p ON a.ZPARENTFOLDER = p.Z_PK
         WHERE a.ZKIND = 1507
+        AND a.ZTRASHEDSTATE = 0
         AND (p.ZTITLE = 'MonthlyExports' OR a.ZPARENTFOLDER IN (SELECT Z_PK FROM photos_db.ZGENERICALBUM WHERE ZTITLE = 'MonthlyExports'))
         ORDER BY a.ZTITLE;
     ''')
@@ -228,6 +233,7 @@ def sync_assets(media_cursor, logger):
         LEFT JOIN photos_db.ZGENERICALBUM p ON a.ZPARENTFOLDER = p.Z_PK
         WHERE a.ZKIND <> 1507
         and a.ZTITLE is NOT NULL
+        and a.ZTRASHEDSTATE = 0
         ORDER BY a.ZTITLE;
     ''')
 
@@ -249,6 +255,7 @@ def sync_assets(media_cursor, logger):
         WHERE a.ZKIND <> 1507
         and a.ZTITLE is NOT NULL
         and p.ZTITLE = 'Moments' 
+        and a.ZTRASHEDSTATE = 0
         ORDER BY a.ZTITLE;
     ''')
 

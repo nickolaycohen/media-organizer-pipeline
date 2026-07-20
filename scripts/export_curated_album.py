@@ -71,7 +71,7 @@ def run_applescript(moment_name, dest_dir):
             do shell script "mkdir -p " & quoted form of destinationFolderPath
             set destFolder to POSIX file destinationFolderPath as alias
             
-            set exportedIds to {{}}
+            set results to {{}}
             set itemsToExport to {{}}
             
             repeat with thisItem in mediaItems
@@ -82,7 +82,7 @@ def run_applescript(moment_name, dest_dir):
                 set fileCheckCmd to "test -f " & quoted form of itemPath & " && echo exists || echo missing"
                 set fileStatus to do shell script fileCheckCmd
                 
-                copy itemId to end of exportedIds
+                copy (itemId & "|" & itemName) to end of results
                 
                 if fileStatus is "missing" then
                     copy thisItem to end of itemsToExport
@@ -93,10 +93,11 @@ def run_applescript(moment_name, dest_dir):
                 export itemsToExport to destFolder with using originals
             end if
             
-            set AppleScript's text item delimiters to ","
-            set idsString to exportedIds as string
-            set AppleScript's text item delimiters to ""
-            return idsString
+            set oldDelims to AppleScript's text item delimiters
+            set AppleScript's text item delimiters to "\\n"
+            set resultsString to results as string
+            set AppleScript's text item delimiters to oldDelims
+            return resultsString
         end tell
     end run
     '''
@@ -127,15 +128,37 @@ def main():
         logger.error(f"❌ AppleScript Error: {result}")
         sys.exit(1)
 
-    # Parse exported asset IDs
-    raw_ids = [item.strip() for item in result.split(",") if item.strip()]
+    # Parse exported asset IDs and filenames
+    lines = [line.strip() for line in result.split("\n") if line.strip()]
     asset_ids = []
-    for rid in raw_ids:
-        # Extract UUID (part before first slash, e.g. "8E0CE138-0096-4A73-A338-709B5AD8A758/L0/001")
-        uuid = rid.split("/")[0]
-        asset_ids.append(uuid)
+    expected_filenames = []
+    for line in lines:
+        if '|' in line:
+            rid, fname = line.split('|', 1)
+            # Extract UUID (part before first slash, e.g. "8E0CE138-0096-4A73-A338-709B5AD8A758/L0/001")
+            uuid = rid.split("/")[0]
+            asset_ids.append(uuid)
+            expected_filenames.append(fname)
 
     logger.info(f"✅ Successfully verified/exported {len(asset_ids)} items to {dest_dir}")
+
+    # Prune extra files in dest_dir that do not correspond to the curated album assets
+    expected_bases = set(os.path.splitext(f)[0].lower() for f in expected_filenames)
+    if os.path.exists(dest_dir):
+        try:
+            pruned_count = 0
+            for f in os.listdir(dest_dir):
+                file_path = os.path.join(dest_dir, f)
+                if os.path.isfile(file_path) and not f.startswith('.'):
+                    f_base = os.path.splitext(f)[0].lower()
+                    if f_base not in expected_bases:
+                        os.remove(file_path)
+                        logger.info(f"🗑️ Pruned extra file from curated directory: {f}")
+                        pruned_count += 1
+            if pruned_count > 0:
+                logger.info(f"✅ Pruned {pruned_count} extra/stale files from {dest_dir}")
+        except Exception as e:
+            logger.warning(f"Failed to prune extra files in {dest_dir}: {e}")
 
     # Record in database
     if not os.path.exists(MEDIA_ORGANIZER_DB_PATH):

@@ -98,6 +98,7 @@ def sync_assets(media_cursor, logger):
             AND (p.ZTITLE IN ('Moments' ) )
             AND ga.ZTRASHEDSTATE = 0
             AND ga.ZKIND <> 1507
+            AND ga.ZTITLE NOT IN ('SkipPublishing', 'Ignore')
             ORDER BY (CASE WHEN p.ZTITLE = 'Moments' THEN 0 ELSE 1 END) ASC LIMIT 1) as MomentsAlbumName,
             (SELECT 1 FROM Z_30ASSETS aa 
             JOIN ZGENERICALBUM ga ON ga.Z_PK = aa.Z_30ALBUMS 

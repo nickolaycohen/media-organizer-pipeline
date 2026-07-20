@@ -1,3 +1,9 @@
+-- 
+select * from ranked_assets_view rav 
+order by rav.score_normalized desc
+-- 
+select * from moments m 
+
 -- all google favs by month
 select month, count(*)
 from assets a 

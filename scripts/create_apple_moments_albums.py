@@ -267,6 +267,11 @@ def cleanup_empty_filesystem_dirs(root_dir):
     deleted_dirs = []
     # Bottom-up walk to ensure nested folders are processed and deleted before parent folders
     for dirpath, dirnames, filenames in os.walk(root_dir, topdown=False):
+        # Skip any path that is or is inside SkipPublishing folder tree
+        path_parts = [p.lower() for p in dirpath.split(os.sep)]
+        if "skippublishing" in path_parts:
+            continue
+
         for dirname in dirnames:
             if dirname.lower() == "skippublishing":
                 continue

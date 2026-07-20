@@ -639,18 +639,32 @@ def run_memory_publishing_flow(cursor, conn):
     logger.info("🎨 Starting Memory Feature & Publishing session...")
     from constants import CURATED_LACIE_DIR, TO_BE_CURATED_DIR
     import math
-    
-    # 1. Fetch the cutoff threshold score
-    cursor.execute("""
-        SELECT v.score_normalized FROM ranked_assets_view v
-        JOIN month_batches mb ON v.month = mb.month
-        WHERE mb.status_code >= '600' AND (v.MomentsAlbumName IS NULL OR v.MomentsAlbumName = '') 
-        ORDER BY v.score_normalized DESC LIMIT 1
-    """)
-    row = cursor.fetchone()
-    cutoff_score = row[0] if row and row[0] is not None else 0.0
-    logger.info(f"Cutoff threshold score: {cutoff_score:.4f}")
 
+    # Create threshold_history table if it doesn't exist
+    try:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS threshold_history (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                recorded_at_utc    TEXT NOT NULL DEFAULT (datetime('now')),
+                threshold_score     REAL NOT NULL,
+                notes               TEXT
+            )
+        """)
+        conn.commit()
+    except Exception as e:
+        logger.warning(f"Could not initialize threshold_history table: {e}")
+
+    # Fetch historical minimum threshold
+    historical_min = 0.0
+    try:
+        cursor.execute("SELECT MIN(threshold_score) FROM threshold_history WHERE threshold_score > 0.0")
+        row = cursor.fetchone()
+        if row and row[0] is not None:
+            historical_min = row[0]
+            logger.info(f"Loaded historical minimum threshold from DB: {historical_min:.4f}")
+    except Exception as e:
+        logger.warning(f"Could not fetch historical minimum threshold: {e}")
+    
     while True:
         # Clear/rollback any open transactions to get a fresh snapshot of the database
         try:
@@ -658,8 +672,7 @@ def run_memory_publishing_flow(cursor, conn):
         except Exception:
             pass
 
-        # Check for highly ranked assets that do not belong to any Moment in Apple Photos
-        # Try attaching Apple Photos DB copy to fetch Apple's auto-generated moments
+        # Try attaching Apple Photos DB copy to fetch Apple's auto-generated moments and filter ignored items
         photos_db_attached = False
         try:
             from constants import APPLE_PHOTOS_DB_COPY_PATH
@@ -676,6 +689,77 @@ def run_memory_publishing_flow(cursor, conn):
         except Exception as e:
             logger.warning(f"Could not attach Photos.sqlite for Apple moment lookup: {e}")
 
+        # Fetch the cutoff threshold score (dynamically on each loop iteration, excluding Ignore folder items)
+        cutoff_score = 0.0
+        if photos_db_attached:
+            try:
+                cursor.execute("""
+                    SELECT v.score_normalized FROM ranked_assets_view v
+                    JOIN month_batches mb ON v.month = mb.month
+                    LEFT JOIN photos_db.ZASSET a ON a.ZUUID = v.asset_id
+                    WHERE mb.status_code >= '600' AND (v.MomentsAlbumName IS NULL OR v.MomentsAlbumName = '') 
+                      AND (a.Z_PK IS NULL OR NOT EXISTS (
+                          SELECT 1 FROM photos_db.Z_30ASSETS aa
+                          JOIN photos_db.ZGENERICALBUM ga ON aa.Z_30ALBUMS = ga.Z_PK
+                          WHERE aa.Z_3ASSETS = a.Z_PK
+                            AND LOWER(ga.ZTITLE) IN ('ignore', 'skippublishing')
+                            AND ga.ZTRASHEDSTATE = 0
+                      ))
+                    ORDER BY v.score_normalized DESC LIMIT 1
+                """)
+                row = cursor.fetchone()
+                cutoff_score = row[0] if row and row[0] is not None else 0.0
+            except Exception as e:
+                logger.warning(f"Error querying cutoff score with photos_db: {e}")
+        
+        if cutoff_score == 0.0:
+            try:
+                cursor.execute("""
+                    SELECT v.score_normalized FROM ranked_assets_view v
+                    JOIN month_batches mb ON v.month = mb.month
+                    WHERE mb.status_code >= '600' AND (v.MomentsAlbumName IS NULL OR v.MomentsAlbumName = '') 
+                    ORDER BY v.score_normalized DESC LIMIT 1
+                """)
+                row = cursor.fetchone()
+                cutoff_score = row[0] if row and row[0] is not None else 0.0
+            except Exception:
+                pass
+                
+        logger.info(f"Cutoff threshold score: {cutoff_score:.4f}")
+
+        # Record cutoff score in threshold_history if it is a valid positive value
+        if cutoff_score > 0.0:
+            try:
+                cursor.execute("INSERT INTO threshold_history (threshold_score) VALUES (?)", (cutoff_score,))
+                conn.commit()
+                # Update running historical_min if this is the first recorded threshold or it is smaller
+                if historical_min == 0.0 or cutoff_score < historical_min:
+                    historical_min = cutoff_score
+            except Exception as e:
+                logger.warning(f"Could not record threshold in history: {e}")
+
+        # Display threshold status summary
+        print("\n==================================================")
+        print("📊 Curation Threshold Status")
+        print("==================================================")
+        print(f" - Current dynamic threshold:  {cutoff_score:.4f}")
+        if historical_min > 0.0:
+            print(f" - Historical minimum target:  {historical_min:.4f}")
+            if cutoff_score > historical_min:
+                print(f"👉 Note: Please assign moments to assets in new batches until the threshold reaches {historical_min:.4f} again.")
+            else:
+                print(f"🎉 Threshold aligned! Current threshold matches or is below historical minimum.")
+        else:
+            print(" - Historical minimum target:  None (No history recorded yet)")
+            print("👉 Note: Once you begin assigning moments, the lowest dynamic threshold reached will be tracked.")
+        print("==================================================\n")
+
+        # Determine effective cutoff threshold to use for selecting qualified moments in the table
+        effective_threshold = cutoff_score
+        if historical_min > 0.0:
+            effective_threshold = min(cutoff_score, historical_min) if cutoff_score > 0.0 else historical_min
+
+        # Check for highly ranked assets that do not belong to any Moment in Apple Photos (excluding Ignore items)
         if photos_db_attached:
             cursor.execute("""
                 SELECT 
@@ -690,7 +774,14 @@ def run_memory_publishing_flow(cursor, conn):
                 LEFT JOIN photos_db.ZASSET a ON a.ZUUID = v.asset_id
                 LEFT JOIN photos_db.ZMOMENT m ON a.ZMOMENT = m.Z_PK
                 WHERE mb.status_code >= '600' AND (v.MomentsAlbumName IS NULL OR v.MomentsAlbumName = '')
-                  AND v.score_normalized > 0.55
+                  AND v.score_normalized > 0.50
+                  AND (a.Z_PK IS NULL OR NOT EXISTS (
+                      SELECT 1 FROM photos_db.Z_30ASSETS aa
+                      JOIN photos_db.ZGENERICALBUM ga ON aa.Z_30ALBUMS = ga.Z_PK
+                      WHERE aa.Z_3ASSETS = a.Z_PK
+                        AND LOWER(ga.ZTITLE) IN ('ignore', 'skippublishing')
+                        AND ga.ZTRASHEDSTATE = 0
+                  ))
                 ORDER BY v.score_normalized DESC
                 LIMIT 5
             """)
@@ -700,18 +791,12 @@ def run_memory_publishing_flow(cursor, conn):
                 FROM ranked_assets_view v
                 JOIN month_batches mb ON v.month = mb.month
                 WHERE mb.status_code >= '600' AND (v.MomentsAlbumName IS NULL OR v.MomentsAlbumName = '')
-                  AND v.score_normalized > 0.55
+                  AND v.score_normalized > 0.50
                 ORDER BY v.score_normalized DESC
                 LIMIT 5
             """)
 
         unassigned = cursor.fetchall()
-
-        if photos_db_attached:
-            try:
-                cursor.execute("DETACH DATABASE photos_db;")
-            except Exception as e:
-                logger.warning(f"Could not detach Photos.sqlite: {e}")
 
         if unassigned:
             print("\n==================================================")
@@ -761,10 +846,11 @@ def run_memory_publishing_flow(cursor, conn):
             FROM ranked_assets_view v
             JOIN month_batches mb ON v.month = mb.month
             WHERE mb.status_code >= '600' AND v.MomentsAlbumName IS NOT NULL AND v.MomentsAlbumName != ''
+              AND LOWER(v.MomentsAlbumName) NOT IN ('skippublishing', 'ignore')
               AND v.score_normalized > ?
             ORDER BY v.score_normalized DESC
         """
-        cursor.execute(query, (cutoff_score,))
+        cursor.execute(query, (effective_threshold,))
         rows = cursor.fetchall()
         
         # Group by moment name
@@ -901,13 +987,15 @@ def run_memory_publishing_flow(cursor, conn):
             # fallback to database curated count if present, otherwise total qualified proposed assets)
             fs_curated_path = os.path.join(CURATED_LACIE_DIR, name)
             fs_count = 0
+            fs_bases = set()
             if os.path.exists(fs_curated_path):
                 try:
                     all_files = [f for f in os.listdir(fs_curated_path) 
                                  if os.path.isfile(os.path.join(fs_curated_path, f)) 
                                  and not f.startswith('.')]
                     # Group by base name to treat Live Photos (HEIC + MOV) as a single asset
-                    fs_count = len(set(os.path.splitext(f)[0].lower() for f in all_files))
+                    fs_bases = set(os.path.splitext(f)[0].lower() for f in all_files)
+                    fs_count = len(fs_bases)
                 except Exception:
                     pass
 
@@ -921,12 +1009,47 @@ def run_memory_publishing_flow(cursor, conn):
             else:
                 assets_display = str(data['total_qualified'])
 
+            # Compare Apple Photos Curated album assets with local filesystem folder contents
+            curated_str = "❌ No"
+            if curated_exists and fs_curated_exists:
+                # Retrieve Apple Photos Curated album asset base names from Photos DB
+                photos_bases = set()
+                if photos_db_attached:
+                    try:
+                        cursor.execute("""
+                            SELECT DISTINCT aaa.ZORIGINALFILENAME
+                            FROM photos_db.ZGENERICALBUM ga
+                            JOIN photos_db.Z_30ASSETS aa ON aa.Z_30ALBUMS = ga.Z_PK
+                            JOIN photos_db.ZASSET a ON aa.Z_3ASSETS = a.Z_PK
+                            JOIN photos_db.ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK
+                            LEFT JOIN photos_db.ZGENERICALBUM p ON ga.ZPARENTFOLDER = p.Z_PK
+                            WHERE ga.ZTITLE = ? AND ga.ZTRASHEDSTATE = 0 AND ga.ZKIND <> 1507
+                              AND p.ZTITLE = 'Curated'
+                        """, (name,))
+                        photos_bases = set(os.path.splitext(row[0])[0].lower() for row in cursor.fetchall() if row[0])
+                    except Exception as e:
+                        logger.warning(f"Error querying Photos curated album assets for {name}: {e}")
+
+                if photos_db_attached and photos_bases:
+                    if photos_bases == fs_bases:
+                        curated_str = "✅ Yes"
+                    else:
+                        curated_str = "⚠️  Mismatch"
+                else:
+                    curated_str = "✅ Yes"
+            elif curated_exists and not fs_curated_exists:
+                curated_str = "📁 Needs Folder"
+            elif not curated_exists and fs_curated_exists:
+                curated_str = "📁 Local Only"
+
             ranked_moments.append({
                 'name': name,
                 'total_qualified': data['total_qualified'],
                 'proposed_count': data['proposed_count'],
                 'curated_count': data['curated_count'],
                 'avg_score': avg_score,
+                'min_score': min(data['scores']) if data['scores'] else 0.0,
+                'max_score': max(data['scores']) if data['scores'] else 0.0,
                 'rank_score': rank_score,
                 'stage': stage,
                 'to_be_curated_exists': to_be_curated_exists,
@@ -934,38 +1057,61 @@ def run_memory_publishing_flow(cursor, conn):
                 'fs_curated_exists': fs_curated_exists,
                 'last_pub_str': last_pub_str,
                 'can_publish_str': can_publish_str,
-                'assets_display': assets_display
+                'assets_display': assets_display,
+                'curated_str': curated_str
             })
+
+        # Detach photos_db now that we are done querying it for moments list
+        if photos_db_attached:
+            try:
+                cursor.execute("DETACH DATABASE photos_db;")
+            except Exception as e:
+                logger.warning(f"Could not detach Photos.sqlite: {e}")
 
         # Sort by: 1. Needs update (proposed + curated < total_qualified), 2. Stage (M100 first), 3. Rank score descending
         ranked_moments.sort(key=lambda x: (
             (x['proposed_count'] + x['curated_count']) < x['total_qualified'],
-            x['stage'] == 'M500',  # Put published at the bottom
+            x['stage'] != 'M500',  # Put published at the bottom
             x['rank_score']
         ), reverse=True)
 
-        print(f"{'No.':<4} {'Moment Name':<30} {'Rank Score':<12} {'Avg Score':<10} {'Assets':<8} {'ToBeCurated?':<13} {'Curated?':<9} {'Published?':<11} {'Can Publish?':<13} {'Last Published':<15}")
-        print("-" * 135)
+        print(f"{'No.':<4} {'Moment Name':<30} {'Rank Score':<12} {'Avg Score':<10} {'Min Score':<10} {'Max Score':<10} {'Assets':<8} {'ToBeCurated?':<13} {'Curated?':<15} {'Published?':<11} {'Can Publish?':<13} {'Last Published':<15}")
+        print("-" * 160)
+        divider_printed = False
         for idx, m in enumerate(ranked_moments, 1):
+            is_needs_update = (m['proposed_count'] + m['curated_count']) < m['total_qualified']
+            if not is_needs_update and not divider_printed:
+                if idx > 1:
+                    print("-" * 160)
+                    print(f"--- Up-To-Date Moments " + "-" * 137)
+                    print("-" * 160)
+                divider_printed = True
+
             to_be_curated_str = "✅ Yes" if m['to_be_curated_exists'] else "❌ No"
             if (m['proposed_count'] + m['curated_count']) < m['total_qualified'] and m['to_be_curated_exists']:
                 to_be_curated_str = "🔄 Update needed"
             
-            curated_str = "✅ Yes" if m['curated_exists'] else "❌ No"
-            if m['curated_exists'] and not m['fs_curated_exists']:
-                curated_str = "📁 Needs Folder"
-                
+            curated_str = m['curated_str']
             published_str = "✅ Yes" if m['stage'] == 'M500' else "❌ No"
-            print(f"{idx:<4} {m['name']:<30} {m['rank_score']:<12.4f} {m['avg_score']:<10.4f} {m['assets_display']:<8} {to_be_curated_str:<13} {curated_str:<9} {published_str:<11} {m['can_publish_str']:<13} {m['last_pub_str']:<15}")
+            print(f"{idx:<4} {m['name']:<30} {m['rank_score']:<12.4f} {m['avg_score']:<10.4f} {m['min_score']:<10.4f} {m['max_score']:<10.4f} {m['assets_display']:<8} {to_be_curated_str:<13} {curated_str:<15} {published_str:<11} {m['can_publish_str']:<13} {m['last_pub_str']:<15}")
 
         print("\n--- Actions ---")
         print(" [1] Sync proposed assets to ToBeCurated albums in Apple Photos")
         print(" [2] Export Curated album from Apple Photos to LaCie filesystem")
-        print(" [3] Record publication in the database (Mark as Published to Shutterfly)")
+        print(" [3] Record publication in the database (Mark as Published to Shutterfly/YouTube)")
+        print(" [R] Restart the planner")
         print(" [E] Exit")
         
         choice = input("\nSelect action: ").strip().lower()
-        if choice == '1':
+        if choice == 'r':
+            logger.info("Restarting planner...")
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        elif choice == '1':
             script_dir = os.path.dirname(os.path.abspath(__file__))
             logger.info("Syncing proposed assets to Apple Photos...")
             try:
@@ -1018,10 +1164,10 @@ def run_memory_publishing_flow(cursor, conn):
                 print(f"⚠️ No curated assets found in the DB for '{moment_name}'. Please export the Curated album first.")
                 continue
                 
-            confirm = input(f"Confirm publication of {len(curated_assets)} assets of '{moment_name}' to Shutterfly? [y/N]: ").strip().lower()
+            confirm = input(f"Confirm publication of {len(curated_assets)} assets of '{moment_name}' to Shutterfly/YouTube? [y/N]: ").strip().lower()
             if confirm == 'y':
                 try:
-                    pub_data = [(aid, moment_name, 'Shutterfly') for aid in curated_assets]
+                    pub_data = [(aid, moment_name, 'Shutterfly/YouTube') for aid in curated_assets]
                     cursor.executemany("""
                         INSERT INTO publications (asset_id, moment_name, platform, published_at_utc)
                         VALUES (?, ?, ?, datetime('now'))

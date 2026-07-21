@@ -839,23 +839,95 @@ def run_memory_publishing_flow(cursor, conn):
                 print(f" - {fname:<25} (Score: {score:.4f}, Captured: {captured_str}, Month: {month}{suggested_info})")
             print("👉 Please consider creating a corresponding album under 'Media Organizer on LaCie / Moments' in Apple Photos (creating the album is sufficient, no need to place the files inside).\n")
         # 2. Query assets that have Moments and are in status >= 600
-        query = """
-            SELECT v.asset_id, v.MomentsAlbumName, v.score_normalized, v.original_filename,
-                   (SELECT 1 FROM moment_exports me WHERE me.asset_id = v.asset_id AND me.curation_stage = 'to_be_curated') as is_proposed,
-                   (SELECT 1 FROM moment_exports me WHERE me.asset_id = v.asset_id AND me.curation_stage = 'curated') as is_curated
-            FROM ranked_assets_view v
-            JOIN month_batches mb ON v.month = mb.month
-            WHERE mb.status_code >= '600' AND v.MomentsAlbumName IS NOT NULL AND v.MomentsAlbumName != ''
-              AND LOWER(v.MomentsAlbumName) NOT IN ('skippublishing', 'ignore')
-              AND v.score_normalized > ?
-            ORDER BY v.score_normalized DESC
-        """
+        if photos_db_attached:
+            query = """
+                SELECT v.asset_id, v.MomentsAlbumName, v.score_normalized, v.original_filename,
+                       v.aesthetic_score, v.google_favorite, v.apple_favorite, v.apple_photos_monthly_selection,
+                       (SELECT 1 FROM moment_exports me WHERE me.asset_id = v.asset_id AND me.curation_stage = 'to_be_curated') as is_proposed,
+                       (SELECT 1 FROM moment_exports me WHERE me.asset_id = v.asset_id AND me.curation_stage = 'curated') as is_curated,
+                       (SELECT album_name FROM moment_exports me WHERE me.asset_id = v.asset_id ORDER BY exported_at_utc DESC LIMIT 1) as exported_album_name,
+                       ast.curated_album
+                FROM ranked_assets_view v
+                JOIN assets ast ON v.asset_id = ast.asset_id
+                JOIN month_batches mb ON v.month = mb.month
+                LEFT JOIN photos_db.ZASSET a ON a.ZUUID = v.asset_id
+                WHERE mb.status_code >= '600' AND v.MomentsAlbumName IS NOT NULL AND v.MomentsAlbumName != ''
+                  AND LOWER(v.MomentsAlbumName) NOT IN ('skippublishing', 'ignore')
+                  AND v.score_normalized > ?
+                  AND (a.Z_PK IS NULL OR NOT EXISTS (
+                      SELECT 1 FROM photos_db.Z_30ASSETS aa
+                      JOIN photos_db.ZGENERICALBUM ga ON aa.Z_30ALBUMS = ga.Z_PK
+                      WHERE aa.Z_3ASSETS = a.Z_PK
+                        AND LOWER(ga.ZTITLE) IN ('ignore', 'skippublishing')
+                        AND ga.ZTRASHEDSTATE = 0
+                  ))
+                ORDER BY v.score_normalized DESC
+            """
+        else:
+            query = """
+                SELECT v.asset_id, v.MomentsAlbumName, v.score_normalized, v.original_filename,
+                       v.aesthetic_score, v.google_favorite, v.apple_favorite, v.apple_photos_monthly_selection,
+                       (SELECT 1 FROM moment_exports me WHERE me.asset_id = v.asset_id AND me.curation_stage = 'to_be_curated') as is_proposed,
+                       (SELECT 1 FROM moment_exports me WHERE me.asset_id = v.asset_id AND me.curation_stage = 'curated') as is_curated,
+                       (SELECT album_name FROM moment_exports me WHERE me.asset_id = v.asset_id ORDER BY exported_at_utc DESC LIMIT 1) as exported_album_name,
+                       ast.curated_album
+                FROM ranked_assets_view v
+                JOIN assets ast ON v.asset_id = ast.asset_id
+                JOIN month_batches mb ON v.month = mb.month
+                WHERE mb.status_code >= '600' AND v.MomentsAlbumName IS NOT NULL AND v.MomentsAlbumName != ''
+                  AND LOWER(v.MomentsAlbumName) NOT IN ('skippublishing', 'ignore')
+                  AND v.score_normalized > ?
+                ORDER BY v.score_normalized DESC
+            """
         cursor.execute(query, (effective_threshold,))
         rows = cursor.fetchall()
+
+        # Display qualified assets scoring components breakdown table
+        print("\n=========================================================================================================================")
+        print("📸 Qualified Assets Scoring Breakdown")
+        print("=========================================================================================================================")
+        print(f"{'No.':<4} {'Filename':<25} {'Assigned Album':<30} {'Norm Score':<12} {'Aesthetic':<12} {'Google Fav':<12} {'Apple Fav':<12} {'Monthly Sel':<12}")
+        print("-" * 125)
+        
+        # Calculate counts of assets in each assigned album
+        album_counts = {}
+        processed_rows = []
+        for row in rows:
+            assigned_album = row[10] if row[10] else (row[11] if row[11] else "—")
+            processed_rows.append((row, assigned_album))
+            album_counts[assigned_album] = album_counts.get(assigned_album, 0) + 1
+            
+        # Sort by: 1. not unassigned ('—' at bottom), 2. album size descending, 3. album name ascending, 4. normalized score descending
+        processed_rows.sort(
+            key=lambda x: (
+                x[1] == "—",
+                -album_counts[x[1]],
+                x[1],
+                -(x[0][2] if x[0][2] is not None else 0.0)
+            )
+        )
+        
+        for idx, (row, assigned_album) in enumerate(processed_rows, 1):
+            filename = row[3] if row[3] else "—"
+            
+            score_normalized_val = row[2]
+            score_normalized_str = f"{score_normalized_val:.4f}" if score_normalized_val is not None else "—"
+            
+            aesthetic_score_val = row[4]
+            aesthetic_score_str = f"{aesthetic_score_val:.4f}" if aesthetic_score_val is not None else "—"
+            
+            google_fav = "✅ Yes" if row[5] else "❌ No"
+            apple_fav = "✅ Yes" if row[6] else "❌ No"
+            monthly_sel = "✅ Yes" if row[7] else "❌ No"
+            
+            print(f"{idx:<4} {filename:<25} {assigned_album:<30} {score_normalized_str:<12} {aesthetic_score_str:<12} {google_fav:<12} {apple_fav:<12} {monthly_sel:<12}")
+        print("=========================================================================================================================\n")
         
         # Group by moment name
         moments_data = {}
-        for asset_id, moment_name, score, filename, is_proposed, is_curated in rows:
+        for row in rows:
+            asset_id, moment_name, score, filename = row[0], row[1], row[2], row[3]
+            is_proposed, is_curated = row[8], row[9]
             if moment_name not in moments_data:
                 moments_data[moment_name] = {
                     'total_qualified': 0,

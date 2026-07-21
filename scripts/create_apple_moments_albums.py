@@ -328,17 +328,34 @@ def main():
         return
 
     # Establish the cutoff threshold: the score of the first asset without a Moment
-    threshold_score = None
+    cutoff_score = None
     for r in rows:
         if not r[1]: # moment_name is index 1
-            threshold_score = r[2] # score_normalized is index 2
+            cutoff_score = r[2] # score_normalized is index 2
             logger.info(f"🛑 Found first asset without a Moment. Cutoff threshold established at score: {r[2]:.4f}")
             break
 
-    if threshold_score is None:
-        logger.warning("No assets without Moments found to establish a cutoff threshold.")
+    # Fetch historical minimum threshold
+    historical_min = 0.0
+    try:
+        cursor.execute("SELECT MIN(threshold_score) FROM threshold_history WHERE threshold_score > 0.0")
+        hist_row = cursor.fetchone()
+        if hist_row and hist_row[0] is not None:
+            historical_min = hist_row[0]
+            logger.info(f"Loaded historical minimum threshold from DB: {historical_min:.4f}")
+    except Exception as e:
+        logger.warning(f"Could not fetch historical minimum threshold: {e}")
+
+    if cutoff_score is None and historical_min == 0.0:
+        logger.warning("No assets without Moments found to establish a cutoff threshold, and no historical minimum found.")
         conn.close()
         return
+
+    effective_threshold = cutoff_score if cutoff_score is not None else 0.0
+    if historical_min > 0.0:
+        effective_threshold = min(cutoff_score, historical_min) if cutoff_score is not None and cutoff_score > 0.0 else historical_min
+    
+    logger.info(f"Using effective cutoff threshold: {effective_threshold:.4f}")
 
     # Check filesystem folder existence for each unique album name
     album_folder_exists = {}
@@ -357,13 +374,13 @@ def main():
     album_candidates = {}
     for r in rows:
         asset_id, album_name, score, db_exported_id = r
-        if score > threshold_score and album_name:
+        if score > effective_threshold and album_name:
             if album_name not in album_candidates:
                 album_candidates[album_name] = []
             album_candidates[album_name].append(r)
 
     if not album_candidates:
-        logger.warning(f"No assets found above the cutoff threshold of {threshold_score:.4f}.")
+        logger.warning(f"No assets found above the cutoff threshold of {effective_threshold:.4f}.")
         conn.close()
         return
 

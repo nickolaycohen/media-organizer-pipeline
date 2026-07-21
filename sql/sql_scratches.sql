@@ -1,3 +1,24 @@
+select 	
+/*	case 
+		when a.aesthetic_score between 0 and .25 then '0-.25'
+		when a.aesthetic_score between 0.25 and 0.3125 then '0.25-0.3125'
+		when a.aesthetic_score between 0.3125 and .375 then '.3175-.375'
+		when a.aesthetic_score between 0.375 and .4375 then '.375-.4375'
+		when a.aesthetic_score between 0.4375 and .5 then '.4375-.5'
+		when a.aesthetic_score between 0.5 and 0.625 then '.5-0.625'
+		when a.aesthetic_score between 0.625 and .75 then '.625-.75'
+		when a.aesthetic_score between 0.75 and 1 then 1		
+	else .75 */
+	case 
+		when aesthetic_score >  0.5341 then 1
+		else 0
+	end as score_range
+	, count()
+from assets a
+group by score_range;
+--0	180551
+--1	28378 - 15.7%
+
 -- 
 select * from ranked_assets_view rav 
 order by rav.score_normalized desc

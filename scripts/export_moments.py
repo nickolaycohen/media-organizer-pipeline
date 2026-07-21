@@ -35,25 +35,43 @@ def main():
     
     cursor.execute(query)
     rows = cursor.fetchall()
+    
+    # Fetch historical minimum threshold
+    historical_min = 0.0
+    try:
+        cursor.execute("SELECT MIN(threshold_score) FROM threshold_history WHERE threshold_score > 0.0")
+        hist_row = cursor.fetchone()
+        if hist_row and hist_row[0] is not None:
+            historical_min = hist_row[0]
+            logger.info(f"Loaded historical minimum threshold from DB: {historical_min:.4f}")
+    except Exception as e:
+        logger.warning(f"Could not fetch historical minimum threshold: {e}")
+        
     conn.close()
 
     # Find the cutoff threshold: the score of the first asset with a NULL Moment
-    threshold_score = None
+    cutoff_score = None
     for filename, month, moment_name, score in rows:
         if not moment_name:
-            threshold_score = score
+            cutoff_score = score
             logger.info(f"🛑 Found first asset without a Moment: {filename} (Score: {score:.4f}). Cutoff threshold established.")
             break
 
-    if threshold_score is None:
-        logger.warning("No assets with NULL Moments found to establish a cutoff threshold.")
+    if cutoff_score is None and historical_min == 0.0:
+        logger.warning("No assets with NULL Moments found to establish a cutoff threshold, and no historical minimum found.")
         return
 
+    effective_threshold = cutoff_score if cutoff_score is not None else 0.0
+    if historical_min > 0.0:
+        effective_threshold = min(cutoff_score, historical_min) if cutoff_score is not None and cutoff_score > 0.0 else historical_min
+    
+    logger.info(f"Using effective cutoff threshold: {effective_threshold:.4f}")
+
     # Export assets that have a score strictly higher than the threshold asset and have a valid Moment name
-    export_list = [r for r in rows if r[3] > threshold_score and r[2]]
+    export_list = [r for r in rows if r[3] > effective_threshold and r[2]]
 
     if not export_list:
-        logger.warning(f"No assets with Moments found with a score higher than {threshold_score:.4f}.")
+        logger.warning(f"No assets with Moments found with a score higher than {effective_threshold:.4f}.")
         return
 
     logger.info(f"✨ Found {len(export_list)} assets categorized into Moments to export.")

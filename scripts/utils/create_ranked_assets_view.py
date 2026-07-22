@@ -22,11 +22,12 @@ def create_view():
         a.google_favorite,
         a.apple_favorite,
         a.apple_photos_monthly_selection,
+        a.mobile_apple_photos_featured_photos,
         (
             (COALESCE(a.aesthetic_score, 0) * 0.875) + 
             (a.google_favorite * 0.125) + 
-            (a.apple_photos_monthly_selection * 0.15)
-            + (a.apple_favorite * 0.125)
+            (a.apple_photos_monthly_selection * 0.15) +
+            (a.mobile_apple_photos_featured_photos * 0.15)
         ) AS score_normalized,
         a.date_created_utc,
         a.MomentsAlbumName

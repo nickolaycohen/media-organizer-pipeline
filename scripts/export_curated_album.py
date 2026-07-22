@@ -204,5 +204,15 @@ def main():
     finally:
         conn.close()
 
+    # Run the deduplication utility on the exported curated folder
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    dedup_script = os.path.join(script_dir, "deduplicate_assets.py")
+    logger.info(f"🔄 Running deduplication on curated export directory: {dest_dir}")
+    try:
+        subprocess.run(["python3", dedup_script, dest_dir], check=True)
+        logger.info("✅ Deduplication of curated album complete.")
+    except subprocess.CalledProcessError as e:
+        logger.error(f"❌ Deduplication failed: {e}")
+
 if __name__ == "__main__":
     main()

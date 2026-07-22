@@ -842,7 +842,7 @@ def run_memory_publishing_flow(cursor, conn):
         if photos_db_attached:
             query = """
                 SELECT v.asset_id, v.MomentsAlbumName, v.score_normalized, v.original_filename,
-                       v.aesthetic_score, v.google_favorite, v.apple_favorite, v.apple_photos_monthly_selection,
+                       v.aesthetic_score, v.google_favorite, v.mobile_apple_photos_featured_photos, v.apple_photos_monthly_selection,
                        (SELECT 1 FROM moment_exports me WHERE me.asset_id = v.asset_id AND me.curation_stage = 'to_be_curated') as is_proposed,
                        (SELECT 1 FROM moment_exports me WHERE me.asset_id = v.asset_id AND me.curation_stage = 'curated') as is_curated,
                        (SELECT album_name FROM moment_exports me WHERE me.asset_id = v.asset_id ORDER BY exported_at_utc DESC LIMIT 1) as exported_album_name,
@@ -866,7 +866,7 @@ def run_memory_publishing_flow(cursor, conn):
         else:
             query = """
                 SELECT v.asset_id, v.MomentsAlbumName, v.score_normalized, v.original_filename,
-                       v.aesthetic_score, v.google_favorite, v.apple_favorite, v.apple_photos_monthly_selection,
+                       v.aesthetic_score, v.google_favorite, v.mobile_apple_photos_featured_photos, v.apple_photos_monthly_selection,
                        (SELECT 1 FROM moment_exports me WHERE me.asset_id = v.asset_id AND me.curation_stage = 'to_be_curated') as is_proposed,
                        (SELECT 1 FROM moment_exports me WHERE me.asset_id = v.asset_id AND me.curation_stage = 'curated') as is_curated,
                        (SELECT album_name FROM moment_exports me WHERE me.asset_id = v.asset_id ORDER BY exported_at_utc DESC LIMIT 1) as exported_album_name,
@@ -886,7 +886,7 @@ def run_memory_publishing_flow(cursor, conn):
         print("\n=========================================================================================================================")
         print("📸 Qualified Assets Scoring Breakdown")
         print("=========================================================================================================================")
-        print(f"{'No.':<4} {'Filename':<25} {'Assigned Album':<30} {'Norm Score':<12} {'Aesthetic':<12} {'Google Fav':<12} {'Apple Fav':<12} {'Monthly Sel':<12}")
+        print(f"{'No.':<4} {'Filename':<25} {'Assigned Album':<30} {'Norm Score':<12} {'Aesthetic':<12} {'Google Fav':<12} {'Apple Feat':<12} {'Monthly Sel':<12}")
         print("-" * 125)
         
         # Calculate counts of assets in each assigned album
@@ -917,10 +917,10 @@ def run_memory_publishing_flow(cursor, conn):
             aesthetic_score_str = f"{aesthetic_score_val:.4f}" if aesthetic_score_val is not None else "—"
             
             google_fav = "✅ Yes" if row[5] else "❌ No"
-            apple_fav = "✅ Yes" if row[6] else "❌ No"
+            apple_feat = "✅ Yes" if row[6] else "❌ No"
             monthly_sel = "✅ Yes" if row[7] else "❌ No"
             
-            print(f"{idx:<4} {filename:<25} {assigned_album:<30} {score_normalized_str:<12} {aesthetic_score_str:<12} {google_fav:<12} {apple_fav:<12} {monthly_sel:<12}")
+            print(f"{idx:<4} {filename:<25} {assigned_album:<30} {score_normalized_str:<12} {aesthetic_score_str:<12} {google_fav:<12} {apple_feat:<12} {monthly_sel:<12}")
         print("=========================================================================================================================\n")
         
         # Group by moment name

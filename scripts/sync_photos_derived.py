@@ -5,7 +5,7 @@ import argparse
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from utils.logger import setup_logger, close_logger
-from constants import LOG_PATH, MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_COPY_PATH, AESTHETIC_SCORE_WEIGHT, GOOGLE_FAVORITES_WEIGHT, APPLE_SELECTION_WEIGHT
+from constants import LOG_PATH, MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_COPY_PATH, AESTHETIC_SCORE_WEIGHT, GOOGLE_FAVORITES_WEIGHT, APPLE_SELECTION_WEIGHT, APPLE_FEATURED_WEIGHT
 from db.connections import get_connection, get_cursor, commit, close as close_conn
 
 MODULE_TAG = 'sync_photos_derived'
@@ -94,6 +94,7 @@ def sync_assets(media_cursor, logger):
             (SELECT ga.ZTITLE FROM ZGENERICALBUM ga 
             JOIN Z_30ASSETS aa ON aa.Z_30ALBUMS = ga.Z_PK 
             LEFT JOIN ZGENERICALBUM p ON ga.ZPARENTFOLDER = p.Z_PK 
+            LEFT JOIN ZGENERICALBUM gp ON p.ZPARENTFOLDER = gp.Z_PK 
             WHERE aa.Z_3ASSETS = a.Z_PK 
             AND (p.ZTITLE IN ('Moments' ) )
             AND ga.ZTRASHEDSTATE = 0
@@ -107,7 +108,15 @@ def sync_assets(media_cursor, logger):
             WHERE aa.Z_3ASSETS = a.Z_PK 
             AND (p.ZTITLE = 'Apple Photos Month Selection')
             AND ga.ZTRASHEDSTATE = 0
-            AND ga.ZKIND <> 1507 LIMIT 1) as apple_photos_monthly_selection
+            AND ga.ZKIND <> 1507 LIMIT 1) as apple_photos_monthly_selection,
+            (SELECT 1 FROM Z_30ASSETS aa 
+            JOIN ZGENERICALBUM ga ON ga.Z_PK = aa.Z_30ALBUMS 
+            LEFT JOIN ZGENERICALBUM p ON ga.ZPARENTFOLDER = p.Z_PK
+            LEFT JOIN ZGENERICALBUM gp ON p.ZPARENTFOLDER = gp.Z_PK
+            WHERE aa.Z_3ASSETS = a.Z_PK 
+            AND (p.ZTITLE = 'MobileApplePhotosFeaturedPhotos' OR gp.ZTITLE = 'MobileApplePhotosFeaturedPhotos')
+            AND ga.ZTRASHEDSTATE = 0
+            AND ga.ZKIND <> 1507 LIMIT 1) as mobile_apple_photos_featured_photos
         FROM ZASSET a
         JOIN ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK
         WHERE a.ZIMPORTSESSION IS NOT NULL
@@ -120,10 +129,10 @@ def sync_assets(media_cursor, logger):
     assets_to_insert = []
 
     for row in results:
-        asset_id, score, is_fav, filename, date_created, imported_date, import_id, month, MomentsAlbumName, selection_flag = row
+        asset_id, score, is_fav, filename, date_created, imported_date, import_id, month, MomentsAlbumName, selection_flag, featured_flag = row
         assets_to_insert.append((
             asset_id, score, is_fav, filename, date_created, imported_date, 
-            import_id, month, MomentsAlbumName, selection_flag or 0
+            import_id, month, MomentsAlbumName, selection_flag or 0, featured_flag or 0
         ))
 
     if assets_to_insert:
@@ -140,9 +149,10 @@ def sync_assets(media_cursor, logger):
                 month,
                 MomentsAlbumName,
                 apple_photos_monthly_selection,
+                mobile_apple_photos_featured_photos,
                 score_imported_at_utc,
                 updated_at_utc
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
             ON CONFLICT(asset_id) DO UPDATE SET
                 asset_id = excluded.asset_id,
                 aesthetic_score = excluded.aesthetic_score,
@@ -152,6 +162,7 @@ def sync_assets(media_cursor, logger):
                 imported_date_utc = excluded.imported_date_utc,
                 import_id = excluded.import_id,
                 apple_photos_monthly_selection = excluded.apple_photos_monthly_selection,
+                mobile_apple_photos_featured_photos = excluded.mobile_apple_photos_featured_photos,
                 score_imported_at_utc = datetime('now'),
                 updated_at_utc = datetime('now')
             WHERE asset_id IS NOT excluded.asset_id
@@ -160,7 +171,8 @@ def sync_assets(media_cursor, logger):
                OR COALESCE(CAST(import_id AS TEXT), '') IS NOT COALESCE(CAST(excluded.import_id AS TEXT), '')
                OR COALESCE(date_created_utc, '') IS NOT COALESCE(excluded.date_created_utc, '')
                OR COALESCE(MomentsAlbumName, '') IS NOT COALESCE(excluded.MomentsAlbumName, '')
-               OR COALESCE(apple_photos_monthly_selection, 0) IS NOT COALESCE(excluded.apple_photos_monthly_selection, 0);
+               OR COALESCE(apple_photos_monthly_selection, 0) IS NOT COALESCE(excluded.apple_photos_monthly_selection, 0)
+               OR COALESCE(mobile_apple_photos_featured_photos, 0) IS NOT COALESCE(excluded.mobile_apple_photos_featured_photos, 0);
         """, assets_to_insert)
         inserted_count = media_cursor.rowcount
         commit()
@@ -337,11 +349,12 @@ def sync_assets(media_cursor, logger):
             google_favorite,
             apple_favorite,
             apple_photos_monthly_selection,
+            mobile_apple_photos_featured_photos,
             (
                 (COALESCE(aesthetic_score, 0) * {AESTHETIC_SCORE_WEIGHT}) + 
                 (google_favorite * {GOOGLE_FAVORITES_WEIGHT}) + 
-                (apple_photos_monthly_selection * {APPLE_SELECTION_WEIGHT})
-                + (apple_favorite * {GOOGLE_FAVORITES_WEIGHT})
+                (apple_photos_monthly_selection * {APPLE_SELECTION_WEIGHT}) +
+                (mobile_apple_photos_featured_photos * {APPLE_FEATURED_WEIGHT})
             ) AS score_normalized,
             date_created_utc,
             MomentsAlbumName

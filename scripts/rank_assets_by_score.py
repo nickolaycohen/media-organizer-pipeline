@@ -24,9 +24,9 @@ def export_ranked_assets(month, threshold_score=0.6):
 
     # Query from view
     query = """
-        SELECT original_filename, score_normalized, google_favorite, aesthetic_score, apple_photos_monthly_selection
+        SELECT original_filename, score_normalized, google_favorite, aesthetic_score, apple_photos_monthly_selection, mobile_apple_photos_featured_photos
         FROM ranked_assets_view
-        WHERE month = ? AND (score_normalized >= ? OR google_favorite = 1 OR apple_photos_monthly_selection = 1)
+        WHERE month = ? AND (score_normalized >= ? OR google_favorite = 1 OR apple_photos_monthly_selection = 1 OR mobile_apple_photos_featured_photos = 1)
         ORDER BY score_normalized DESC;
     """
 
@@ -39,7 +39,7 @@ def export_ranked_assets(month, threshold_score=0.6):
         return
 
     # Prepare source and destination folders
-    fav_count = sum(1 for _, _, is_fav, _, is_sel in ranked_assets if is_fav or is_sel)
+    fav_count = sum(1 for row in ranked_assets if row[2] or row[4] or row[5])
     high_score_count = len(ranked_assets) - fav_count
     
     export_path = os.path.join(CURATED_EXPORT_DIR, month)
@@ -55,10 +55,11 @@ def export_ranked_assets(month, threshold_score=0.6):
     logger.info(f"🚀 Exporting curated assets to {export_path}...")
 
     exported_count = 0
-    for filename, score, is_fav, apple_score, is_sel in ranked_assets:
+    for filename, score, is_fav, apple_score, is_sel, is_feat in ranked_assets:
         fav_status = "Yes" if is_fav else "No"
         sel_status = "Yes" if is_sel else "No"
-        logger.info(f"  - {filename:40} | Total Score: {score:.4f} (Apple: {apple_score or 0.0:.4f}, Fav: {fav_status}, Sel: {sel_status})")
+        feat_status = "Yes" if is_feat else "No"
+        logger.info(f"  - {filename:40} | Total Score: {score:.4f} (Apple Score: {apple_score or 0.0:.4f}, Google Fav: {fav_status}, Monthly Sel: {sel_status}, Featured Feat: {feat_status})")
 
         source_file = os.path.join(source_root, filename)
         dest_file = os.path.join(export_path, filename)

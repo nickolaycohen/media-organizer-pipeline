@@ -76,21 +76,33 @@ def update_batch_asset_count(staging_path, retained_count):
 
 
 def main():
-    batch_month = sys.argv[1] if len(sys.argv) > 1 else None
-    if not batch_month:
-        logger.error("❌ Month parameter is required.")
+    import re
+    arg = sys.argv[1] if len(sys.argv) > 1 else None
+    if not arg:
+        logger.error("❌ Month parameter or directory path is required.")
         sys.exit(1)
 
-    staging_folder = STAGING_ROOT / batch_month
+    if os.path.isdir(arg):
+        staging_folder = Path(arg)
+        batch_month = staging_folder.name
+    else:
+        batch_month = arg
+        staging_folder = STAGING_ROOT / batch_month
+
     if not staging_folder.exists():
-        logger.warning(f"⚠️ Staging folder does not exist: {staging_folder}")
+        logger.warning(f"⚠️ Folder does not exist: {staging_folder}")
         return
 
-    logger.info(f"🔍 Deduplicating assets for batch: {batch_month} at {staging_folder}")
+    logger.info(f"🔍 Deduplicating assets at {staging_folder}")
     file_groups = collect_files(staging_folder)
     kept, removed = deduplicate_files(file_groups)
-    update_batch_asset_count(staging_folder, len(kept))
-    logger.info(f"✅ Deduplication complete for {batch_month}.")
+    
+    if re.match(r'^\d{4}-\d{2}$', batch_month):
+        update_batch_asset_count(staging_folder, len(kept))
+    else:
+        logger.info("ℹ️ Skipping database month batch update (not a standard YYYY-MM batch name).")
+        
+    logger.info(f"✅ Deduplication complete for {staging_folder}.")
 
 if __name__ == "__main__":
     main()

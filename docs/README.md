@@ -35,8 +35,11 @@ The pipeline is split into two phases: **Planning** and **Execution**.
 ```bash
 # Interactive mode (recommended)
 python3 scripts/pipeline_planner.py
+
+# Fast mode (skips copying and syncing the 13 GB Photos database)
+python3 scripts/pipeline_planner.py --no-sync
 ```
-This runs the bootstrap phase and prompts you to select either Batch Management (`[B]`) or Memory Feature & Publishing (`[M]`).
+This runs the bootstrap phase (which can be skipped using `--no-sync` if you want to bypass database syncing) and prompts you to select either Batch Management (`[B]`) or Memory Feature & Publishing (`[M]`).
 
 ### Step 2: Execute the Plan (For Batch Management)
 Once a monthly batch is planned under Batch Management, run the executor to perform the file operations.

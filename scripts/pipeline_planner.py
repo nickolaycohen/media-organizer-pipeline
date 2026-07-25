@@ -115,6 +115,30 @@ def run_bootstrap_steps(auto_apply, logger):
             else:
                 sys.exit(1)
 
+def print_assets_table(assets):
+    """
+    Prints a list of assets as a formatted table.
+    Each asset is a tuple or list: (filename, date_created_utc, uuid)
+    """
+    if not assets:
+        print("  No involved assets found.")
+        return
+    # Find max length of filenames for padding
+    max_len = max(len(row[0]) if row[0] else 8 for row in assets)
+    max_len = max(max_len, 8) # minimum width for "Filename"
+    
+    header = f"  {'Filename':<{max_len}} | {'Date Created':<19} | {'Asset UUID':<36}"
+    separator = "-" * (max_len + 3 + 19 + 3 + 36)
+    print(f"  {separator}")
+    print(header)
+    print(f"  {separator}")
+    for fname, dt, uuid in assets:
+        fname_str = fname if fname else "None"
+        dt_str = dt if dt else "None"
+        uuid_str = uuid if uuid else "None"
+        print(f"  {fname_str:<{max_len}} | {dt_str:<19} | {uuid_str:<36}")
+    print(f"  {separator}")
+
 def prompt_asset_level_triage(cursor, conn, import_uuids, camera_model, camera_make, month):
     """
     Prompts the user to ignore assets one by one for a given import/month/camera.
@@ -321,11 +345,28 @@ def check_active_sources_import_status(cursor, conn, month, auto_apply):
                         a = cursor.fetchone()
                         after_str = f"  After:   {a[0]} -> {a[1]} ({a[2]} to {a[3]})" if a and a[0] else "  After:   None"
 
+                        # Fetch involved assets to print table before prompt
+                        cursor.execute(f"""
+                            SELECT aaa.ZORIGINALFILENAME, datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime'), a.ZUUID
+                            FROM photos_db.ZASSET a
+                            JOIN photos_db.ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK
+                            LEFT JOIN photos_db.ZEXTENDEDATTRIBUTES ea ON ea.ZASSET = a.Z_PK
+                            WHERE a.ZIMPORTSESSION IN ({placeholders})
+                              AND COALESCE(ea.ZCAMERAMODEL, 'Unknown') = ?
+                              AND COALESCE(ea.ZCAMERAMAKE, 'Unknown') = ?
+                              AND strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) = ?
+                            ORDER BY aaa.ZORIGINALFILENAME
+                        """, import_id_list + [model, make or "Unknown", month_str])
+                        involved_assets = cursor.fetchall()
+
                         print(f"Verifying {model} for {month_str}:")
                         print(before_str)
+                        print(f"  Current: {f_min} -> {f_max} ({d_min} to {d_max}){gap_info}{continuity_info}")
+                        print(after_str)
+                        print(f"\n  Involved assets ({len(involved_assets)} items):")
+                        print_assets_table(involved_assets)
+
                         choice = input(
-                            f"  Current: {f_min} -> {f_max} ({d_min} to {d_max}){gap_info}{continuity_info}\n"
-                            f"{after_str}\n"
                             f"Mark as reasonable? [I/n]: "
                         ).strip().upper()
 
@@ -363,20 +404,7 @@ def check_active_sources_import_status(cursor, conn, month, auto_apply):
                             conn.commit()
                             logger.info(f"✅ Marked involved imports for {model} in {month_str} as reasonable and updated metadata individually.")
                         else:
-                            print(f"\n❌ Reasonability rejected for {model} in {month_str}. Listing involved assets:")
-                            cursor.execute(f"""
-                                SELECT aaa.ZORIGINALFILENAME, datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime'), a.ZUUID
-                                FROM photos_db.ZASSET a
-                                JOIN photos_db.ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK
-                                LEFT JOIN photos_db.ZEXTENDEDATTRIBUTES ea ON ea.ZASSET = a.Z_PK
-                                WHERE a.ZIMPORTSESSION IN ({placeholders})
-                                  AND COALESCE(ea.ZCAMERAMODEL, 'Unknown') = ?
-                                  AND COALESCE(ea.ZCAMERAMAKE, 'Unknown') = ?
-                                  AND strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) = ?
-                                ORDER BY aaa.ZORIGINALFILENAME
-                            """, import_id_list + [model, make or "Unknown", month_str])
-                            for fname, dt, uuid in cursor.fetchall():
-                                print(f"  - {fname} ({dt}) [UUID: {uuid}]")
+                            print(f"\n❌ Reasonability rejected for {model} in {month_str}.")
                             logger.error("Execution halted by user. Source data needs fixing.")
                             sys.exit(1)
     finally:
@@ -531,11 +559,30 @@ def verify_sequencing_for_planned_month(cursor, conn, month, auto_apply):
         a = cursor.fetchone()
         after_str = f"  After:   {a[0]} -> {a[1]} ({a[2]} to {a[3]})" if a and a[0] else "  After:   None"
 
+        # Fetch involved assets to print table before prompt
+        cursor.execute("""
+            SELECT aaa.ZORIGINALFILENAME, datetime(za.ZDATECREATED + 978307200, 'unixepoch', 'localtime'), za.ZUUID
+            FROM ZASSET za
+            JOIN ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = za.Z_PK
+            LEFT JOIN ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
+            LEFT JOIN assets a ON a.asset_id = za.ZUUID
+            WHERE za.ZIMPORTSESSION = ?
+              AND COALESCE(zea.ZCAMERAMODEL, 'Unknown') = COALESCE(?, 'Unknown')
+              AND COALESCE(zea.ZCAMERAMAKE, 'Unknown') = COALESCE(?, 'Unknown')
+              AND a.month = ?
+              AND (a.ignore_continuity_check = 0 OR a.ignore_continuity_check IS NULL)
+            ORDER BY aaa.ZORIGINALFILENAME
+        """, (uuid, model, make, month))
+        involved_assets = cursor.fetchall()
+
         print(f"Verifying {model} session {uuid} for {month}:")
         print(before_str)
+        print(f"  Current: {f_min} -> {f_max} ({d_min} to {d_max}) ({count} files){gap_str}")
+        print(after_str)
+        print(f"\n  Involved assets ({len(involved_assets)} items):")
+        print_assets_table(involved_assets)
+
         choice = input(
-            f"  Current: {f_min} -> {f_max} ({d_min} to {d_max}) ({count} files){gap_str}\n"
-            f"{after_str}\n"
             f"Mark as reasonable? [I/n]: "
         ).strip().upper()
 
@@ -559,23 +606,7 @@ def verify_sequencing_for_planned_month(cursor, conn, month, auto_apply):
             conn.commit()
             logger.info(f"✅ Marked import {uuid} for {model} as reasonable and updated metadata.")
         else:
-            print(f"\n❌ Reasonability rejected for {model} (session {uuid}). Listing active assets:")
-            cursor.execute("""
-                SELECT aaa.ZORIGINALFILENAME, datetime(za.ZDATECREATED + 978307200, 'unixepoch', 'localtime'), za.ZUUID
-                FROM ZASSET za
-                JOIN ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = za.Z_PK
-                LEFT JOIN ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
-                LEFT JOIN assets a ON a.asset_id = za.ZUUID
-                WHERE za.ZIMPORTSESSION = ?
-                  AND COALESCE(zea.ZCAMERAMODEL, 'Unknown') = COALESCE(?, 'Unknown')
-                  AND COALESCE(zea.ZCAMERAMAKE, 'Unknown') = COALESCE(?, 'Unknown')
-                  AND a.month = ?
-                  AND (a.ignore_continuity_check = 0 OR a.ignore_continuity_check IS NULL)
-                ORDER BY aaa.ZORIGINALFILENAME
-            """, (uuid, model, make, month))
-            for fname, dt, asset_uuid in cursor.fetchall():
-                print(f"  - {fname} ({dt}) [UUID: {asset_uuid}]")
-
+            print(f"\n❌ Reasonability rejected for {model} (session {uuid}).")
             asset_choice = input(f"\nWould you like to triage assets one by one for {model} (session {uuid}) to ignore specific items? [y/N]: ").strip().lower()
             if asset_choice == 'y':
                 prompt_asset_level_triage(cursor, conn, [uuid], model or "Unknown", make or "Unknown", month)
@@ -1259,7 +1290,7 @@ def run_memory_publishing_flow(cursor, conn):
         elif choice == 'e':
             break
 
-def main(auto_apply):
+def main(auto_apply, no_sync=False):
     # Set up logger with line number in format
 
     # Check for active planned execution first to prevent overlapping plans
@@ -1276,7 +1307,10 @@ def main(auto_apply):
         sys.exit(0)
 
     # Run bootstrap steps before proceeding
-    run_bootstrap_steps(auto_apply, logger)
+    if not no_sync:
+        run_bootstrap_steps(auto_apply, logger)
+    else:
+        logger.info("⚡ Fast Mode: Skipping bootstrap sync steps.")
 
     # Prompt for session mode: Memory Feature & Publishing or Batch Management
     if not auto_apply:
@@ -1683,5 +1717,6 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--auto-apply", action="store_true", help="Skip confirmation and apply plan immediately")
+    parser.add_argument("--no-sync", action="store_true", help="Skip database copy and sync steps (fast mode)")
     args = parser.parse_args()
-    main(auto_apply=args.auto_apply)
+    main(auto_apply=args.auto_apply, no_sync=args.no_sync)

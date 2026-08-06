@@ -705,6 +705,7 @@ def run_memory_publishing_flow(cursor, conn):
 
         # Try attaching Apple Photos DB copy to fetch Apple's auto-generated moments and filter ignored items
         photos_db_attached = False
+        skip_bases = set()
         try:
             from constants import APPLE_PHOTOS_DB_COPY_PATH
             # Pre-open direct connection to force SQLite recovery/WAL resolution on the copy
@@ -717,6 +718,22 @@ def run_memory_publishing_flow(cursor, conn):
 
             cursor.execute(f"ATTACH DATABASE '{APPLE_PHOTOS_DB_COPY_PATH}' AS photos_db;")
             photos_db_attached = True
+            
+            # Load assets to skip from Apple Photos ('ignore'/'skippublishing' albums)
+            try:
+                cursor.execute("""
+                    SELECT DISTINCT aaa.ZORIGINALFILENAME
+                    FROM photos_db.ZGENERICALBUM ga
+                    JOIN photos_db.Z_30ASSETS aa ON aa.Z_30ALBUMS = ga.Z_PK
+                    JOIN photos_db.ZASSET a ON aa.Z_3ASSETS = a.Z_PK
+                    JOIN photos_db.ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK
+                    WHERE ga.ZTRASHEDSTATE = 0 AND ga.ZKIND <> 1507
+                      AND LOWER(ga.ZTITLE) IN ('ignore', 'skippublishing')
+                """)
+                skip_bases = set(os.path.splitext(row[0])[0].lower() for row in cursor.fetchall() if row[0])
+                logger.info(f"Loaded {len(skip_bases)} assets to skip from Apple Photos ('ignore'/'skippublishing')")
+            except Exception as e:
+                logger.warning(f"Could not load skip/ignore assets: {e}")
         except Exception as e:
             logger.warning(f"Could not attach Photos.sqlite for Apple moment lookup: {e}")
 
@@ -1200,6 +1217,220 @@ def run_memory_publishing_flow(cursor, conn):
             curated_str = m['curated_str']
             published_str = "✅ Yes" if m['stage'] == 'M500' else "❌ No"
             print(f"{idx:<4} {m['name']:<30} {m['rank_score']:<12.4f} {m['avg_score']:<10.4f} {m['min_score']:<10.4f} {m['max_score']:<10.4f} {m['assets_display']:<8} {to_be_curated_str:<13} {curated_str:<15} {published_str:<11} {m['can_publish_str']:<13} {m['last_pub_str']:<15}")
+
+        # Display Weekly Memory Publishing Recommendations
+        recommendations = []
+        for m in ranked_moments:
+            name = m['name']
+            fs_curated_path = os.path.join(CURATED_LACIE_DIR, name)
+            
+            # Check files in folder if it exists
+            files = []
+            if m['fs_curated_exists']:
+                try:
+                    files = [f for f in os.listdir(fs_curated_path) 
+                             if os.path.isfile(os.path.join(fs_curated_path, f)) 
+                             and not f.startswith('.')]
+                except Exception:
+                    pass
+            
+            if not files:
+                continue
+                
+            # Group by base name (Live Photos)
+            base_to_files = {}
+            for f in files:
+                base, ext = os.path.splitext(f)
+                base_lower = base.lower()
+                if base_lower in skip_bases:
+                    continue
+                if base_lower not in base_to_files:
+                    base_to_files[base_lower] = []
+                base_to_files[base_lower].append(f)
+                
+            unique_bases = list(base_to_files.keys())
+            total_unique = len(unique_bases)
+            
+            # Get publication count and timing info
+            last_pub_date, pub_count = pub_info.get(name, (None, 0))
+            too_recent = False
+            if last_pub_date:
+                try:
+                    pub_dt = datetime.strptime(last_pub_date.split('.')[0], "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    try:
+                        pub_dt = datetime.strptime(last_pub_date, "%Y-%m-%d")
+                    except ValueError:
+                        pub_dt = None
+                if pub_dt:
+                    diff = datetime.now() - pub_dt
+                    if diff.days < 30:
+                        too_recent = True
+            
+            # Only recommend if not too recent and we have unpublished assets
+            if too_recent or total_unique <= pub_count:
+                continue
+                
+            # Query database scores for all assets in this moment
+            cursor.execute("""
+                SELECT original_filename, score_normalized 
+                FROM ranked_assets_view 
+                WHERE MomentsAlbumName = ?
+            """, (name,))
+            db_assets = cursor.fetchall()
+            
+            # Map base name to highest score
+            base_scores = {}
+            for orig_fname, score in db_assets:
+                if orig_fname:
+                    base_orig = os.path.splitext(orig_fname)[0].lower()
+                    base_scores[base_orig] = max(base_scores.get(base_orig, 0.0), score)
+                    
+            # Sort unique bases by database score descending, fallback to name
+            scored_bases = []
+            for b in unique_bases:
+                score = base_scores.get(b, 0.0)
+                scored_bases.append((b, score))
+                
+            scored_bases.sort(key=lambda x: (x[1], x[0]), reverse=True)
+            
+            # Determine recommendation based on publication count and remaining assets
+            # We want to publish a batch of up to 9 assets.
+            # If pub_count == 0 (first publication):
+            if pub_count == 0:
+                if total_unique < 3:
+                    action = "Disjoint: Merge needed (<3 assets)"
+                    rec_count = 0
+                    rec_bases_list = []
+                    rec_avg_score = m['avg_score']
+                elif 3 <= total_unique <= 9:
+                    action = "Publish Whole Album"
+                    rec_count = total_unique
+                    rec_bases_list = [b[0] for b in scored_bases]
+                    rec_avg_score = sum(b[1] for b in scored_bases) / len(scored_bases) if scored_bases else 0.0
+                else: # total_unique > 9
+                    action = f"Publish Top 9 Assets (out of {total_unique})"
+                    rec_count = 9
+                    rec_bases_list = [b[0] for b in scored_bases[:9]]
+                    rec_avg_score = sum(b[1] for b in scored_bases[:9]) / 9
+            else: # pub_count > 0 (republishing next batch)
+                rem_bases = scored_bases[pub_count:]
+                if not rem_bases:
+                    continue
+                rec_count = min(9, len(rem_bases))
+                action = f"Republish: Next {rec_count} Assets (regulation passed)"
+                rec_bases_list = [b[0] for b in rem_bases[:rec_count]]
+                rec_avg_score = sum(b[1] for b in rem_bases[:rec_count]) / rec_count
+                
+            recommendations.append({
+                'name': name,
+                'avg_score': rec_avg_score,
+                'total_unique': total_unique,
+                'pub_count': pub_count,
+                'rec_count': rec_count,
+                'action': action,
+                'rec_bases': rec_bases_list,
+                'base_to_files': base_to_files
+            })
+            
+        # Partition into actionable and disjoint groups
+        actionable_recs = [r for r in recommendations if not r['action'].startswith("Disjoint")]
+        disjoint_recs = [r for r in recommendations if r['action'].startswith("Disjoint")]
+        
+        # Sort each group by average score descending
+        actionable_recs.sort(key=lambda x: -x['avg_score'])
+        disjoint_recs.sort(key=lambda x: -x['avg_score'])
+        
+        # Select top 20 actionable and top 10 disjoint
+        top_recommendations = actionable_recs[:20] + disjoint_recs[:10]
+        
+        if top_recommendations:
+            print("\n==================================================================================================================================================================")
+            print("📢 Publishing Recommendations (Top 20 Actionable & Top 10 Disjoint Candidates)")
+            print("==================================================================================================================================================================")
+            print(f"{'No.':<4} {'Moment Name':<30} {'Avg Score':<10} {'Files':<6} {'Pub.':<5} {'Rec.':<5} {'Recommendation/Action':<42} {'Recommended Assets to Publish'}")
+            print("-" * 168)
+            divider_printed = False
+            for idx, rec in enumerate(top_recommendations, 1):
+                if rec['action'].startswith("Disjoint") and not divider_printed:
+                    print("-" * 168)
+                    print(f"--- Disjoint Moments (Need Merge) " + "-" * 134)
+                    print("-" * 168)
+                    divider_printed = True
+                
+                if rec['rec_bases']:
+                    if len(rec['rec_bases']) <= 5:
+                        assets_str = ", ".join(rec['rec_bases'])
+                    else:
+                        assets_str = ", ".join(rec['rec_bases'][:4]) + f" (+{len(rec['rec_bases'])-4} more)"
+                else:
+                    assets_str = "—"
+                print(f"{idx:<4} {rec['name']:<30} {rec['avg_score']:<10.4f} {rec['total_unique']:<6} {rec['pub_count']:<5} {rec['rec_count']:<5} {rec['action']:<42} {assets_str}")
+            print("==================================================================================================================================================================\n")
+
+            # Sync folders and files to 'Publishing Recommendation' directory
+            PUBLISHING_RECOMMENDATION_DIR = "/Volumes/LaCie/Media Organizer/Publishing Recommendation"
+            os.makedirs(PUBLISHING_RECOMMENDATION_DIR, exist_ok=True)
+            active_rec_names = set()
+            
+            print("📂 Syncing files to 'Publishing Recommendation' folder...")
+            import shutil
+            
+            for rec in top_recommendations:
+                if not rec['rec_bases'] or rec['rec_count'] == 0:
+                    continue
+                    
+                moment_name = rec['name']
+                active_rec_names.add(moment_name)
+                
+                src_folder = os.path.join(CURATED_LACIE_DIR, moment_name)
+                dest_folder = os.path.join(PUBLISHING_RECOMMENDATION_DIR, moment_name)
+                os.makedirs(dest_folder, exist_ok=True)
+                
+                # Gather all files that should be in the destination
+                expected_files = []
+                for base in rec['rec_bases']:
+                    expected_files.extend(rec['base_to_files'].get(base, []))
+                    
+                expected_files_set = set(expected_files)
+                
+                # Delete extra/stale files in dest_folder
+                try:
+                    dest_files = os.listdir(dest_folder)
+                    for f in dest_files:
+                        if f.startswith('.'):
+                            continue
+                        if f not in expected_files_set:
+                            file_path = os.path.join(dest_folder, f)
+                            if os.path.isfile(file_path):
+                                os.remove(file_path)
+                                logger.info(f"Deleted outdated recommended file: {moment_name}/{f}")
+                except Exception as e:
+                    logger.warning(f"Error cleaning folder {dest_folder}: {e}")
+                    
+                # Copy missing files from src_folder to dest_folder
+                for f in expected_files:
+                    src_file = os.path.join(src_folder, f)
+                    dest_file = os.path.join(dest_folder, f)
+                    if os.path.exists(src_file) and not os.path.exists(dest_file):
+                        try:
+                            shutil.copy2(src_file, dest_file)
+                            logger.info(f"Copied recommended asset: {moment_name}/{f}")
+                        except Exception as e:
+                            logger.error(f"Error copying {src_file} to {dest_file}: {e}")
+            
+            # Clean up old folders in PUBLISHING_RECOMMENDATION_DIR that are no longer recommended
+            try:
+                for d in os.listdir(PUBLISHING_RECOMMENDATION_DIR):
+                    d_path = os.path.join(PUBLISHING_RECOMMENDATION_DIR, d)
+                    if os.path.isdir(d_path) and not d.startswith('.'):
+                        if d not in active_rec_names:
+                            shutil.rmtree(d_path)
+                            logger.info(f"Deleted outdated recommendation folder: {d}")
+            except Exception as e:
+                logger.warning(f"Error cleaning up outdated recommendation folders: {e}")
+                
+            print("✅ 'Publishing Recommendation' folder is up to date!")
 
         print("\n--- Actions ---")
         print(" [1] Sync proposed assets to ToBeCurated albums in Apple Photos")

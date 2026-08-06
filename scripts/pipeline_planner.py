@@ -1171,11 +1171,14 @@ def run_memory_publishing_flow(cursor, conn):
             except Exception as e:
                 logger.warning(f"Could not detach Photos.sqlite: {e}")
 
-        # Sort by: 1. Needs update (proposed + curated < total_qualified), 2. Stage (M100 first), 3. Rank score descending
+        # Sort by: 
+        # 1. Needs update (proposed + curated < total_qualified)
+        # 2. Stage (M100 first)
+        # 3. If needs update: rank score descending; if up-to-date: average score descending
         ranked_moments.sort(key=lambda x: (
             (x['proposed_count'] + x['curated_count']) < x['total_qualified'],
             x['stage'] != 'M500',  # Put published at the bottom
-            x['rank_score']
+            x['rank_score'] if ((x['proposed_count'] + x['curated_count']) < x['total_qualified']) else x['avg_score']
         ), reverse=True)
 
         print(f"{'No.':<4} {'Moment Name':<30} {'Rank Score':<12} {'Avg Score':<10} {'Min Score':<10} {'Max Score':<10} {'Assets':<8} {'ToBeCurated?':<13} {'Curated?':<15} {'Published?':<11} {'Can Publish?':<13} {'Last Published':<15}")

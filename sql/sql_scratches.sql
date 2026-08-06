@@ -1,3 +1,9 @@
+-- get count of favorites for month batches
+select mb.*, 
+	(select count() from assets a WHERE a.google_favorite = 1 and a."month" = mb."month")
+from month_batches mb 
+order by mb.month desc
+
 select 	
 /*	case 
 		when a.aesthetic_score between 0 and .25 then '0-.25'

@@ -120,6 +120,7 @@ def sync_assets(media_cursor, logger):
         FROM ZASSET a
         JOIN ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK
         WHERE a.ZIMPORTSESSION IS NOT NULL
+          AND a.ZTRASHEDSTATE = 0
     """)
     results = media_cursor.fetchall()
 
@@ -179,15 +180,17 @@ def sync_assets(media_cursor, logger):
 
     logger.info(f"✅ Inserted or updated {inserted_count} asset records in Media Organizer DB.")
 
-    # Purge assets from local 'assets' table that no longer exist in ZASSET
-    logger.info("Purging orphaned assets that no longer exist in Apple Photos...")
+    # Purge assets from local 'assets' table that no longer exist or are trashed in Apple Photos
+    logger.info("Purging orphaned or trashed assets that no longer exist in Apple Photos...")
     media_cursor.execute("""
         DELETE FROM assets 
-        WHERE asset_id NOT IN (SELECT ZUUID FROM photos_db.ZASSET)
+        WHERE asset_id NOT IN (
+            SELECT ZUUID FROM photos_db.ZASSET WHERE ZTRASHEDSTATE = 0
+        )
     """)
     purged_count = media_cursor.rowcount
     if purged_count > 0:
-        logger.info(f"🗑️ Purged {purged_count} orphaned asset records.")
+        logger.info(f"🗑️ Purged {purged_count} orphaned or trashed asset records.")
         commit()
 
     # Purge import sessions from local 'imports' table that no longer have corresponding assets in ZASSET

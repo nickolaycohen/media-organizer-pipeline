@@ -18,7 +18,42 @@ import tzlocal
 from datetime import timezone
 from dataclasses import dataclass
 from typing import List
+import atexit
 from db.connections import get_connection, get_cursor, commit, close as close_conn
+
+LOCK_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), "../db/executor.lock"))
+
+def acquire_lock():
+    if os.path.exists(LOCK_FILE):
+        try:
+            with open(LOCK_FILE, "r") as f:
+                pid = int(f.read().strip())
+            # Check if process is still running
+            os.kill(pid, 0)
+            logger.info(f"⏭️ Executor is already running (PID: {pid}). Exiting.")
+            sys.exit(0)
+        except (ValueError, OSError):
+            # PID is not running, or lock file is invalid/stale
+            pass
+
+    try:
+        os.makedirs(os.path.dirname(LOCK_FILE), exist_ok=True)
+        with open(LOCK_FILE, "w") as f:
+            f.write(str(os.getpid()))
+        atexit.register(release_lock)
+        logger.info(f"🔒 Acquired execution lock file (PID: {os.getpid()}).")
+    except Exception as e:
+        logger.error(f"Failed to create lock file: {e}")
+        sys.exit(1)
+
+def release_lock():
+    try:
+        if os.path.exists(LOCK_FILE):
+            os.remove(LOCK_FILE)
+            logger.info("🔓 Released execution lock file.")
+    except Exception as e:
+        logger.warning(f"Failed to release lock file: {e}")
+
 
 
 @dataclass
@@ -299,6 +334,7 @@ def get_pipeline_steps(cursor, script_dir, use_mock_data=False):
 
 
 def main(args):
+    acquire_lock()
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
     # Open a single SQLite connection to be used throughout
@@ -326,9 +362,14 @@ def main(args):
         logger.info(f"📋 Planned execution found. Using batch: {month}")
         from_index, to_index = 0, len(all_steps) # Execute all steps for the planned month
     else:
-        logger.error("🚫 No active planned execution found. Please run pipeline_planner first.")
-        conn.close()
-        sys.exit(1)
+        if args.cron:
+            logger.info("No active planned execution found. Exiting silently.")
+            conn.close()
+            sys.exit(0)
+        else:
+            logger.error("🚫 No active planned execution found. Please run pipeline_planner first.")
+            conn.close()
+            sys.exit(1)
 
     # The executor is non-interactive. The planner decides the month.
     # We will now run all steps for the planned month.
@@ -349,6 +390,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Execute the media organizer pipeline.")
     parser.add_argument("--dry-run", action="store_true", help="Log actions without executing them.")
     parser.add_argument("--mock-steps", action="store_true", help="Use mocked pipeline steps instead of querying the database.")
+    parser.add_argument("--cron", action="store_true", help="Run in cron mode (silent exit with 0 if no active plan).")
     args = parser.parse_args()
 
     main(args)

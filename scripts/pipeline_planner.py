@@ -697,6 +697,7 @@ def run_memory_publishing_flow(cursor, conn):
         logger.warning(f"Could not fetch historical minimum threshold: {e}")
     
     while True:
+        displayed_moments_map = {}
         # Clear/rollback any open transactions to get a fresh snapshot of the database
         try:
             conn.rollback()
@@ -894,7 +895,8 @@ def run_memory_publishing_flow(cursor, conn):
                        (SELECT 1 FROM moment_exports me WHERE me.asset_id = v.asset_id AND me.curation_stage = 'to_be_curated') as is_proposed,
                        (SELECT 1 FROM moment_exports me WHERE me.asset_id = v.asset_id AND me.curation_stage = 'curated') as is_curated,
                        (SELECT album_name FROM moment_exports me WHERE me.asset_id = v.asset_id ORDER BY exported_at_utc DESC LIMIT 1) as exported_album_name,
-                       ast.curated_album
+                       ast.curated_album,
+                       (SELECT 1 FROM publications p WHERE p.asset_id = v.asset_id LIMIT 1) as is_published
                 FROM ranked_assets_view v
                 JOIN assets ast ON v.asset_id = ast.asset_id
                 JOIN month_batches mb ON v.month = mb.month
@@ -918,7 +920,8 @@ def run_memory_publishing_flow(cursor, conn):
                        (SELECT 1 FROM moment_exports me WHERE me.asset_id = v.asset_id AND me.curation_stage = 'to_be_curated') as is_proposed,
                        (SELECT 1 FROM moment_exports me WHERE me.asset_id = v.asset_id AND me.curation_stage = 'curated') as is_curated,
                        (SELECT album_name FROM moment_exports me WHERE me.asset_id = v.asset_id ORDER BY exported_at_utc DESC LIMIT 1) as exported_album_name,
-                       ast.curated_album
+                       ast.curated_album,
+                       (SELECT 1 FROM publications p WHERE p.asset_id = v.asset_id LIMIT 1) as is_published
                 FROM ranked_assets_view v
                 JOIN assets ast ON v.asset_id = ast.asset_id
                 JOIN month_batches mb ON v.month = mb.month
@@ -976,12 +979,14 @@ def run_memory_publishing_flow(cursor, conn):
         for row in rows:
             asset_id, moment_name, score, filename = row[0], row[1], row[2], row[3]
             is_proposed, is_curated = row[8], row[9]
+            is_published = row[12] if len(row) > 12 else None
             if moment_name not in moments_data:
                 moments_data[moment_name] = {
                     'total_qualified': 0,
                     'proposed_count': 0,
                     'curated_count': 0,
-                    'scores': []
+                    'scores': [],
+                    'unpublished_scores': []
                 }
             moments_data[moment_name]['total_qualified'] += 1
             if is_proposed:
@@ -989,6 +994,8 @@ def run_memory_publishing_flow(cursor, conn):
             if is_curated:
                 moments_data[moment_name]['curated_count'] += 1
             moments_data[moment_name]['scores'].append(score)
+            if not is_published:
+                moments_data[moment_name]['unpublished_scores'].append(score)
 
         # 3. Query Apple Photos albums and folders inside Curated and ToBeCurated (to match existence and get counts)
         applescript_code = """
@@ -1065,7 +1072,8 @@ def run_memory_publishing_flow(cursor, conn):
         
         ranked_moments = []
         for name, data in moments_data.items():
-            avg_score = sum(data['scores']) / len(data['scores']) if data['scores'] else 0.0
+            target_scores = data['unpublished_scores'] if data['unpublished_scores'] else data['scores']
+            avg_score = sum(target_scores) / len(target_scores) if target_scores else 0.0
             stage = stages.get(name, 'M100')
             
             # Check Apple Photos existence
@@ -1168,8 +1176,8 @@ def run_memory_publishing_flow(cursor, conn):
                 'proposed_count': data['proposed_count'],
                 'curated_count': data['curated_count'],
                 'avg_score': avg_score,
-                'min_score': min(data['scores']) if data['scores'] else 0.0,
-                'max_score': max(data['scores']) if data['scores'] else 0.0,
+                'min_score': min(target_scores) if target_scores else 0.0,
+                'max_score': max(target_scores) if target_scores else 0.0,
                 'rank_score': rank_score,
                 'stage': stage,
                 'to_be_curated_exists': to_be_curated_exists,
@@ -1202,6 +1210,7 @@ def run_memory_publishing_flow(cursor, conn):
         print("-" * 160)
         divider_printed = False
         for idx, m in enumerate(ranked_moments, 1):
+            displayed_moments_map[idx] = {'name': m['name'], 'type': 'ranked_moment'}
             is_needs_update = (m['proposed_count'] + m['curated_count']) < m['total_qualified']
             if not is_needs_update and not divider_printed:
                 if idx > 1:
@@ -1351,7 +1360,9 @@ def run_memory_publishing_flow(cursor, conn):
             print(f"{'No.':<4} {'Moment Name':<30} {'Avg Score':<10} {'Files':<6} {'Pub.':<5} {'Rec.':<5} {'Recommendation/Action':<42} {'Recommended Assets to Publish'}")
             print("-" * 168)
             divider_printed = False
-            for idx, rec in enumerate(top_recommendations, 1):
+            start_idx = len(ranked_moments) + 1
+            for idx, rec in enumerate(top_recommendations, start_idx):
+                displayed_moments_map[idx] = {'name': rec['name'], 'type': 'recommendation', 'rec_bases': rec['rec_bases'], 'action': rec['action']}
                 if rec['action'].startswith("Disjoint") and not divider_printed:
                     print("-" * 168)
                     print(f"--- Disjoint Moments (Need Merge) " + "-" * 134)
@@ -1459,9 +1470,9 @@ def run_memory_publishing_flow(cursor, conn):
         elif choice == '2':
             moment_name = input("Enter Moment Name to export (or index from list): ").strip()
             if moment_name.isdigit():
-                idx = int(moment_name) - 1
-                if 0 <= idx < len(ranked_moments):
-                    moment_name = ranked_moments[idx]['name']
+                idx = int(moment_name)
+                if idx in displayed_moments_map:
+                    moment_name = displayed_moments_map[idx]['name']
             
             if not moment_name:
                 continue
@@ -1483,41 +1494,77 @@ def run_memory_publishing_flow(cursor, conn):
                 logger.error(f"Export failed: {e}")
         elif choice == '3':
             moment_name = input("Enter Moment Name to publish (or index from list): ").strip()
+            selected_rec = None
             if moment_name.isdigit():
-                idx = int(moment_name) - 1
-                if 0 <= idx < len(ranked_moments):
-                    moment_name = ranked_moments[idx]['name']
+                idx = int(moment_name)
+                if idx in displayed_moments_map:
+                    item_info = displayed_moments_map[idx]
+                    moment_name = item_info['name']
+                    if item_info['type'] == 'recommendation':
+                        selected_rec = item_info
             
             if not moment_name:
                 continue
                 
+            if selected_rec and selected_rec['action'].startswith("Disjoint"):
+                print(f"⚠️ Cannot publish '{moment_name}': {selected_rec['action']}")
+                continue
+
             cursor.execute("""
-                SELECT asset_id FROM moment_exports 
-                WHERE album_name = ? AND curation_stage = 'curated'
+                SELECT me.asset_id, a.original_filename
+                FROM moment_exports me
+                JOIN assets a ON me.asset_id = a.asset_id
+                WHERE me.album_name = ? AND me.curation_stage = 'curated'
             """, (moment_name,))
-            curated_assets = [row[0] for row in cursor.fetchall()]
+            curated_assets_info = cursor.fetchall()
             
-            if not curated_assets:
+            if not curated_assets_info:
                 print(f"⚠️ No curated assets found in the DB for '{moment_name}'. Please export the Curated album first.")
                 continue
                 
-            confirm = input(f"Confirm publication of {len(curated_assets)} assets of '{moment_name}' to Shutterfly/YouTube? [y/N]: ").strip().lower()
+            cursor.execute("SELECT asset_id FROM publications WHERE moment_name = ?", (moment_name,))
+            already_published = set(row[0] for row in cursor.fetchall())
+
+            # Filter target assets to publish
+            if selected_rec:
+                rec_bases = set(selected_rec['rec_bases'])
+                target_assets = []
+                for asset_id, orig_fname in curated_assets_info:
+                    if orig_fname:
+                        base = os.path.splitext(orig_fname)[0].lower()
+                        if base in rec_bases:
+                            target_assets.append(asset_id)
+            else:
+                target_assets = [row[0] for row in curated_assets_info]
+
+            # Exclude already published
+            target_assets = [aid for aid in target_assets if aid not in already_published]
+
+            if not target_assets:
+                print(f"ℹ️ All selected assets for '{moment_name}' are already marked as published.")
+                continue
+
+            confirm = input(f"Confirm publication of {len(target_assets)} assets of '{moment_name}' to Shutterfly/YouTube? [y/N]: ").strip().lower()
             if confirm == 'y':
                 try:
-                    pub_data = [(aid, moment_name, 'Shutterfly/YouTube') for aid in curated_assets]
+                    pub_data = [(aid, moment_name, 'Shutterfly/YouTube') for aid in target_assets]
                     cursor.executemany("""
                         INSERT INTO publications (asset_id, moment_name, platform, published_at_utc)
                         VALUES (?, ?, ?, datetime('now'))
                     """, pub_data)
                     
+                    # Calculate new stage
+                    total_pub_after = len(already_published) + len(target_assets)
+                    new_stage = 'M500' if total_pub_after >= len(curated_assets_info) else 'M400'
+
                     cursor.execute("""
                         INSERT INTO curated_moments (moment_name, memory_stage)
-                        VALUES (?, 'M500')
-                        ON CONFLICT(moment_name) DO UPDATE SET memory_stage = 'M500'
-                    """, (moment_name,))
+                        VALUES (?, ?)
+                        ON CONFLICT(moment_name) DO UPDATE SET memory_stage = excluded.memory_stage
+                    """, (moment_name, new_stage))
                     
                     conn.commit()
-                    print(f"✅ Recorded publication of {len(curated_assets)} assets for '{moment_name}' in database.")
+                    print(f"✅ Recorded publication of {len(target_assets)} assets for '{moment_name}' in database (Stage: {new_stage}).")
                 except Exception as e:
                     logger.warning(f"Failed to record publication: {e}")
                     conn.rollback()

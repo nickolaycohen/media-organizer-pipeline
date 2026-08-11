@@ -1102,3 +1102,29 @@ from schema_migrations sm
 select * 
 from imports
 order by import_uuid desc
+
+SELECT 
+    v.asset_id,
+    v.MomentsAlbumName,
+    v.score_normalized,
+    v.original_filename,
+    v.aesthetic_score,
+    v.google_favorite,
+    v.mobile_apple_photos_featured_photos,
+    v.apple_photos_monthly_selection,
+    (SELECT 1 FROM moment_exports me 
+     WHERE me.asset_id = v.asset_id AND me.curation_stage = 'to_be_curated') AS is_proposed,
+    (SELECT 1 FROM moment_exports me 
+     WHERE me.asset_id = v.asset_id AND me.curation_stage = 'curated') AS is_curated,
+    ast.curated_album,
+    (SELECT 1 FROM publications p 
+     WHERE p.asset_id = v.asset_id LIMIT 1) AS is_published
+FROM ranked_assets_view v
+JOIN assets ast ON v.asset_id = ast.asset_id
+JOIN month_batches mb ON v.month = mb.month
+WHERE mb.status_code >= '600' 
+  AND v.MomentsAlbumName IS NOT NULL 
+  AND v.MomentsAlbumName != ''
+  AND LOWER(v.MomentsAlbumName) NOT IN ('skippublishing', 'ignore')
+  AND v.score_normalized > :effective_threshold
+ORDER BY v.score_normalized DESC;

@@ -62,7 +62,7 @@ def main():
     conn = get_connection()
     cursor = get_cursor()
 
-    album_month = get_planned_month(cursor)
+    album_month = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith('-') else get_planned_month(cursor)
     if not album_month:
         logger.error("No active planned batch found. Please run the planner first.")
         close_conn()

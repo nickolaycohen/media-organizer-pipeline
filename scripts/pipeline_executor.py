@@ -303,12 +303,12 @@ def get_pipeline_steps(cursor, script_dir, use_mock_data=False):
         logger.info("Using mocked pipeline steps data.")
         
         return [
-            PipelineStep("2.1 Verify Smart Album", "100", ["python3", os.path.join(script_dir, "verify_smart_album.py"), "{month}"]),
-            PipelineStep("2.2 Export Assets", "200", ["python3", os.path.join(script_dir, "export_photos_applescript.py"), "{month}"]),
-            PipelineStep("2.2.5 Remove duplicate assets based on extension and size", "210", ["python3", os.path.join(script_dir, "deduplicate_assets.py"), "{month}"]),
-            PipelineStep("2.4 Partial upload to Google Photos due to insufficient space", "399", ["python3", os.path.join(script_dir, "upload_to_google_photos.py"), "{month}"]),
-            PipelineStep("3.2 Pull Google Photos Favorites and update asset flags", "550", ["python3", os.path.join(script_dir, "pull_google_favorites.py"), "{month}"]),
-            PipelineStep("3.4 Rank Assets by Score", "600", ["python3", os.path.join(script_dir, "rank_assets_by_score.py"), "{month}"]),
+            PipelineStep("2.1 Verify Smart Album", "100", [sys.executable, os.path.join(script_dir, "verify_smart_album.py"), "{month}"]),
+            PipelineStep("2.2 Export Assets", "200", [sys.executable, os.path.join(script_dir, "export_photos_applescript.py"), "{month}"]),
+            PipelineStep("2.2.5 Remove duplicate assets based on extension and size", "210", [sys.executable, os.path.join(script_dir, "deduplicate_assets.py"), "{month}"]),
+            PipelineStep("2.4 Partial upload to Google Photos due to insufficient space", "399", [sys.executable, os.path.join(script_dir, "upload_to_google_photos.py"), "{month}"]),
+            PipelineStep("3.2 Pull Google Photos Favorites and update asset flags", "550", [sys.executable, os.path.join(script_dir, "pull_google_favorites.py"), "{month}"]),
+            PipelineStep("3.4 Rank Assets by Score", "600", [sys.executable, os.path.join(script_dir, "rank_assets_by_score.py"), "{month}"]),
         ]
 
     steps = []
@@ -326,7 +326,7 @@ def get_pipeline_steps(cursor, script_dir, use_mock_data=False):
         cmd = []
         if script_name:
             script_path = os.path.join(script_dir, script_name.split()[0])
-            cmd = ["python3", script_path]
+            cmd = [sys.executable, script_path]
             if "{month}" in script_name:
                 cmd.append("{month}")
         steps.append(PipelineStep(label, code, cmd))
@@ -354,36 +354,37 @@ def main(args):
     all_steps = bootstrap_steps.copy()
     all_steps.extend(steps)
 
-    # Check for planned execution before interactive mode
-    cursor.execute("SELECT planned_month FROM planned_execution WHERE active = 1 LIMIT 1")
-    planned_row = cursor.fetchone()
-    if planned_row:
-        month = planned_row[0]
-        logger.info(f"📋 Planned execution found. Using batch: {month}")
-        from_index, to_index = 0, len(all_steps) # Execute all steps for the planned month
-    else:
+    # Check for active planned executions in queue
+    cursor.execute("SELECT id, planned_month FROM planned_execution WHERE active = 1 ORDER BY id ASC")
+    planned_rows = cursor.fetchall()
+    if not planned_rows:
         if args.cron:
-            logger.info("No active planned execution found. Exiting silently.")
+            logger.info("No active planned execution found in queue. Exiting silently.")
             conn.close()
             sys.exit(0)
         else:
-            logger.error("🚫 No active planned execution found. Please run pipeline_planner first.")
+            logger.error("🚫 No active planned execution found in queue. Please run pipeline_planner first.")
             conn.close()
             sys.exit(1)
 
-    # The executor is non-interactive. The planner decides the month.
-    # We will now run all steps for the planned month.
-    # The run_regular_steps function has internal logic to skip steps
-    # that are not applicable based on the month's current status.
-    run_bootstrap_steps(bootstrap_steps, from_index, to_index, args.dry_run, None, conn, month)
-    run_regular_steps(bootstrap_steps, steps, from_index, to_index, args.dry_run, month, conn)
+    total_plans = len(planned_rows)
+    logger.info(f"📋 Found {total_plans} active planned execution(s) in queue: {[r[1] for r in planned_rows]}")
 
-    # If a planned execution was used, mark it as inactive upon successful completion
-    if planned_row and not args.dry_run:
-        cursor.execute("UPDATE planned_execution SET active = 0 WHERE planned_month = ?", (month,))
-        conn.commit()
-        logger.info(f"✅ Planned execution for {month} marked as inactive.")
+    from_index, to_index = 0, len(all_steps)
 
+    for idx, (plan_id, month) in enumerate(planned_rows, 1):
+        logger.info(f"\n{'='*60}\n🚀 [{idx}/{total_plans}] Starting execution for planned batch: {month} (Queue ID: {plan_id})\n{'='*60}")
+        
+        run_bootstrap_steps(bootstrap_steps, from_index, to_index, args.dry_run, None, conn, month)
+        run_regular_steps(bootstrap_steps, steps, from_index, to_index, args.dry_run, month, conn)
+
+        # Mark this specific planned execution as inactive upon successful completion
+        if not args.dry_run:
+            cursor.execute("UPDATE planned_execution SET active = 0 WHERE id = ?", (plan_id,))
+            conn.commit()
+            logger.info(f"✅ Planned execution for {month} (Queue ID: {plan_id}) completed and marked as inactive.")
+
+    logger.info(f"🎉 Completed all {total_plans} queued planned execution(s).")
     conn.close()
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ from utils.utils import get_full_transition_path, human_readable_size
 from google_photos import check_google_quota, authenticate, get_all_favorites
 import argparse
 import sqlite3
-from constants import MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_COPY_PATH, LOG_PATH, GOOGLE_PHOTOS_READONLY_SCOPES, GOOGLE_DRIVE_READ_ONLY_SCOPES, PLANNER_REQUIRED_SCOPES
+from constants import MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_COPY_PATH, LOG_PATH, GOOGLE_PHOTOS_READONLY_SCOPES, GOOGLE_DRIVE_READ_ONLY_SCOPES, PLANNER_REQUIRED_SCOPES, CURATION_THRESHOLD_LOG_PATH, SCORING_BREAKDOWN_LOG_PATH, MEDIA_CLEANUP_LOG_PATH
 from constants import ACTIVE_CAMERA_MODELS
 from db.connections import get_connection, get_cursor, commit, close as close_conn
 from db.queries import get_stage_transitions, get_batch_statuses, get_latest_import_and_month
@@ -27,8 +27,14 @@ for handler in logger.handlers:
     handler.setFormatter(logging.Formatter('%(asctime)s [%(name)s:%(lineno)d] - %(levelname)s - %(message)s'))
 
 def set_planned_month(cursor, month):
-    cursor.execute("DELETE FROM planned_execution")
-    cursor.execute("INSERT INTO planned_execution (planned_month, active) VALUES (?, 1)", (month,))
+    cursor.execute("SELECT id FROM planned_execution WHERE planned_month = ? AND active = 1", (month,))
+    existing = cursor.fetchone()
+    if existing:
+        cursor.execute("UPDATE planned_execution SET set_at_utc = datetime('now') WHERE id = ?", (existing[0],))
+        logger.info(f"Updated existing active plan for month {month} in queue (Queue ID: {existing[0]}).")
+    else:
+        cursor.execute("INSERT INTO planned_execution (planned_month, active, set_at_utc) VALUES (?, 1, datetime('now'))", (month,))
+        logger.info(f"Added month {month} to planned_execution queue.")
 
 def should_run_sync_metadata(cursor):
     """
@@ -105,7 +111,7 @@ def run_bootstrap_steps(auto_apply, logger):
                 if not should_sync:
                     logger.info(f"Skipping {script_file} as sync is up to date.")
                     continue
-            subprocess.run(["python3", script_path] + step_args, check=True)
+            subprocess.run([sys.executable, script_path] + step_args, check=True)
             logger.info(f"✅ Completed: {step_name}")
         except subprocess.CalledProcessError as e:
             logger.error(f"❌ Error in bootstrap step {step_name}: {e}")
@@ -160,21 +166,87 @@ def prompt_asset_level_triage(cursor, conn, import_uuids, camera_model, camera_m
     assets = cursor.fetchall()
     if not assets:
         print(f"No active assets found to triage for {camera_make} {camera_model} in {month}.")
-        return
+        return True
 
     print(f"\n--- Asset-level Triage for {camera_make} {camera_model} ({month}) ---")
-    ignored_any = False
+    ignored_count = 0
     for fname, dt, asset_id in assets:
         choice = input(f"  Ignore {fname} ({dt})? [y/N]: ").strip().lower()
         if choice == 'y':
             cursor.execute("UPDATE assets SET ignore_continuity_check = 1 WHERE asset_id = ?", (asset_id,))
-            ignored_any = True
+            ignored_count += 1
             print(f"  ✅ Asset {fname} ignored.")
     
-    if ignored_any:
+    if ignored_count > 0:
+        cursor.execute(f"""
+            UPDATE imports
+            SET sequencing_confirmed = 1
+            WHERE import_uuid IN ({placeholders})
+              AND camera_model = ?
+        """, import_uuids + [camera_model])
         conn.commit()
-        print("\nTriaging complete. Please re-run the planner to see updated reasonability metrics.")
-        sys.exit(0)
+        print(f"\n✅ Ignored {ignored_count} asset(s). Continuing with planner...")
+        return True
+    else:
+        print("\nNo assets were marked as ignored.")
+        return False
+
+def ignore_all_assets_for_batch(cursor, conn, import_uuids, camera_model, camera_make, month):
+    """
+    Marks all assets in the specified import sessions / camera model for the month as ignored for continuity checks.
+    Also marks the import sessions as confirmed so planning can continue seamlessly without restarting.
+    """
+    placeholders = ','.join(['?' for _ in import_uuids])
+    cursor.execute(f"""
+        UPDATE assets
+        SET ignore_continuity_check = 1
+        WHERE import_id IN ({placeholders})
+          AND month = ?
+          AND (ignore_continuity_check = 0 OR ignore_continuity_check IS NULL)
+          AND asset_id IN (
+              SELECT za.ZUUID
+              FROM ZASSET za
+              LEFT JOIN ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
+              WHERE za.ZIMPORTSESSION IN ({placeholders})
+                AND COALESCE(zea.ZCAMERAMODEL, 'Unknown') = ?
+                AND COALESCE(zea.ZCAMERAMAKE, 'Unknown') = ?
+          )
+    """, import_uuids + [month] + import_uuids + [camera_model, camera_make])
+    count = cursor.rowcount
+
+    cursor.execute(f"""
+        UPDATE imports
+        SET sequencing_confirmed = 1
+        WHERE import_uuid IN ({placeholders})
+          AND camera_model = ?
+    """, import_uuids + [camera_model])
+
+    conn.commit()
+    logger.info(f"✅ Marked all {count} assets for {camera_make} {camera_model} ({month}) as ignored for continuity checks.")
+    print(f"\n✅ Marked {count} asset(s) as ignored for {camera_model} in {month}. Continuing with planner...")
+    return True
+
+def handle_reasonability_rejection(cursor, conn, import_uuids, camera_model, camera_make, month, label=""):
+    """
+    Handles user rejecting reasonability for an import session or batch.
+    Prompts the user to triage assets one by one or ignore the whole batch.
+    """
+    print(f"\n❌ Reasonability rejected for {camera_model or 'Unknown'}{f' ({label})' if label else ''}.")
+    print("\nHow would you like to handle these assets?")
+    print("  [1] Triage assets one by one (select individual assets to ignore)")
+    print("  [2] Ignore the whole batch (ignore all involved assets for this month)")
+    print("  [Q] Quit / abort execution")
+    
+    choice = input("\nSelection [1/2/Q]: ").strip().lower()
+    
+    if choice == '1':
+        return prompt_asset_level_triage(cursor, conn, import_uuids, camera_model or "Unknown", camera_make or "Unknown", month)
+    elif choice == '2':
+        return ignore_all_assets_for_batch(cursor, conn, import_uuids, camera_model or "Unknown", camera_make or "Unknown", month)
+    else:
+        logger.error("Execution halted by user. Source data needs fixing.")
+        close_conn()
+        sys.exit(1)
 
 def check_active_sources_import_status(cursor, conn, month, auto_apply):
     """
@@ -404,9 +476,9 @@ def check_active_sources_import_status(cursor, conn, month, auto_apply):
                             conn.commit()
                             logger.info(f"✅ Marked involved imports for {model} in {month_str} as reasonable and updated metadata individually.")
                         else:
-                            print(f"\n❌ Reasonability rejected for {model} in {month_str}.")
-                            logger.error("Execution halted by user. Source data needs fixing.")
-                            sys.exit(1)
+                            handle_reasonability_rejection(
+                                cursor, conn, import_id_list, model, make or "Unknown", month_str, label=f"month {month_str}"
+                            )
     finally:
         cursor.execute("DETACH DATABASE photos_db;")
         logger.debug("Detached Photos.sqlite database.")
@@ -606,13 +678,9 @@ def verify_sequencing_for_planned_month(cursor, conn, month, auto_apply):
             conn.commit()
             logger.info(f"✅ Marked import {uuid} for {model} as reasonable and updated metadata.")
         else:
-            print(f"\n❌ Reasonability rejected for {model} (session {uuid}).")
-            asset_choice = input(f"\nWould you like to triage assets one by one for {model} (session {uuid}) to ignore specific items? [y/N]: ").strip().lower()
-            if asset_choice == 'y':
-                prompt_asset_level_triage(cursor, conn, [uuid], model or "Unknown", make or "Unknown", month)
-
-            logger.error("Execution halted by user. Source data needs fixing.")
-            sys.exit(1)
+            handle_reasonability_rejection(
+                cursor, conn, [uuid], model or "Unknown", make or "Unknown", month, label=f"session {uuid}"
+            )
 
     if auto_apply:
         return True
@@ -787,21 +855,22 @@ def run_memory_publishing_flow(cursor, conn):
             except Exception as e:
                 logger.warning(f"Could not record threshold in history: {e}")
 
-        # Display threshold status summary
-        print("\n==================================================")
-        print("📊 Curation Threshold Status")
-        print("==================================================")
-        print(f" - Current dynamic threshold:  {cutoff_score:.4f}")
+        # Build and write Curation Threshold Status & Unassigned High-Rank Assets report to dedicated log
+        threshold_report = []
+        threshold_report.append("==================================================")
+        threshold_report.append("📊 Curation Threshold Status")
+        threshold_report.append("==================================================")
+        threshold_report.append(f" - Current dynamic threshold:  {cutoff_score:.4f}")
         if historical_min > 0.0:
-            print(f" - Historical minimum target:  {historical_min:.4f}")
+            threshold_report.append(f" - Historical minimum target:  {historical_min:.4f}")
             if cutoff_score > historical_min:
-                print(f"👉 Note: Please assign moments to assets in new batches until the threshold reaches {historical_min:.4f} again.")
+                threshold_report.append(f"👉 Note: Please assign moments to assets in new batches until the threshold reaches {historical_min:.4f} again.")
             else:
-                print(f"🎉 Threshold aligned! Current threshold matches or is below historical minimum.")
+                threshold_report.append("🎉 Threshold aligned! Current threshold matches or is below historical minimum.")
         else:
-            print(" - Historical minimum target:  None (No history recorded yet)")
-            print("👉 Note: Once you begin assigning moments, the lowest dynamic threshold reached will be tracked.")
-        print("==================================================\n")
+            threshold_report.append(" - Historical minimum target:  None (No history recorded yet)")
+            threshold_report.append("👉 Note: Once you begin assigning moments, the lowest dynamic threshold reached will be tracked.")
+        threshold_report.append("==================================================\n")
 
         # Determine effective cutoff threshold to use for selecting qualified moments in the table
         effective_threshold = cutoff_score
@@ -848,10 +917,10 @@ def run_memory_publishing_flow(cursor, conn):
         unassigned = cursor.fetchall()
 
         if unassigned:
-            print("\n==================================================")
-            print("⚠️  Unassigned High-Rank Assets (Need Moment Naming Decision)")
-            print("==================================================")
-            print("The following highly-ranked assets are not assigned to any Moment album in Apple Photos:")
+            threshold_report.append("==================================================")
+            threshold_report.append("⚠️  Unassigned High-Rank Assets (Need Moment Naming Decision)")
+            threshold_report.append("==================================================")
+            threshold_report.append("The following highly-ranked assets are not assigned to any Moment album in Apple Photos:")
             for fname, score, month, date_created, moment_title, moment_subtitle in unassigned:
                 captured_str = "—"
                 if date_created:
@@ -872,7 +941,6 @@ def run_memory_publishing_flow(cursor, conn):
                     except Exception:
                         captured_str = date_created[:19]
 
-                # Construct suggested album name if moment information is available
                 moment_parts = []
                 if moment_title:
                     moment_parts.append(moment_title.replace('\xa0', ' ').strip())
@@ -885,8 +953,86 @@ def run_memory_publishing_flow(cursor, conn):
                     suggested_name = f"{captured_date} - {' - '.join(moment_parts)}"
                     suggested_info = f", Suggested Album: {suggested_name}"
 
-                print(f" - {fname:<25} (Score: {score:.4f}, Captured: {captured_str}, Month: {month}{suggested_info})")
-            print("👉 Please consider creating a corresponding album under 'Media Organizer on LaCie / Moments' in Apple Photos (creating the album is sufficient, no need to place the files inside).\n")
+                threshold_report.append(f" - {fname:<25} (Score: {score:.4f}, Captured: {captured_str}, Month: {month}{suggested_info})")
+            threshold_report.append("👉 Please consider creating a corresponding album under 'Media Organizer on LaCie / Moments' in Apple Photos (creating the album is sufficient, no need to place the files inside).\n")
+
+        # Query published moments / folders with stats
+        cursor.execute("""
+            SELECT 
+                p.moment_name,
+                MAX(p.published_at_utc) AS last_published_at,
+                COUNT(DISTINCT p.asset_id) AS published_count,
+                AVG(v.score_normalized) AS avg_score,
+                MIN(v.score_normalized) AS min_score,
+                MAX(v.score_normalized) AS max_score,
+                MIN(a.date_created_utc) AS min_captured,
+                MAX(a.date_created_utc) AS max_captured,
+                GROUP_CONCAT(DISTINCT COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown')) AS camera_sources,
+                GROUP_CONCAT(DISTINCT p.platform) AS platforms
+            FROM publications p
+            JOIN assets a ON p.asset_id = a.asset_id
+            LEFT JOIN ranked_assets_view v ON v.asset_id = a.asset_id
+            LEFT JOIN imports i ON a.import_id = i.import_uuid
+            LEFT JOIN ZASSET za ON za.ZUUID = a.asset_id
+            LEFT JOIN ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
+            GROUP BY p.moment_name
+            ORDER BY MAX(p.published_at_utc) DESC, p.moment_name ASC
+        """)
+        published_folders = cursor.fetchall()
+
+        threshold_report.append("==================================================================================================================================")
+        threshold_report.append("🌟 Published Moments / Folders & Stats")
+        threshold_report.append("==================================================================================================================================")
+        if not published_folders:
+            threshold_report.append("ℹ️  No published moments recorded yet in database.\n")
+        else:
+            threshold_report.append("The following moments have been curated and published:")
+            pub_header = f"{'No.':<4} {'Moment Name':<30} {'Published At (Local)':<22} {'Assets':<8} {'Avg Score':<11} {'Score Range':<17} {'Capture Dates':<24} {'Camera Sources'}"
+            threshold_report.append(pub_header)
+            threshold_report.append("-" * len(pub_header))
+            for idx, p_row in enumerate(published_folders, 1):
+                p_name = p_row[0] or "—"
+                p_date_raw = p_row[1]
+                p_date_str = "—"
+                if p_date_raw:
+                    try:
+                        dt_utc = None
+                        for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                            try:
+                                dt_utc = datetime.strptime(p_date_raw, fmt)
+                                break
+                            except ValueError:
+                                continue
+                        if dt_utc:
+                            dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+                            dt_local = dt_utc.astimezone()
+                            p_date_str = dt_local.strftime("%Y-%m-%d %H:%M:%S")
+                        else:
+                            p_date_str = p_date_raw[:19]
+                    except Exception:
+                        p_date_str = p_date_raw[:19]
+
+                p_count = str(p_row[2])
+                p_avg = f"{p_row[3]:.4f}" if p_row[3] is not None else "—"
+                p_min = f"{p_row[4]:.4f}" if p_row[4] is not None else "—"
+                p_max = f"{p_row[5]:.4f}" if p_row[5] is not None else "—"
+                score_rng = f"{p_min} - {p_max}" if p_row[4] is not None else "—"
+                d_min = (p_row[6][:10] if p_row[6] else "—")
+                d_max = (p_row[7][:10] if p_row[7] else "—")
+                date_rng = f"{d_min} to {d_max}" if d_min != d_max else d_min
+                c_srcs = (p_row[8] or "Unknown").replace(',', ', ')
+                threshold_report.append(f"{idx:<4} {p_name:<30} {p_date_str:<22} {p_count:<8} {p_avg:<11} {score_rng:<17} {date_rng:<24} {c_srcs}")
+            threshold_report.append("==================================================================================================================================\n")
+
+        # Save to logs/curation_threshold_status.log and print to console
+        try:
+            with open(CURATION_THRESHOLD_LOG_PATH, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(threshold_report) + '\n')
+        except Exception as e:
+            logger.warning(f"Could not write curation threshold log: {e}")
+
+        print('\n' + '\n'.join(threshold_report))
+
         # 2. Query assets that have Moments and are in status >= 600
         if photos_db_attached:
             query = """
@@ -933,13 +1079,6 @@ def run_memory_publishing_flow(cursor, conn):
         cursor.execute(query, (effective_threshold,))
         rows = cursor.fetchall()
 
-        # Display qualified assets scoring components breakdown table
-        print("\n=========================================================================================================================")
-        print("📸 Qualified Assets Scoring Breakdown")
-        print("=========================================================================================================================")
-        print(f"{'No.':<4} {'Filename':<25} {'Assigned Album':<30} {'Norm Score':<12} {'Aesthetic':<12} {'Google Fav':<12} {'Apple Feat':<12} {'Monthly Sel':<12}")
-        print("-" * 125)
-        
         # Calculate counts of assets in each assigned album
         album_counts = {}
         processed_rows = []
@@ -957,22 +1096,33 @@ def run_memory_publishing_flow(cursor, conn):
                 -(x[0][2] if x[0][2] is not None else 0.0)
             )
         )
+
+        # Build Qualified Assets Scoring Breakdown report for file logging only (not printed to console)
+        scoring_report = []
+        scoring_report.append("=========================================================================================================================")
+        scoring_report.append("📸 Qualified Assets Scoring Breakdown")
+        scoring_report.append("=========================================================================================================================")
+        scoring_report.append(f"{'No.':<4} {'Filename':<25} {'Assigned Album':<30} {'Norm Score':<12} {'Aesthetic':<12} {'Google Fav':<12} {'Apple Feat':<12} {'Monthly Sel':<12}")
+        scoring_report.append("-" * 125)
         
         for idx, (row, assigned_album) in enumerate(processed_rows, 1):
             filename = row[3] if row[3] else "—"
-            
             score_normalized_val = row[2]
             score_normalized_str = f"{score_normalized_val:.4f}" if score_normalized_val is not None else "—"
-            
             aesthetic_score_val = row[4]
             aesthetic_score_str = f"{aesthetic_score_val:.4f}" if aesthetic_score_val is not None else "—"
-            
             google_fav = "✅ Yes" if row[5] else "❌ No"
             apple_feat = "✅ Yes" if row[6] else "❌ No"
             monthly_sel = "✅ Yes" if row[7] else "❌ No"
-            
-            print(f"{idx:<4} {filename:<25} {assigned_album:<30} {score_normalized_str:<12} {aesthetic_score_str:<12} {google_fav:<12} {apple_feat:<12} {monthly_sel:<12}")
-        print("=========================================================================================================================\n")
+            scoring_report.append(f"{idx:<4} {filename:<25} {assigned_album:<30} {score_normalized_str:<12} {aesthetic_score_str:<12} {google_fav:<12} {apple_feat:<12} {monthly_sel:<12}")
+        scoring_report.append("=========================================================================================================================\n")
+
+        try:
+            with open(SCORING_BREAKDOWN_LOG_PATH, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(scoring_report) + '\n')
+            print(f"📄 Qualified Assets Scoring Breakdown ({len(processed_rows)} assets) saved to: {SCORING_BREAKDOWN_LOG_PATH}\n")
+        except Exception as e:
+            logger.warning(f"Could not write scoring breakdown log: {e}")
         
         # Group by moment name
         moments_data = {}
@@ -1061,9 +1211,30 @@ def run_memory_publishing_flow(cursor, conn):
         cursor.execute("SELECT moment_name, memory_stage FROM curated_moments")
         stages = dict(cursor.fetchall())
 
-        # 4.5 Fetch publication information
-        cursor.execute("SELECT moment_name, MAX(published_at_utc), COUNT(*) FROM publications GROUP BY moment_name")
-        pub_info = {row[0]: (row[1], row[2]) for row in cursor.fetchall()}
+        # 4.5 Fetch publication information with score stats
+        cursor.execute("""
+            SELECT 
+                p.moment_name,
+                MAX(p.published_at_utc) AS last_published_at,
+                COUNT(DISTINCT p.asset_id) AS pub_count,
+                AVG(v.score_normalized) AS pub_avg_score,
+                MIN(v.score_normalized) AS pub_min_score,
+                MAX(v.score_normalized) AS pub_max_score
+            FROM publications p
+            JOIN assets a ON p.asset_id = a.asset_id
+            LEFT JOIN ranked_assets_view v ON v.asset_id = a.asset_id
+            GROUP BY p.moment_name
+        """)
+        pub_info = {
+            row[0]: {
+                'last_pub_utc': row[1],
+                'pub_count': row[2],
+                'pub_avg': row[3],
+                'pub_min': row[4],
+                'pub_max': row[5]
+            }
+            for row in cursor.fetchall()
+        }
 
         # 5. Format and display status report
         print("\n==================================================")
@@ -1086,17 +1257,40 @@ def run_memory_publishing_flow(cursor, conn):
             # Count-weighted rank score to prevent small/single-asset moments from dominating
             rank_score = avg_score * math.log(data['total_qualified'] + 1)
             
-            last_pub_date, pub_count = pub_info.get(name, (None, 0))
-            last_pub_str = last_pub_date[:10] if last_pub_date else "—"
+            p_data = pub_info.get(name, {})
+            last_pub_raw = p_data.get('last_pub_utc')
+            pub_count = p_data.get('pub_count', 0)
+            pub_avg = p_data.get('pub_avg')
+            pub_min = p_data.get('pub_min')
+            pub_max = p_data.get('pub_max')
+
+            last_pub_str = "—"
+            if last_pub_raw:
+                try:
+                    dt_utc = None
+                    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                        try:
+                            dt_utc = datetime.strptime(last_pub_raw, fmt)
+                            break
+                        except ValueError:
+                            continue
+                    if dt_utc:
+                        dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+                        dt_local = dt_utc.astimezone()
+                        last_pub_str = dt_local.strftime("%Y-%m-%d %H:%M")
+                    else:
+                        last_pub_str = last_pub_raw[:16]
+                except Exception:
+                    last_pub_str = last_pub_raw[:16]
             
             # Check if featured/published in less than a month (30 days)
             too_recent = False
-            if last_pub_date:
+            if last_pub_raw:
                 try:
-                    pub_dt = datetime.strptime(last_pub_date.split('.')[0], "%Y-%m-%d %H:%M:%S")
+                    pub_dt = datetime.strptime(last_pub_raw.split('.')[0], "%Y-%m-%d %H:%M:%S")
                 except ValueError:
                     try:
-                        pub_dt = datetime.strptime(last_pub_date, "%Y-%m-%d")
+                        pub_dt = datetime.strptime(last_pub_raw, "%Y-%m-%d")
                     except ValueError:
                         pub_dt = None
                 
@@ -1170,6 +1364,10 @@ def run_memory_publishing_flow(cursor, conn):
             elif not curated_exists and fs_curated_exists:
                 curated_str = "📁 Local Only"
 
+            pub_display = str(pub_count) if pub_count > 0 else "—"
+            pub_avg_str = f"{pub_avg:.4f}" if pub_avg is not None else "—"
+            pub_range_str = f"{pub_min:.4f} - {pub_max:.4f}" if pub_min is not None else "—"
+
             ranked_moments.append({
                 'name': name,
                 'total_qualified': data['total_qualified'],
@@ -1183,6 +1381,10 @@ def run_memory_publishing_flow(cursor, conn):
                 'to_be_curated_exists': to_be_curated_exists,
                 'curated_exists': curated_exists,
                 'fs_curated_exists': fs_curated_exists,
+                'pub_count': pub_count,
+                'pub_display': pub_display,
+                'pub_avg_str': pub_avg_str,
+                'pub_range_str': pub_range_str,
                 'last_pub_str': last_pub_str,
                 'can_publish_str': can_publish_str,
                 'assets_display': assets_display,
@@ -1206,17 +1408,18 @@ def run_memory_publishing_flow(cursor, conn):
             x['rank_score'] if ((x['proposed_count'] + x['curated_count']) < x['total_qualified']) else x['avg_score']
         ), reverse=True)
 
-        print(f"{'No.':<4} {'Moment Name':<30} {'Rank Score':<12} {'Avg Score':<10} {'Min Score':<10} {'Max Score':<10} {'Assets':<8} {'ToBeCurated?':<13} {'Curated?':<15} {'Published?':<11} {'Can Publish?':<13} {'Last Published':<15}")
-        print("-" * 160)
+        header_m = f"{'No.':<4} {'Moment Name':<30} {'Rank Score':<12} {'Avg Score':<10} {'Min Score':<10} {'Max Score':<10} {'Assets':<8} {'Pub.':<6} {'Pub. Avg':<10} {'Pub. Range':<17} {'ToBeCurated?':<13} {'Curated?':<15} {'Published?':<13} {'Can Publish?':<18} {'Last Published':<18}"
+        print(header_m)
+        print("-" * len(header_m))
         divider_printed = False
         for idx, m in enumerate(ranked_moments, 1):
             displayed_moments_map[idx] = {'name': m['name'], 'type': 'ranked_moment'}
             is_needs_update = (m['proposed_count'] + m['curated_count']) < m['total_qualified']
             if not is_needs_update and not divider_printed:
                 if idx > 1:
-                    print("-" * 160)
-                    print(f"--- Up-To-Date Moments " + "-" * 137)
-                    print("-" * 160)
+                    print("-" * len(header_m))
+                    print(f"--- Up-To-Date Moments " + "-" * (len(header_m) - 23))
+                    print("-" * len(header_m))
                 divider_printed = True
 
             to_be_curated_str = "✅ Yes" if m['to_be_curated_exists'] else "❌ No"
@@ -1224,13 +1427,122 @@ def run_memory_publishing_flow(cursor, conn):
                 to_be_curated_str = "🔄 Update needed"
             
             curated_str = m['curated_str']
-            published_str = "✅ Yes" if m['stage'] == 'M500' else "❌ No"
-            print(f"{idx:<4} {m['name']:<30} {m['rank_score']:<12.4f} {m['avg_score']:<10.4f} {m['min_score']:<10.4f} {m['max_score']:<10.4f} {m['assets_display']:<8} {to_be_curated_str:<13} {curated_str:<15} {published_str:<11} {m['can_publish_str']:<13} {m['last_pub_str']:<15}")
+            if m['pub_count'] == 0:
+                published_str = "❌ No"
+            elif m['pub_count'] >= m['total_qualified'] or m['stage'] == 'M500':
+                published_str = "✅ Yes"
+            else:
+                published_str = f"🔄 Part ({m['pub_count']})"
+
+            print(f"{idx:<4} {m['name']:<30} {m['rank_score']:<12.4f} {m['avg_score']:<10.4f} {m['min_score']:<10.4f} {m['max_score']:<10.4f} {m['assets_display']:<8} {m['pub_display']:<6} {m['pub_avg_str']:<10} {m['pub_range_str']:<17} {to_be_curated_str:<13} {curated_str:<15} {published_str:<13} {m['can_publish_str']:<18} {m['last_pub_str']:<18}")
+
+        # Build timeline map of moments to find closest merge suggestions for disjoint moments
+        cursor.execute("""
+            SELECT a.curated_album, v.MomentsAlbumName, a.date_created_utc
+            FROM assets a
+            LEFT JOIN ranked_assets_view v ON v.asset_id = a.asset_id
+            WHERE a.date_created_utc IS NOT NULL
+        """)
+        all_asset_dates = cursor.fetchall()
+        moment_dates_map = {}
+        for cur_alb, mom_name, dt_str in all_asset_dates:
+            dt = None
+            for fmt in ('%Y-%m-%d %H:%M:%S.%f', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d'):
+                try:
+                    dt = datetime.strptime(dt_str, fmt)
+                    break
+                except ValueError:
+                    pass
+            if not dt:
+                continue
+            for m_key in set([cur_alb, mom_name]):
+                if m_key:
+                    if m_key not in moment_dates_map:
+                        moment_dates_map[m_key] = []
+                    moment_dates_map[m_key].append(dt)
+
+        # Fallback date parsing from folder names on disk
+        if os.path.exists(CURATED_LACIE_DIR):
+            for d in os.listdir(CURATED_LACIE_DIR):
+                if not d.startswith('.') and os.path.isdir(os.path.join(CURATED_LACIE_DIR, d)):
+                    if d not in moment_dates_map:
+                        moment_dates_map[d] = []
+                    if not moment_dates_map[d]:
+                        m_match = re.match(r'(\d{4}-\d{2}-\d{2})', d)
+                        if m_match:
+                            try:
+                                moment_dates_map[d].append(datetime.strptime(m_match.group(1), '%Y-%m-%d'))
+                            except ValueError:
+                                pass
+                        else:
+                            m_match = re.match(r'(\d{4}-\d{2})', d)
+                            if m_match:
+                                try:
+                                    moment_dates_map[d].append(datetime.strptime(m_match.group(1) + '-01', '%Y-%m-%d'))
+                                except ValueError:
+                                    pass
+
+        moment_summary = {}
+        for m_name, dts in moment_dates_map.items():
+            if not dts:
+                continue
+            fs_path_m = os.path.join(CURATED_LACIE_DIR, m_name)
+            fs_cnt = len([f for f in os.listdir(fs_path_m) if not f.startswith('.')]) if os.path.exists(fs_path_m) else len(dts)
+            min_dt = min(dts)
+            max_dt = max(dts)
+            mid_dt = min_dt + (max_dt - min_dt) / 2
+            moment_summary[m_name] = {
+                'mid': mid_dt,
+                'count': fs_cnt
+            }
+
+        def find_closest_merge_candidate(target_name):
+            if target_name not in moment_summary:
+                return None
+            t_mid = moment_summary[target_name]['mid']
+            best_candidate = None
+            best_diff_days = None
+            for other_name, o_info in moment_summary.items():
+                if other_name == target_name:
+                    continue
+                if o_info['count'] < 3:
+                    continue
+                diff_sec = (o_info['mid'] - t_mid).total_seconds()
+                diff_days = diff_sec / 86400.0
+                abs_days = abs(diff_days)
+                if best_diff_days is None or abs_days < abs(best_diff_days):
+                    best_diff_days = diff_days
+                    best_candidate = other_name
+            if best_candidate:
+                days_int = round(abs(best_diff_days))
+                time_rel = f'+{days_int}d' if best_diff_days > 0 else f'-{days_int}d' if best_diff_days < 0 else '0d'
+                return f"💡 Suggest merge with: '{best_candidate}' ({time_rel})"
+            return None
 
         # Display Weekly Memory Publishing Recommendations
         recommendations = []
         for m in ranked_moments:
             name = m['name']
+            p_data = pub_info.get(name, {})
+            last_pub_date = p_data.get('last_pub_utc')
+            pub_count = p_data.get('pub_count', 0)
+            
+            # Check for Disjoint Moment (<3 qualified assets)
+            if m['total_qualified'] < 3:
+                suggested_merge = find_closest_merge_candidate(name)
+                recommendations.append({
+                    'name': name,
+                    'avg_score': m['avg_score'],
+                    'total_unique': m['total_qualified'],
+                    'pub_count': pub_count,
+                    'rec_count': 0,
+                    'action': "Disjoint: Merge needed (<3 assets)",
+                    'suggested_merge': suggested_merge,
+                    'rec_bases': [],
+                    'base_to_files': {}
+                })
+                continue
+
             fs_curated_path = os.path.join(CURATED_LACIE_DIR, name)
             
             # Check files in folder if it exists
@@ -1260,8 +1572,7 @@ def run_memory_publishing_flow(cursor, conn):
             unique_bases = list(base_to_files.keys())
             total_unique = len(unique_bases)
             
-            # Get publication count and timing info
-            last_pub_date, pub_count = pub_info.get(name, (None, 0))
+            # Check publication timing info
             too_recent = False
             if last_pub_date:
                 try:
@@ -1280,7 +1591,7 @@ def run_memory_publishing_flow(cursor, conn):
             if too_recent or total_unique <= pub_count:
                 continue
                 
-            # Query database scores for all assets in this moment
+            # Query database scores for all assets strictly assigned to this moment under Moments
             cursor.execute("""
                 SELECT original_filename, score_normalized 
                 FROM ranked_assets_view 
@@ -1295,23 +1606,23 @@ def run_memory_publishing_flow(cursor, conn):
                     base_orig = os.path.splitext(orig_fname)[0].lower()
                     base_scores[base_orig] = max(base_scores.get(base_orig, 0.0), score)
                     
-            # Sort unique bases by database score descending, fallback to name
-            scored_bases = []
-            for b in unique_bases:
-                score = base_scores.get(b, 0.0)
-                scored_bases.append((b, score))
-                
+            # Filter unique bases in folder strictly to assets that belong to this moment
+            valid_bases = [b for b in unique_bases if b in base_scores]
+            scored_bases = [(b, base_scores[b]) for b in valid_bases]
             scored_bases.sort(key=lambda x: (x[1], x[0]), reverse=True)
+            total_unique = len(valid_bases)
             
             # Determine recommendation based on publication count and remaining assets
             # We want to publish a batch of up to 9 assets.
             # If pub_count == 0 (first publication):
+            suggested_merge = None
             if pub_count == 0:
                 if total_unique < 3:
                     action = "Disjoint: Merge needed (<3 assets)"
                     rec_count = 0
                     rec_bases_list = []
                     rec_avg_score = m['avg_score']
+                    suggested_merge = find_closest_merge_candidate(name)
                 elif 3 <= total_unique <= 9:
                     action = "Publish Whole Album"
                     rec_count = total_unique
@@ -1338,6 +1649,7 @@ def run_memory_publishing_flow(cursor, conn):
                 'pub_count': pub_count,
                 'rec_count': rec_count,
                 'action': action,
+                'suggested_merge': suggested_merge,
                 'rec_bases': rec_bases_list,
                 'base_to_files': base_to_files
             })
@@ -1350,14 +1662,14 @@ def run_memory_publishing_flow(cursor, conn):
         actionable_recs.sort(key=lambda x: -x['avg_score'])
         disjoint_recs.sort(key=lambda x: -x['avg_score'])
         
-        # Select top 20 actionable and top 10 disjoint
-        top_recommendations = actionable_recs[:20] + disjoint_recs[:10]
+        # Select top 12 actionable and top 10 disjoint
+        top_recommendations = actionable_recs[:12] + disjoint_recs[:10]
         
         if top_recommendations:
             print("\n==================================================================================================================================================================")
-            print("📢 Publishing Recommendations (Top 20 Actionable & Top 10 Disjoint Candidates)")
+            print("📢 Publishing Recommendations (Top 12 Actionable & Top 10 Disjoint Candidates)")
             print("==================================================================================================================================================================")
-            print(f"{'No.':<4} {'Moment Name':<30} {'Avg Score':<10} {'Files':<6} {'Pub.':<5} {'Rec.':<5} {'Recommendation/Action':<42} {'Recommended Assets to Publish'}")
+            print(f"{'No.':<4} {'Moment Name':<30} {'Avg Score':<10} {'Files':<6} {'Pub.':<5} {'Rec.':<5} {'Recommendation/Action':<40} {'Recommended Assets / Suggested Merge'}")
             print("-" * 168)
             divider_printed = False
             start_idx = len(ranked_moments) + 1
@@ -1369,14 +1681,16 @@ def run_memory_publishing_flow(cursor, conn):
                     print("-" * 168)
                     divider_printed = True
                 
-                if rec['rec_bases']:
+                if rec['action'].startswith("Disjoint"):
+                    assets_str = rec.get('suggested_merge') or "—"
+                elif rec['rec_bases']:
                     if len(rec['rec_bases']) <= 5:
                         assets_str = ", ".join(rec['rec_bases'])
                     else:
                         assets_str = ", ".join(rec['rec_bases'][:4]) + f" (+{len(rec['rec_bases'])-4} more)"
                 else:
                     assets_str = "—"
-                print(f"{idx:<4} {rec['name']:<30} {rec['avg_score']:<10.4f} {rec['total_unique']:<6} {rec['pub_count']:<5} {rec['rec_count']:<5} {rec['action']:<42} {assets_str}")
+                print(f"{idx:<4} {rec['name']:<30} {rec['avg_score']:<10.4f} {rec['total_unique']:<6} {rec['pub_count']:<5} {rec['rec_count']:<5} {rec['action']:<40} {assets_str}")
             print("==================================================================================================================================================================\n")
 
             # Sync folders and files to 'Publishing Recommendation' directory
@@ -1463,7 +1777,7 @@ def run_memory_publishing_flow(cursor, conn):
             script_dir = os.path.dirname(os.path.abspath(__file__))
             logger.info("Syncing proposed assets to Apple Photos...")
             try:
-                subprocess.run(["python3", os.path.join(script_dir, "create_apple_moments_albums.py")], check=True)
+                subprocess.run([sys.executable, os.path.join(script_dir, "create_apple_moments_albums.py")], check=True)
                 logger.info("Sync complete.")
             except subprocess.CalledProcessError as e:
                 logger.error(f"Sync failed: {e}")
@@ -1489,7 +1803,7 @@ def run_memory_publishing_flow(cursor, conn):
                     
             script_dir = os.path.dirname(os.path.abspath(__file__))
             try:
-                subprocess.run(["python3", os.path.join(script_dir, "export_curated_album.py"), moment_name], check=True)
+                subprocess.run([sys.executable, os.path.join(script_dir, "export_curated_album.py"), moment_name], check=True)
             except subprocess.CalledProcessError as e:
                 logger.error(f"Export failed: {e}")
         elif choice == '3':
@@ -1571,21 +1885,137 @@ def run_memory_publishing_flow(cursor, conn):
         elif choice == 'e':
             break
 
+def display_media_cleanup_recommendations(cursor, verbose=True):
+    """
+    Generates and displays media cleanup recommendations for source cameras based on published albums.
+    For each published album, identifies contributing camera sources, date ranges, and filename ranges.
+    """
+    cursor.execute("""
+        SELECT 
+            p.moment_name,
+            MAX(p.published_at_utc) AS last_published_at,
+            COALESCE(zea.ZCAMERAMAKE, i.camera_make, 'Unknown') AS camera_make,
+            COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') AS camera_model,
+            COUNT(DISTINCT a.asset_id) AS total_published_assets,
+            MIN(a.original_filename) AS min_filename,
+            MAX(a.original_filename) AS max_filename,
+            MIN(a.date_created_utc) AS min_date,
+            MAX(a.date_created_utc) AS max_date,
+            GROUP_CONCAT(DISTINCT a.month) AS batch_months
+        FROM publications p
+        JOIN assets a ON p.asset_id = a.asset_id
+        LEFT JOIN imports i ON a.import_id = i.import_uuid
+        LEFT JOIN ZASSET za ON za.ZUUID = a.asset_id
+        LEFT JOIN ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
+        GROUP BY p.moment_name, COALESCE(zea.ZCAMERAMAKE, i.camera_make, 'Unknown'), COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown')
+        ORDER BY MAX(p.published_at_utc) DESC, p.moment_name ASC
+    """)
+    rows = cursor.fetchall()
+
+    cleanup_report = []
+    cleanup_report.append("==================================================================================================================================")
+    cleanup_report.append("🧹 Media Cleanup Recommendations (Safe to Delete from Source Cameras)")
+    cleanup_report.append("==================================================================================================================================")
+
+    if not rows:
+        cleanup_report.append("ℹ️  No published moments found in database.")
+        cleanup_report.append("👉 Once moments are published in Mode [M], safe deletion recommendations for your camera SD cards will appear here.")
+        cleanup_report.append("==================================================================================================================================\n")
+    else:
+        cleanup_report.append("The following events/moments have been curated and published.")
+        cleanup_report.append("You can safely format or delete these files from your source cameras / SD cards:\n")
+        header = f"{'No.':<4} {'Moment / Album Name':<30} {'Camera Source':<24} {'Files':<6} {'Filename Range':<32} {'Date Range':<24} {'Published At (Local)':<22}"
+        cleanup_report.append(header)
+        cleanup_report.append("-" * len(header))
+
+        for idx, row in enumerate(rows, 1):
+            m_name = row[0] or "—"
+            p_date_raw = row[1]
+            pub_date_str = "—"
+            if p_date_raw:
+                try:
+                    dt_utc = None
+                    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                        try:
+                            dt_utc = datetime.strptime(p_date_raw, fmt)
+                            break
+                        except ValueError:
+                            continue
+                    if dt_utc:
+                        dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+                        dt_local = dt_utc.astimezone()
+                        pub_date_str = dt_local.strftime("%Y-%m-%d %H:%M:%S")
+                    else:
+                        pub_date_str = p_date_raw[:19]
+                except Exception:
+                    pub_date_str = p_date_raw[:19]
+
+            c_make = row[2] or ""
+            c_model = row[3] or "Unknown"
+            c_source = f"{c_model}" if (c_model != "Unknown" and c_model) else (c_make or "Unknown")
+            file_count = str(row[4])
+            f_min = row[5] or "—"
+            f_max = row[6] or "—"
+            f_range = f"{f_min} -> {f_max}" if f_min != f_max else f_min
+            d_min = (row[7][:10] if row[7] else "—")
+            d_max = (row[8][:10] if row[8] else "—")
+            d_range = f"{d_min} to {d_max}" if d_min != d_max else d_min
+
+            line = f"{idx:<4} {m_name:<30} {c_source:<24} {file_count:<6} {f_range:<32} {d_range:<24} {pub_date_str:<22}"
+            cleanup_report.append(line)
+
+        cleanup_report.append("==================================================================================================================================\n")
+
+    # Write to dedicated log file
+    try:
+        with open(MEDIA_CLEANUP_LOG_PATH, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(cleanup_report) + '\n')
+        if verbose:
+            logger.info(f"📄 Media cleanup recommendations written to {MEDIA_CLEANUP_LOG_PATH}")
+    except Exception as e:
+        logger.warning(f"Could not write media cleanup log: {e}")
+
+    # Print to console
+    print('\n' + '\n'.join(cleanup_report))
+
 def main(auto_apply, no_sync=False):
     # Set up logger with line number in format
 
-    # Check for active planned execution first to prevent overlapping plans
+    # Check for active planned executions in queue
     check_conn = sqlite3.connect(MEDIA_ORGANIZER_DB_PATH)
     check_cursor = check_conn.cursor()
-    check_cursor.execute("SELECT planned_month FROM planned_execution WHERE active = 1")
-    planned_row = check_cursor.fetchone()
+    check_cursor.execute("SELECT id, planned_month, set_at_utc FROM planned_execution WHERE active = 1 ORDER BY id ASC")
+    active_plans = check_cursor.fetchall()
     check_conn.close()
 
-    if planned_row:
-        active_month = planned_row[0]
-        logger.warning(f"⚠️ An active plan for month {active_month} already exists.")
-        logger.info(f"Please run 'python3 scripts/pipeline_executor.py' to execute it, or manually reset the planned_execution table.")
-        sys.exit(0)
+    if active_plans:
+        logger.info(f"📋 Current execution queue ({len(active_plans)} batch(es) pending):")
+        for plan_id, p_month, p_time in active_plans:
+            logger.info(f"   • Queue ID {plan_id}: Batch {p_month} (queued at {p_time})")
+
+        if not auto_apply:
+            print("\n📋 Active execution queue:")
+            for plan_id, p_month, p_time in active_plans:
+                print(f"   • Queue ID {plan_id}: Batch {p_month} (queued at {p_time})")
+            
+            queue_choice = input("\nOptions: [E]xecute queue now | [C]ontinue planning next batch | [R]eset/clear queue | [Q]uit [E/c/r/q]: ").strip().lower()
+            if queue_choice == 'e':
+                executor_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pipeline_executor.py")
+                logger.info(f"🚀 Launching pipeline_executor for queued batches: {executor_path}")
+                os.execv(sys.executable, [sys.executable, executor_path])
+            elif queue_choice == 'r':
+                reset_conn = sqlite3.connect(MEDIA_ORGANIZER_DB_PATH)
+                reset_cursor = reset_conn.cursor()
+                reset_cursor.execute("UPDATE planned_execution SET active = 0 WHERE active = 1")
+                reset_conn.commit()
+                reset_conn.close()
+                logger.info("🗑️ Active execution queue cleared.")
+                active_plans = []
+            elif queue_choice == 'q':
+                logger.info("Exiting planner.")
+                sys.exit(0)
+            else:
+                logger.info("Proceeding to plan next batch...")
 
     # Run bootstrap steps before proceeding
     if not no_sync:
@@ -1593,15 +2023,22 @@ def main(auto_apply, no_sync=False):
     else:
         logger.info("⚡ Fast Mode: Skipping bootstrap sync steps.")
 
-    # Prompt for session mode: Memory Feature & Publishing or Batch Management
+    # Prompt for session mode: Batch Management, Memory Feature & Publishing, or Media Cleanup
     if not auto_apply:
         print("\n--- 🛠️  Session Mode ---")
-        mode = input("Select mode: [B] Batch Management (default) | [M] Memory Feature & Publishing: ").strip().lower()
+        mode = input("Select mode: [B] Batch Management (default) | [M] Memory Feature & Publishing | [C] Media Cleanup: ").strip().lower()
         if mode == 'm':
             conn = get_connection()
             conn.execute("PRAGMA busy_timeout = 30000")
             cursor = get_cursor()
             run_memory_publishing_flow(cursor, conn)
+            close_conn()
+            sys.exit(0)
+        elif mode == 'c':
+            conn = get_connection()
+            conn.execute("PRAGMA busy_timeout = 30000")
+            cursor = get_cursor()
+            display_media_cleanup_recommendations(cursor, verbose=True)
             close_conn()
             sys.exit(0)
 
@@ -1650,6 +2087,9 @@ def main(auto_apply, no_sync=False):
     batches = get_batch_statuses(cursor)
 
     display_summary(transitions, batches, cursor, remote_favs_cache)
+
+    # Media cleanup recommendations for source cameras
+    display_media_cleanup_recommendations(cursor, verbose=False)
 
     # Proactive check for new month readiness
     if batches:
@@ -1727,8 +2167,15 @@ def main(auto_apply, no_sync=False):
     selected_month = None
     selected_transition = None
 
+    # Check active queue to skip already-queued candidates
+    cursor.execute("SELECT planned_month FROM planned_execution WHERE active = 1")
+    active_planned_set = set(row[0] for row in cursor.fetchall())
+
     logger.info("🔍 Evaluating manual transition candidates...")
     for month, transition in manual_candidates:
+        if month in active_planned_set:
+            logger.info(f"  ⏭️ Skipping {month} (already in planned execution queue).")
+            continue
         selected_code, selected_prev, selected_desc, selected_type, short_label = transition
         logger.info(f"  Checking {month} ({selected_desc}, status {selected_prev})...")
 
@@ -1773,6 +2220,9 @@ def main(auto_apply, no_sync=False):
 
     logger.info("🔍 Evaluating retryable transition candidates...")
     for month, transition in retryable_candidates:
+        if month in active_planned_set:
+            logger.info(f"  ⏭️ Skipping {month} (already in planned execution queue).")
+            continue
         selected_code, selected_prev, selected_desc, selected_type, short_label = transition
 
         # Only perform space-based analysis and branching for batches that haven't finished 
@@ -1798,6 +2248,11 @@ def main(auto_apply, no_sync=False):
             else:
                 staging_folder = None; staging_size = 0; logger.warning(f"No staging folder found for {month}")
 
+            cursor.execute("SELECT COUNT(*), COUNT(CASE WHEN uploaded_to_google = 1 THEN 1 END) FROM assets WHERE month = ?", (month,))
+            row_cnt = cursor.fetchone()
+            total_db_assets = row_cnt[0] if row_cnt else 0
+            uploaded_db_count = row_cnt[1] if row_cnt else 0
+
             cursor.execute("SELECT original_filename FROM assets WHERE month = ? AND uploaded_to_google = 1", (month,))
             uploaded_assets = cursor.fetchall()
             latest_upload_size = 0
@@ -1806,11 +2261,15 @@ def main(auto_apply, no_sync=False):
                     file_path = os.path.join(staging_folder, filename_tuple[0])
                     if os.path.exists(file_path):
                         latest_upload_size += os.path.getsize(file_path)
-            logger.info(f"Upload progress: {human_readable_size(latest_upload_size)} of {month} already in Google Photos.")
+            logger.info(f"Upload progress: {uploaded_db_count}/{total_db_assets} assets ({human_readable_size(latest_upload_size)}) of {month} in Google Photos.")
 
-            remaining_to_upload = max(0, staging_size - latest_upload_size)
-            if remaining_to_upload == 0:
-                logger.info(f"✅ All assets for {month} appear to be uploaded already.")
+            if staging_folder and staging_size > 0:
+                remaining_to_upload = max(0, staging_size - latest_upload_size)
+            else:
+                remaining_to_upload = 0 if (total_db_assets > 0 and uploaded_db_count >= total_db_assets) else 999999999999
+
+            if total_db_assets > 0 and uploaded_db_count >= total_db_assets and remaining_to_upload == 0:
+                logger.info(f"✅ All assets for {month} appear to be uploaded already ({uploaded_db_count}/{total_db_assets}).")
                 if auto_apply: proceed_transition = True
                 else:
                     ans = input(f"All assets uploaded - transition {month} to 400 status? [y/N]: ").strip().lower()
@@ -1818,7 +2277,7 @@ def main(auto_apply, no_sync=False):
                 if proceed_transition:
                     cursor.execute("UPDATE month_batches SET status_code = '400' WHERE month = ?", (month,))
                     conn.commit(); logger.info(f"Month {month} updated to 400."); close_conn(); sys.exit(0)
-            elif free_space >= remaining_to_upload:
+            elif staging_folder and free_space >= remaining_to_upload:
                 logger.info(f"🚀 Found {human_readable_size(remaining_to_upload)} left to upload for {month}. "
                             f"Available space: {human_readable_size(free_space)}. Priority given to finishing this batch.")
                 selected_month = month
@@ -1843,9 +2302,16 @@ def main(auto_apply, no_sync=False):
 
     if not selected_month:
         logger.info("🔍 Evaluating pipeline transition candidates...")
-        if not pipeline_candidates:
-            logger.info("No pipeline transitions available. Exiting."); close_conn(); sys.exit(0)
-        selected_month, selected_transition = pipeline_candidates[0]
+        available_pipeline_candidates = [
+            (m, t) for m, t in pipeline_candidates if m not in active_planned_set
+        ]
+        if not available_pipeline_candidates:
+            if active_planned_set:
+                logger.info(f"All available pipeline candidates are already in the execution queue ({sorted(list(active_planned_set))}). Exiting.")
+            else:
+                logger.info("No pipeline transitions available. Exiting.")
+            close_conn(); sys.exit(0)
+        selected_month, selected_transition = available_pipeline_candidates[0]
 
     latest_month = selected_month
     selected_code, selected_prev, selected_desc, selected_type, short_label = selected_transition
@@ -1865,8 +2331,16 @@ def main(auto_apply, no_sync=False):
             if str(current_status) in ('000', '100E'):
                 cursor.execute("SELECT COUNT(*) FROM smart_albums WHERE LOWER(album_name) = ?", (latest_month.lower(),))
                 if cursor.fetchone()[0] == 0:
-                    logger.error(f"❌ Smart Album '{latest_month}' does not exist in Apple Photos.")
-                    logger.info(f"👉 Please create the Smart Album '{latest_month}' inside 'MonthlyExports' in Apple Photos first.")
+                    logger.warning(f"⚠️ Smart Album '{latest_month}' does not exist in Apple Photos.")
+                    logger.info(f"👉 Please create the Smart Album '{latest_month}' inside 'Media Organizer on LaCie > Google Photos Pipeline > MonthlyExports' in Apple Photos first.")
+                    if not auto_apply:
+                        ans = input("\nPress [Enter] once created to resync and restart the planner (or [Q] to quit): ").strip().lower()
+                        if ans != 'q':
+                            logger.info("🔄 Forcing metadata resync and restarting planner...")
+                            cursor.execute("UPDATE db_updates SET raw_synced = 0, derived_synced = 0")
+                            conn.commit()
+                            close_conn()
+                            os.execv(sys.executable, [sys.executable] + sys.argv)
                     logger.info("Then, re-run the pipeline planner to sync the changes and proceed.")
                     close_conn()
                     sys.exit(0)
@@ -1984,6 +2458,14 @@ def main(auto_apply, no_sync=False):
         set_planned_month(cursor, latest_month)
         conn.commit()
         logger.info(f"📌 Month {latest_month} recorded in planned_execution for next pipeline run.")
+
+        if not auto_apply:
+            exec_now = input("\n🚀 Would you like to start the pipeline executor now? [y/N]: ").strip().lower()
+            if exec_now == 'y':
+                close_conn()
+                executor_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pipeline_executor.py")
+                logger.info(f"🚀 Launching pipeline_executor: {executor_path}")
+                os.execv(sys.executable, [sys.executable, executor_path])
 
         if selected_type not in ['manual', 'retryable', 'pipeline']:
             logger.warning(f"Unknown transition type '{selected_type}' for current status {current_status}.")

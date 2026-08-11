@@ -4,6 +4,9 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MEDIA_ORGANIZER_DB_PATH = os.path.join(BASE_DIR, '../db/media_organizer.db')
 LOG_PATH = os.path.join(BASE_DIR, '../logs/media_organizer.log')
 APPLE_SCRIPT_LOG_PATH = os.path.join(BASE_DIR, '../logs/applescript_execution.log')
+CURATION_THRESHOLD_LOG_PATH = os.path.join(BASE_DIR, '../logs/curation_threshold_status.log')
+SCORING_BREAKDOWN_LOG_PATH = os.path.join(BASE_DIR, '../logs/qualified_assets_scoring_breakdown.log')
+MEDIA_CLEANUP_LOG_PATH = os.path.join(BASE_DIR, '../logs/media_cleanup_recommendations.log')
 
 # Paths to the Apple Photos database and Media Organizer database
 # For safety - during DEV will use a copy of the All-Media DB 

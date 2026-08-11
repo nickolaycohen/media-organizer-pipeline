@@ -29,6 +29,7 @@ def get_planned_month(cursor):
         SELECT planned_month 
         FROM planned_execution 
         WHERE active = 1 
+        ORDER BY id ASC
         LIMIT 1
     """)
     row = cursor.fetchone()

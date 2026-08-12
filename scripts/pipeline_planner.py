@@ -774,7 +774,6 @@ def run_memory_publishing_flow(cursor, conn):
 
         # Try attaching Apple Photos DB copy to fetch Apple's auto-generated moments and filter ignored items
         photos_db_attached = False
-        skip_bases = set()
         try:
             from constants import APPLE_PHOTOS_DB_COPY_PATH
             # Pre-open direct connection to force SQLite recovery/WAL resolution on the copy
@@ -787,22 +786,6 @@ def run_memory_publishing_flow(cursor, conn):
 
             cursor.execute(f"ATTACH DATABASE '{APPLE_PHOTOS_DB_COPY_PATH}' AS photos_db;")
             photos_db_attached = True
-            
-            # Load assets to skip from Apple Photos ('ignore'/'skippublishing' albums)
-            try:
-                cursor.execute("""
-                    SELECT DISTINCT aaa.ZORIGINALFILENAME
-                    FROM photos_db.ZGENERICALBUM ga
-                    JOIN photos_db.Z_30ASSETS aa ON aa.Z_30ALBUMS = ga.Z_PK
-                    JOIN photos_db.ZASSET a ON aa.Z_3ASSETS = a.Z_PK
-                    JOIN photos_db.ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK
-                    WHERE ga.ZTRASHEDSTATE = 0 AND ga.ZKIND <> 1507
-                      AND LOWER(ga.ZTITLE) IN ('ignore', 'skippublishing')
-                """)
-                skip_bases = set(os.path.splitext(row[0])[0].lower() for row in cursor.fetchall() if row[0])
-                logger.info(f"Loaded {len(skip_bases)} assets to skip from Apple Photos ('ignore'/'skippublishing')")
-            except Exception as e:
-                logger.warning(f"Could not load skip/ignore assets: {e}")
         except Exception as e:
             logger.warning(f"Could not attach Photos.sqlite for Apple moment lookup: {e}")
 
@@ -1243,7 +1226,7 @@ def run_memory_publishing_flow(cursor, conn):
         
         ranked_moments = []
         for name, data in moments_data.items():
-            target_scores = data['unpublished_scores'] if data['unpublished_scores'] else data['scores']
+            target_scores = data['unpublished_scores']
             avg_score = sum(target_scores) / len(target_scores) if target_scores else 0.0
             stage = stages.get(name, 'M100')
             
@@ -1400,11 +1383,9 @@ def run_memory_publishing_flow(cursor, conn):
 
         # Sort by: 
         # 1. Needs update (proposed + curated < total_qualified)
-        # 2. Stage (M100 first)
-        # 3. If needs update: rank score descending; if up-to-date: average score descending
+        # 2. If needs update: rank score descending; if up-to-date: average score descending
         ranked_moments.sort(key=lambda x: (
             (x['proposed_count'] + x['curated_count']) < x['total_qualified'],
-            x['stage'] != 'M500',  # Put published at the bottom
             x['rank_score'] if ((x['proposed_count'] + x['curated_count']) < x['total_qualified']) else x['avg_score']
         ), reverse=True)
 
@@ -1505,7 +1486,7 @@ def run_memory_publishing_flow(cursor, conn):
             for other_name, o_info in moment_summary.items():
                 if other_name == target_name:
                     continue
-                if o_info['count'] < 3:
+                if o_info['count'] < 2:
                     continue
                 diff_sec = (o_info['mid'] - t_mid).total_seconds()
                 diff_days = diff_sec / 86400.0
@@ -1527,8 +1508,8 @@ def run_memory_publishing_flow(cursor, conn):
             last_pub_date = p_data.get('last_pub_utc')
             pub_count = p_data.get('pub_count', 0)
             
-            # Check for Disjoint Moment (<3 qualified assets)
-            if m['total_qualified'] < 3:
+            # Check for Disjoint Moment (<2 qualified assets)
+            if m['total_qualified'] < 2:
                 suggested_merge = find_closest_merge_candidate(name)
                 recommendations.append({
                     'name': name,
@@ -1536,7 +1517,7 @@ def run_memory_publishing_flow(cursor, conn):
                     'total_unique': m['total_qualified'],
                     'pub_count': pub_count,
                     'rec_count': 0,
-                    'action': "Disjoint: Merge needed (<3 assets)",
+                    'action': "Disjoint: Merge needed (<2 assets)",
                     'suggested_merge': suggested_merge,
                     'rec_bases': [],
                     'base_to_files': {}
@@ -1563,8 +1544,6 @@ def run_memory_publishing_flow(cursor, conn):
             for f in files:
                 base, ext = os.path.splitext(f)
                 base_lower = base.lower()
-                if base_lower in skip_bases:
-                    continue
                 if base_lower not in base_to_files:
                     base_to_files[base_lower] = []
                 base_to_files[base_lower].append(f)
@@ -1617,13 +1596,13 @@ def run_memory_publishing_flow(cursor, conn):
             # If pub_count == 0 (first publication):
             suggested_merge = None
             if pub_count == 0:
-                if total_unique < 3:
-                    action = "Disjoint: Merge needed (<3 assets)"
+                if total_unique < 2:
+                    action = "Disjoint: Merge needed (<2 assets)"
                     rec_count = 0
                     rec_bases_list = []
                     rec_avg_score = m['avg_score']
                     suggested_merge = find_closest_merge_candidate(name)
-                elif 3 <= total_unique <= 9:
+                elif 2 <= total_unique <= 9:
                     action = "Publish Whole Album"
                     rec_count = total_unique
                     rec_bases_list = [b[0] for b in scored_bases]

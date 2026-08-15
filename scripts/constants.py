@@ -31,6 +31,11 @@ APPLE_FEATURED_WEIGHT = 0.15
 MAX_RETRIES = 5
 RETRY_DELAY = 30
 
+# Upload Settings
+MAX_UPLOAD_FILE_SIZE_MB = 50
+MAX_UPLOAD_FILE_SIZE_BYTES = MAX_UPLOAD_FILE_SIZE_MB * 1024 * 1024
+SKIPPED_UPLOADS_ALBUM_NAME = "Google Upload Skipped Videos"
+
 # --- Google API Scopes ---
 # https://developers.google.com/photos/overview/authorization
 # https://developers.google.com/photos/library/reference/rest/v1/albums/get

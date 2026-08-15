@@ -41,6 +41,9 @@ def main(month, dry_run=False, session_id=None):
         # We assume the caller has validated the correct month; this check is no longer needed
 
         success = run_applescript_export(month, logger, dry_run)
+        if not success:
+            logger.error("❌ AppleScript export failed. Exiting with error.")
+            sys.exit(1)
 
         # if success and not dry_run:
         #     set_batch_status(cursor, month, '200', session_id=session_id)

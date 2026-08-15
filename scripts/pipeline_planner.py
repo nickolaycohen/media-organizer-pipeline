@@ -12,7 +12,7 @@ from utils.utils import get_full_transition_path, human_readable_size
 from google_photos import check_google_quota, authenticate, get_all_favorites
 import argparse
 import sqlite3
-from constants import MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_COPY_PATH, LOG_PATH, GOOGLE_PHOTOS_READONLY_SCOPES, GOOGLE_DRIVE_READ_ONLY_SCOPES, PLANNER_REQUIRED_SCOPES, CURATION_THRESHOLD_LOG_PATH, SCORING_BREAKDOWN_LOG_PATH, MEDIA_CLEANUP_LOG_PATH
+from constants import MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_COPY_PATH, LOG_PATH, GOOGLE_PHOTOS_READONLY_SCOPES, GOOGLE_DRIVE_READ_ONLY_SCOPES, PLANNER_REQUIRED_SCOPES, CURATION_THRESHOLD_LOG_PATH, SCORING_BREAKDOWN_LOG_PATH, MEDIA_CLEANUP_LOG_PATH, MAX_UPLOAD_FILE_SIZE_BYTES, MAX_UPLOAD_FILE_SIZE_MB
 from constants import ACTIVE_CAMERA_MODELS
 from db.connections import get_connection, get_cursor, commit, close as close_conn
 from db.queries import get_stage_transitions, get_batch_statuses, get_latest_import_and_month
@@ -1282,11 +1282,13 @@ def run_memory_publishing_flow(cursor, conn):
                     if diff.days < 30:
                         too_recent = True
             
-            if too_recent:
+            has_unpublished = (fs_curated_exists and data['curated_count'] > 0 and data['curated_count'] > pub_count)
+            if not has_unpublished:
+                can_publish_str = "❌ No"
+            elif too_recent:
                 can_publish_str = "❌ Recent (<30d)"
             else:
-                # Can be published if local folder exists, has assets, and we have more curated assets than published ones
-                can_publish_str = "✅ Yes" if (fs_curated_exists and data['curated_count'] > 0 and data['curated_count'] > pub_count) else "❌ No"
+                can_publish_str = "✅ Yes"
             
             # Determine asset count to display (use filesystem count if curated folder exists,
             # fallback to database curated count if present, otherwise total qualified proposed assets)
@@ -1410,7 +1412,7 @@ def run_memory_publishing_flow(cursor, conn):
             curated_str = m['curated_str']
             if m['pub_count'] == 0:
                 published_str = "❌ No"
-            elif m['pub_count'] >= m['total_qualified'] or m['stage'] == 'M500':
+            elif m['pub_count'] >= m['total_qualified'] or (m['stage'] == 'M500' and m['pub_count'] >= m['curated_count']):
                 published_str = "✅ Yes"
             else:
                 published_str = f"🔄 Part ({m['pub_count']})"
@@ -1501,6 +1503,13 @@ def run_memory_publishing_flow(cursor, conn):
             return None
 
         # Display Weekly Memory Publishing Recommendations
+        cursor.execute("SELECT asset_id, moment_name FROM publications")
+        published_assets_by_moment = {}
+        for aid, mom_name in cursor.fetchall():
+            if mom_name not in published_assets_by_moment:
+                published_assets_by_moment[mom_name] = set()
+            published_assets_by_moment[mom_name].add(aid)
+
         recommendations = []
         for m in ranked_moments:
             name = m['name']
@@ -1572,18 +1581,21 @@ def run_memory_publishing_flow(cursor, conn):
                 
             # Query database scores for all assets strictly assigned to this moment under Moments
             cursor.execute("""
-                SELECT original_filename, score_normalized 
+                SELECT original_filename, score_normalized, asset_id 
                 FROM ranked_assets_view 
                 WHERE MomentsAlbumName = ?
             """, (name,))
             db_assets = cursor.fetchall()
             
-            # Map base name to highest score
+            # Map base name to highest score and keep asset ID
             base_scores = {}
-            for orig_fname, score in db_assets:
+            base_asset_ids = {}
+            for orig_fname, score, asset_id in db_assets:
                 if orig_fname:
                     base_orig = os.path.splitext(orig_fname)[0].lower()
-                    base_scores[base_orig] = max(base_scores.get(base_orig, 0.0), score)
+                    if score > base_scores.get(base_orig, -1.0):
+                        base_scores[base_orig] = score
+                        base_asset_ids[base_orig] = asset_id
                     
             # Filter unique bases in folder strictly to assets that belong to this moment
             valid_bases = [b for b in unique_bases if b in base_scores]
@@ -1613,7 +1625,11 @@ def run_memory_publishing_flow(cursor, conn):
                     rec_bases_list = [b[0] for b in scored_bases[:9]]
                     rec_avg_score = sum(b[1] for b in scored_bases[:9]) / 9
             else: # pub_count > 0 (republishing next batch)
-                rem_bases = scored_bases[pub_count:]
+                published_set = published_assets_by_moment.get(name, set())
+                rem_bases = [
+                    (b, score) for b, score in scored_bases
+                    if base_asset_ids.get(b) not in published_set
+                ]
                 if not rem_bases:
                     continue
                 rec_count = min(9, len(rem_bases))
@@ -2059,6 +2075,44 @@ def main(auto_apply, no_sync=False):
     try:
         logger.info("🌐 Fetching remote favorites from Google Photos API to verify curation status...")
         remote_favs_cache = get_all_favorites(creds)
+        
+        # Auto-run retroactive favorites sync for bypassed months
+        try:
+            cursor.execute("SELECT month FROM month_batches WHERE is_bypassed = 1")
+            byp_months = [row[0] for row in cursor.fetchall()]
+            if byp_months:
+                logger.info(f"🔄 Auto-syncing late favorites for bypassed months: {byp_months}...")
+                from google_photos import create_or_get_album
+                from pull_google_favorites import get_album_items
+                
+                favorite_set = {(f.get('filename'), f.get('mediaMetadata', {}).get('creationTime')) for f in remote_favs_cache}
+                for bm in byp_months:
+                    album_title = f"Currently Curating - {bm}"
+                    album_id = create_or_get_album(creds, album_title)
+                    if album_id:
+                        album_items = get_album_items(creds, album_id)
+                        matched = [item for item in album_items
+                                   if (item.get('filename'), item.get('mediaMetadata', {}).get('creationTime')) in favorite_set]
+                        
+                        update_count = 0
+                        for item in matched:
+                            filename = item.get('filename')
+                            raw_creation_time = item.get('mediaMetadata', {}).get('creationTime', '')
+                            creation_time = raw_creation_time.replace('T', ' ').split('.')[0] if raw_creation_time else ''
+                            if filename and creation_time:
+                                cursor.execute("""
+                                    UPDATE assets
+                                    SET google_favorite = 1, updated_at_utc = datetime('now')
+                                    WHERE original_filename = ? AND date_created_utc = ? AND month = ? AND MomentsAlbumName IS NOT NULL AND google_favorite = 0
+                                """, (filename, creation_time, bm))
+                                if cursor.rowcount:
+                                    update_count += 1
+                        if update_count > 0:
+                            conn.commit()
+                            logger.info(f"⭐️ Retroactively synced {update_count} favorites for bypassed month {bm}.")
+        except Exception as ex:
+            logger.error(f"Error during bypassed batch auto-sync: {ex}")
+            
     except Exception as e:
         logger.warning(f"Could not pre-fetch remote favorites: {e}")
 
@@ -2136,7 +2190,24 @@ def main(auto_apply, no_sync=False):
                 retryable_candidates.append((month, t))
             elif t[3] == 'pipeline':
                 logger.debug(f"Found pipeline transition candidate for month {month}: {t[2]} (code {t[1]}) -> (code {t[0]})")
-                pipeline_candidates.append((month, t))
+                
+                is_delay = False
+                if t[0] == '650':
+                    cursor.execute("SELECT is_bypassed, bypass_timestamp FROM month_batches WHERE month = ?", (month,))
+                    row_byp = cursor.fetchone()
+                    if row_byp and row_byp[0] == 1 and row_byp[1]:
+                        try:
+                            bypass_dt = datetime.strptime(row_byp[1], "%Y-%m-%d %H:%M:%S")
+                            now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+                            elapsed = (now_utc - bypass_dt).total_seconds() / 86400
+                            if elapsed < 14:
+                                is_delay = True
+                                logger.info(f"⏳ Cleanup delayed for bypassed batch {month}. {14 - elapsed:.1f} days remaining in grace period.")
+                        except Exception as e:
+                            logger.error(f"Error parsing bypass_timestamp for {month}: {e}")
+                
+                if not is_delay:
+                    pipeline_candidates.append((month, t))
 
     # Precedence: manual > retryable > pipeline. Sort by month descending to prioritize newer batches.
     manual_candidates.sort(key=lambda x: x[0], reverse=True)
@@ -2184,11 +2255,21 @@ def main(auto_apply, no_sync=False):
             logger.info(f"    ✨ Detected {fav_count} favorites ({source}).")
 
         if not auto_apply:
-            proceed_input = input(f"\nPlease confirm: has '{short_label}' task been completed for {month}? [y/N]: ")
-            if proceed_input.strip().lower() == 'y':
-                cursor.execute("UPDATE month_batches SET status_code = ? WHERE month = ?", (selected_code, month))
+            if fav_count == 0:
+                proceed_input = input(f"\nPlease confirm: has '{short_label}' task been completed for {month}? [y/N/bypass] (Choose 'bypass' to proceed with aesthetic ranking only): ").strip().lower()
+            else:
+                proceed_input = input(f"\nPlease confirm: has '{short_label}' task been completed for {month}? [y/N]: ").strip().lower()
+
+            if proceed_input == 'y':
+                cursor.execute("UPDATE month_batches SET status_code = ?, is_bypassed = 0, bypass_timestamp = NULL WHERE month = ?", (selected_code, month))
                 conn.commit()
                 logger.info(f"✅ Month {month} status updated to {selected_code}.")
+                close_conn(); sys.exit(0)
+            elif proceed_input == 'bypass' and fav_count == 0:
+                now_str = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+                cursor.execute("UPDATE month_batches SET status_code = ?, is_bypassed = 1, bypass_timestamp = ? WHERE month = ?", (selected_code, now_str, month))
+                conn.commit()
+                logger.info(f"✅ Month {month} status updated to {selected_code} (Direct-Rank Bypassed).")
                 close_conn(); sys.exit(0)
             else:
                 logger.info(f"  Skipped manual transition for {month}. Checking next candidate...")
@@ -2217,13 +2298,20 @@ def main(auto_apply, no_sync=False):
             if matched_folders:
                 staging_folder = matched_folders[0]
                 staging_size = 0
+                staging_eligible_count = 0
+                staging_oversized_count = 0
                 for root, dirs, files in os.walk(staging_folder):
                     for f in files:
                         ext = os.path.splitext(f)[1].lower()
                         if ext in SUPPORTED_EXTENSIONS:
                             fp = os.path.join(root, f)
-                            staging_size += os.path.getsize(fp)
-                logger.info(f"Staging folder content for {month}: {human_readable_size(staging_size)} total files.")
+                            fp_size = os.path.getsize(fp)
+                            if fp_size <= MAX_UPLOAD_FILE_SIZE_BYTES:
+                                staging_size += fp_size
+                                staging_eligible_count += 1
+                            else:
+                                staging_oversized_count += 1
+                logger.info(f"Staging folder content for {month}: {human_readable_size(staging_size)} eligible upload files ({staging_eligible_count} items <= {MAX_UPLOAD_FILE_SIZE_MB}MB, {staging_oversized_count} skipped).")
             else:
                 staging_folder = None; staging_size = 0; logger.warning(f"No staging folder found for {month}")
 
@@ -2245,10 +2333,10 @@ def main(auto_apply, no_sync=False):
             if staging_folder and staging_size > 0:
                 remaining_to_upload = max(0, staging_size - latest_upload_size)
             else:
-                remaining_to_upload = 0 if (total_db_assets > 0 and uploaded_db_count >= total_db_assets) else 999999999999
+                remaining_to_upload = 0 if (total_db_assets > 0 and (uploaded_db_count >= total_db_assets or (staging_folder and (uploaded_db_count + staging_oversized_count) >= total_db_assets))) else 999999999999
 
-            if total_db_assets > 0 and uploaded_db_count >= total_db_assets and remaining_to_upload == 0:
-                logger.info(f"✅ All assets for {month} appear to be uploaded already ({uploaded_db_count}/{total_db_assets}).")
+            if total_db_assets > 0 and (uploaded_db_count >= total_db_assets or (staging_folder and (uploaded_db_count + staging_oversized_count) >= total_db_assets)) and remaining_to_upload == 0:
+                logger.info(f"✅ All eligible assets for {month} appear to be uploaded already ({uploaded_db_count} uploaded, {staging_oversized_count} skipped > {MAX_UPLOAD_FILE_SIZE_MB}MB).")
                 if auto_apply: proceed_transition = True
                 else:
                     ans = input(f"All assets uploaded - transition {month} to 400 status? [y/N]: ").strip().lower()
@@ -2303,6 +2391,20 @@ def main(auto_apply, no_sync=False):
             str(current_status)
         )
 
+        # Filter out delayed cleanup (600->650) for bypassed batches
+        cursor.execute("SELECT is_bypassed, bypass_timestamp FROM month_batches WHERE month = ?", (latest_month,))
+        row_byp = cursor.fetchone()
+        if row_byp and row_byp[0] == 1 and row_byp[1]:
+            try:
+                bypass_dt = datetime.strptime(row_byp[1], "%Y-%m-%d %H:%M:%S")
+                now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+                elapsed = (now_utc - bypass_dt).total_seconds() / 86400
+                if elapsed < 14:
+                    # Delay cleanup
+                    full_transition_list = [t for t in full_transition_list if not t.endswith('->650')]
+            except Exception as e:
+                logger.error(f"Error parsing bypass_timestamp for {latest_month} in full path build: {e}")
+
         # Only perform import continuity and sequencing checks for batches that haven't reached the upload stage (400)
         # This prevents redundant prompts for batches that are already processed or being curated.
         if current_status and str(current_status) < '400':
@@ -2338,22 +2440,33 @@ def main(auto_apply, no_sync=False):
         is_favorites_pull = any('550' in str(t) or 'Pull Google' in str(t) for t in full_transition_list)
         is_after_pull = any('Rank Assets' in str(t) or 'Ranking' in str(t) for t in full_transition_list)
         
+        # Check if the batch is bypassed before printing favorites warnings
+        cursor.execute("SELECT is_bypassed FROM month_batches WHERE month = ?", (latest_month,))
+        row_byp = cursor.fetchone()
+        is_byp = row_byp[0] if row_byp else 0
+
         if is_favorites_pull:
-            fav_count, source, fav_names = check_favorites_count(
-                cursor, latest_month, check_remote=True, 
-                all_favs=remote_favs_cache, creds=creds
-            )
-            if fav_count == 0:
-                logger.warning(f"⚠️ Suggested batch {latest_month} has no favorites in Google Photos yet.")
+            if is_byp:
+                logger.info(f"ℹ️ Batch {latest_month} is running in Direct-Rank Bypass mode (no remote favorites expected).")
             else:
-                logger.info(f"✨ Batch {latest_month} is ready with {fav_count} favorites in Google Photos (Source: {source}).")
+                fav_count, source, fav_names = check_favorites_count(
+                    cursor, latest_month, check_remote=True, 
+                    all_favs=remote_favs_cache, creds=creds
+                )
+                if fav_count == 0:
+                    logger.warning(f"⚠️ Suggested batch {latest_month} has no favorites in Google Photos yet.")
+                else:
+                    logger.info(f"✨ Batch {latest_month} is ready with {fav_count} favorites in Google Photos (Source: {source}).")
         elif is_after_pull:
-            fav_count, source, fav_names = check_favorites_count(
-                cursor, latest_month, check_remote=False, 
-                all_favs=remote_favs_cache, creds=creds
-            )
-            if fav_count == 0:
-                logger.warning(f"⚠️ Suggested batch {latest_month} has 0 favorites in local DB (Source: {source}). Ranking steps may be skipped.")
+            if is_byp:
+                logger.info(f"ℹ️ Batch {latest_month} is running in Direct-Rank Bypass mode (no local favorites expected).")
+            else:
+                fav_count, source, fav_names = check_favorites_count(
+                    cursor, latest_month, check_remote=False, 
+                    all_favs=remote_favs_cache, creds=creds
+                )
+                if fav_count == 0:
+                    logger.warning(f"⚠️ Suggested batch {latest_month} has 0 favorites in local DB (Source: {source}). Ranking steps may be skipped.")
 
         # --- Begin Google quota check for upload transitions ---
         # Determine if any transition in the pipeline represents an upload to Google (e.g., '210->399')
@@ -2378,11 +2491,18 @@ def main(auto_apply, no_sync=False):
             if matched_folders:
                 staging_folder = matched_folders[0]
                 staging_size = 0
+                staging_oversized_count = 0
                 for root, dirs, files in os.walk(staging_folder):
                     for f in files:
-                        fp = os.path.join(root, f)
-                        staging_size += os.path.getsize(fp)
-                logger.info(f"Detected staging folder for month {latest_month}: {staging_folder}, size: {human_readable_size(staging_size)}")
+                        ext = os.path.splitext(f)[1].lower()
+                        if ext in SUPPORTED_EXTENSIONS:
+                            fp = os.path.join(root, f)
+                            fp_size = os.path.getsize(fp)
+                            if fp_size <= MAX_UPLOAD_FILE_SIZE_BYTES:
+                                staging_size += fp_size
+                            else:
+                                staging_oversized_count += 1
+                logger.info(f"Detected staging folder for month {latest_month}: {staging_folder}, eligible upload size: {human_readable_size(staging_size)} (skipped {staging_oversized_count} files > {MAX_UPLOAD_FILE_SIZE_MB}MB)")
             else:
                 staging_folder = None
                 staging_size = 0

@@ -190,7 +190,17 @@ def run_step(conn, step: PipelineStep, dry_run=False, month=None, command=None):
         # Always update batch status centrally after a successful step with a valid code
         if step.code and month is not None:
             cursor = conn.cursor()
-            next_code = get_next_code(cursor, step.code)
+            
+            # For upload steps, the script itself determines the final status (399 or 400).
+            # We read the actual status from the database instead of blindly setting it to step.code.
+            if step.code in ['399', '400']:
+                cursor.execute("SELECT status_code FROM month_batches WHERE month = ?", (month,))
+                actual_status_row = cursor.fetchone()
+                resolved_code = actual_status_row[0] if actual_status_row else step.code
+            else:
+                resolved_code = step.code
+
+            next_code = get_next_code(cursor, resolved_code)
 
             if not next_code:
                 # Look for any pipeline step that has current step as preceding_code (even if added later)
@@ -199,7 +209,7 @@ def run_step(conn, step: PipelineStep, dry_run=False, month=None, command=None):
                     WHERE preceding_code = ? AND transition_type = 'pipeline'
                     ORDER BY code ASC
                     LIMIT 1
-                """, (step.code,))
+                """, (resolved_code,))
                 row = cursor.fetchone()
                 if row:
                     next_code = row[0]
@@ -209,9 +219,9 @@ def run_step(conn, step: PipelineStep, dry_run=False, month=None, command=None):
                 row = cursor.fetchone()
                 transition_type = row[0] if row else None
 
-                # Update the batch to the current step's code regardless of the next transition type
-                set_batch_status(cursor, month, step.code, session_id=session_id)
-                logger.info(f"✅ Batch {month} status updated to {step.code}")
+                # Update the batch to the resolved step's code regardless of the next transition type
+                set_batch_status(cursor, month, resolved_code, session_id=session_id)
+                logger.info(f"✅ Batch {month} status updated to {resolved_code}")
 
                 # Log and update associated import records
                 cursor.execute("""
@@ -231,16 +241,16 @@ def run_step(conn, step: PipelineStep, dry_run=False, month=None, command=None):
                         JOIN month_batches mb ON a.month = mb.month
                         WHERE mb.month = ?
                     )
-                """, (session_id, step.code, month))
-                logger.info(f"📌 Updated imports for month {month} with execution_id={session_id}, status_code={step.code}")
+                """, (session_id, resolved_code, month))
+                logger.info(f"📌 Updated imports for month {month} with execution_id={session_id}, status_code={resolved_code}")
                 
                 if transition_type == 'manual':
-                    logger.info(f"⏸️ Next transition from {step.code} is manual. Halting automated execution.")
+                    logger.info(f"⏸️ Next transition from {resolved_code} is manual. Halting automated execution.")
 
                 conn.commit()
             else:
                 # Final step reached for this month, set batch status and update imports
-                set_batch_status(cursor, month, step.code, session_id=session_id)
+                set_batch_status(cursor, month, resolved_code, session_id=session_id)
                 # Log which import_uuids will be updated
                 cursor.execute("""
                     SELECT DISTINCT a.import_id
@@ -260,9 +270,9 @@ def run_step(conn, step: PipelineStep, dry_run=False, month=None, command=None):
                         JOIN month_batches mb ON a.month = mb.month
                         WHERE mb.month = ?
                     )
-                """, (session_id, step.code, month))
+                """, (session_id, resolved_code, month))
                 conn.commit()
-                logger.info(f"🏁 Final step reached for month {month}; batch status set and imports updated with execution_id={session_id}, status_code={step.code}")
+                logger.info(f"🏁 Final step reached for month {month}; batch status set and imports updated with execution_id={session_id}, status_code={resolved_code}")
         return True
     except subprocess.CalledProcessError as e:
         logger.error(f"❌ Failed: {step.label} with error: {e}")

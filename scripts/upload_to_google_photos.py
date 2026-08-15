@@ -7,12 +7,13 @@ import sqlite3
 import argparse
 import hashlib
 import re
-from constants import MEDIA_ORGANIZER_DB_PATH, STAGING_ROOT, LOG_PATH
+import subprocess
+from constants import MEDIA_ORGANIZER_DB_PATH, STAGING_ROOT, LOG_PATH, MAX_UPLOAD_FILE_SIZE_MB, MAX_UPLOAD_FILE_SIZE_BYTES, SKIPPED_UPLOADS_ALBUM_NAME
 from db.queries import get_planned_month
 from db.connections import get_connection, get_cursor, commit, close as close_conn
 from utils.logger import setup_logger
 from google_photos import create_or_get_album, upload_media, human_readable_size, check_google_quota, authenticate, GOOGLE_PHOTOS_READONLY_SCOPES, GOOGLE_PHOTOS_APPEND_ONLY_SCOPES, PLANNER_REQUIRED_SCOPES
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 from utils.logger import compute_file_hash
 
@@ -22,6 +23,71 @@ logger = setup_logger(LOG_PATH, MODULE_TAG)
 
 SUPPORTED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.heic', '.mov', '.mp4'}
 
+
+def add_skipped_assets_to_apple_photos(asset_ids, album_name=SKIPPED_UPLOADS_ALBUM_NAME):
+    """Add skipped assets to the dedicated Apple Photos album under 'Media Organizer on LaCie'."""
+    if not asset_ids:
+        return
+    logger.info(f"📸 Adding {len(asset_ids)} skipped asset(s) to Apple Photos album '{album_name}'...")
+    safe_album_name = album_name.replace('"', '\\"')
+    ids_string = ",".join([f'"{aid}"' for aid in sorted(list(set(asset_ids)))])
+    script = f'''
+    tell application "Photos"
+        set topFolderName to "Media Organizer on LaCie"
+        set targetAlbumName to "{safe_album_name}"
+        
+        if not (exists folder topFolderName) then
+            make new folder named topFolderName
+        end if
+        set topFolder to folder topFolderName
+        
+        set targetAlbum to missing value
+        if exists album targetAlbumName of topFolder then
+            set targetAlbum to album targetAlbumName of topFolder
+        else
+            repeat with f in folders of topFolder
+                if exists album targetAlbumName of f then
+                    set targetAlbum to album targetAlbumName of f
+                    exit repeat
+                end if
+            end repeat
+        end if
+        
+        if targetAlbum is missing value then
+            make new album named targetAlbumName at topFolder
+            set targetAlbum to album targetAlbumName of topFolder
+        end if
+        
+        set assetIds to {{{ids_string}}}
+        set assetsToAdd to {{}}
+        repeat with anId in assetIds
+            try
+                set end of assetsToAdd to media item id (anId & "/L0/001")
+            on error
+                try
+                    set foundItems to (media items whose id contains anId)
+                    if (count of foundItems) > 0 then
+                        set end of assetsToAdd to item 1 of foundItems
+                    end if
+                end try
+            end try
+        end repeat
+        
+        if (count of assetsToAdd) > 0 then
+            add assetsToAdd to targetAlbum
+        end if
+        return (count of assetsToAdd) as string
+    end tell
+    '''
+    try:
+        process = subprocess.Popen(['osascript', '-e', script], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        stdout, stderr = process.communicate()
+        if stderr and "error" in stderr.lower():
+            logger.warning(f"AppleScript warning while adding skipped assets: {stderr.strip()}")
+        added_count = stdout.strip() if stdout else "0"
+        logger.info(f"✅ Added {added_count} skipped asset(s) to '{album_name}' in Apple Photos.")
+    except Exception as e:
+        logger.warning(f"⚠️ Failed to add skipped assets to Apple Photos album: {e}")
 
 def get_files_to_upload(folder_path):
     files = []
@@ -94,6 +160,8 @@ def main(args):
 
 
     month = args.month
+    max_upload_size_mb = getattr(args, 'max_size_mb', MAX_UPLOAD_FILE_SIZE_MB)
+    max_upload_size_bytes = max_upload_size_mb * 1024 * 1024
     conn = get_connection()
     cursor = get_cursor()
 
@@ -108,7 +176,7 @@ def main(args):
         logger.warning(f"No supported media files found in {album_path}")
         return
 
-    logger.info(f"Found {len(files)} media files to upload from batch {month}")
+    logger.info(f"Found {len(files)} media files to upload from batch {month} (Max size per file: {max_upload_size_mb:.0f} MB)")
 
     # Store metadata by original_filename. Multiple sources can have the same original_filename.
     # We store them in a list to match against exported files (which might have suffixes like ' 2').
@@ -143,17 +211,32 @@ def main(args):
                 return m
         return None
 
-    # Filter physical files: ignore those that DB says belong to other months or are already uploaded
+    # Filter physical files: ignore those that DB says belong to other months or are already uploaded,
+    # or that exceed the max upload size threshold.
     files_to_process = []
     already_uploaded_size = 0
     total_eligible_size = 0
     skipped_count = 0
+    skipped_oversized_count = 0
+    skipped_quota_count = 0
+    skipped_oversized_size = 0
+    skipped_oversized_asset_ids = []
+
     for file_path, file_size in files:
         disk_filename = os.path.basename(file_path)
         metadata = find_metadata_match(disk_filename)
         
         if not metadata:
             logger.warning(f"⏭️ Skipping {disk_filename}: Not found in database for month {month}. It may belong to another batch.")
+            continue
+
+        if file_size > max_upload_size_bytes:
+            file_size_mb = file_size / (1024 * 1024)
+            logger.info(f"⏭️ Skipping {disk_filename} ({file_size_mb:.2f} MB): Exceeds upload threshold of {max_upload_size_mb:.0f} MB.")
+            skipped_oversized_count += 1
+            skipped_oversized_size += file_size
+            if metadata.get("asset_id"):
+                skipped_oversized_asset_ids.append(metadata.get("asset_id"))
             continue
             
         total_eligible_size += file_size
@@ -166,11 +249,33 @@ def main(args):
             
         files_to_process.append((file_path, file_size, metadata))
 
+    if skipped_oversized_asset_ids:
+        if args.dry_run:
+            logger.info(f"[Dry Run] Would add {len(skipped_oversized_asset_ids)} skipped asset(s) to Apple Photos album '{SKIPPED_UPLOADS_ALBUM_NAME}'.")
+        else:
+            add_skipped_assets_to_apple_photos(skipped_oversized_asset_ids, album_name=SKIPPED_UPLOADS_ALBUM_NAME)
+
     if not files_to_process:
-        logger.info(f"✅ No new files to upload for month {month}. (Checked {len(files)} files, {skipped_count} already uploaded).")
+        logger.info(f"✅ No new files to upload for month {month}. (Checked {len(files)} files, {skipped_count} already uploaded, {skipped_oversized_count} skipped > {max_upload_size_mb:.0f} MB).")
+        # Finalize status from partial (399) or error (400E) to complete (400) if all eligible assets have been processed
+        cursor.execute("SELECT COUNT(*) FROM assets WHERE month = ?", (month,))
+        total_assets_expected = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM assets WHERE month = ? AND uploaded_to_google = 1", (month,))
+        uploaded_count = cursor.fetchone()[0]
+
+        if (uploaded_count + skipped_oversized_count) >= total_assets_expected or (total_assets_expected > 0 and len(files) == (skipped_count + skipped_oversized_count)):
+            cursor.execute("SELECT status_code FROM month_batches WHERE month = ?", (month,))
+            row = cursor.fetchone()
+            if row and row[0] < '400':
+                cursor.execute("UPDATE month_batches SET status_code = '400' WHERE month = ?", (month,))
+                conn.commit()
+                logger.info(f"✅ Batch {month} status finalized to 400.")
         return
     else:
-        logger.info(f"🔍 Batch Analysis: {len(files_to_process) + skipped_count} total files found. {skipped_count} skipped (already uploaded), {len(files_to_process)} remaining in queue.")
+        logger.info(f"🔍 Batch Analysis: {len(files_to_process) + skipped_count + skipped_oversized_count} total files found. "
+                    f"{skipped_count} skipped (already uploaded), {skipped_oversized_count} skipped (> {max_upload_size_mb:.0f} MB), "
+                    f"{len(files_to_process)} remaining in queue.")
 
     # Calculate total size of the remaining files
     batch_remaining_size = sum(f[1] for f in files_to_process)
@@ -211,8 +316,8 @@ def main(args):
                 logger.error(f"Not enough space on Google Drive to upload even the smallest file. Aborting upload.")
                 return
 
-            skipped_count = len(files_to_process) - len(selected_files)
-            logger.info(f"Selected {len(selected_files)} files to upload based on aesthetic score to fit available quota. Skipped {skipped_count} files.")
+            skipped_quota_count = len(files_to_process) - len(selected_files)
+            logger.info(f"Selected {len(selected_files)} files to upload based on aesthetic score to fit available quota. Skipped {skipped_quota_count} files due to quota.")
             files_to_process = selected_files
 
             # Mark batch as partial upload if not all files fit AND it's not already further along (e.g. 500)
@@ -220,7 +325,7 @@ def main(args):
             current_status_row = cursor.fetchone()
             current_status = current_status_row[0] if current_status_row else '000'
             
-            if len(files) < len(files_to_process) and current_status < '400':
+            if skipped_quota_count > 0 and current_status < '400':
                 cursor.execute("""
                     UPDATE month_batches
                     SET status_code = '399'
@@ -301,31 +406,32 @@ def main(args):
                 logger.error("Halting upload process due to error.")
                 sys.exit(1)
 
-    # Final check: Verify if the entire DB batch for this month is now uploaded.
+    # Final check: Verify if all eligible assets for this month are now uploaded.
     cursor.execute("SELECT COUNT(*) FROM assets WHERE month = ?", (month,))
     total_assets_expected = cursor.fetchone()[0]
 
     cursor.execute("SELECT COUNT(*) FROM assets WHERE month = ? AND uploaded_to_google = 1", (month,))
     uploaded_count = cursor.fetchone()[0]
 
-    if uploaded_count >= total_assets_expected:
-        logger.info(f"🎊 All {total_assets_expected} assets for {month} are verified as uploaded in the database.")
-        # Finalize status from partial (399) or error (400E) to complete (400)
+    if (uploaded_count + skipped_oversized_count) >= total_assets_expected or (total_assets_expected > 0 and len(files) == (skipped_count + len(files_to_process) + skipped_oversized_count + skipped_quota_count) and not args.dry_run):
+        logger.info(f"🎊 All eligible assets for {month} are verified as uploaded in the database ({uploaded_count} uploaded, {skipped_oversized_count} skipped > {max_upload_size_mb:.0f} MB).")
+        # Finalize status to complete (400)
         cursor.execute("SELECT status_code FROM month_batches WHERE month = ?", (month,))
         row = cursor.fetchone()
-        if row and row[0] in ['399', '400E']:
+        if row and row[0] < '400':
             cursor.execute("UPDATE month_batches SET status_code = '400' WHERE month = ?", (month,))
             logger.info(f"✅ Batch {month} status finalized to 400.")
     else:
         logger.info(f"⚠️ Month {month} remains partially uploaded ({uploaded_count}/{total_assets_expected} assets).")
 
     conn.commit()
-    logger.info(f"✅ Upload process completed at {datetime.utcnow().isoformat()}Z")
+    logger.info(f"✅ Upload process completed at {datetime.now(timezone.utc).isoformat()}")
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Upload media files to Google Photos.")
     parser.add_argument("month", help="Month to process (YYYY-MM)")
     parser.add_argument("--dry-run", action="store_true", help="Only log actions without uploading files.")
+    parser.add_argument("--max-size-mb", type=float, default=MAX_UPLOAD_FILE_SIZE_MB, help=f"Maximum file size in MB to upload to Google Photos (default: {MAX_UPLOAD_FILE_SIZE_MB} MB).")
     return parser.parse_args()
 
 if __name__ == "__main__":

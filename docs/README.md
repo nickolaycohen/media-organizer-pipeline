@@ -2,6 +2,8 @@
 
 This pipeline handles the curation, export, and publishing of family photos, using a two-track workflow to manage monthly photo ingest/cleanup and weekly event-based memory curation.
 
+> 💡 **Note**: To view the graphical flowcharts in this documentation (such as [pipeline_architecture.md](file:///Users/nickolaycohen/dev/media-organizer-pipeline/docs/pipeline_architecture.md)), you will need a Mermaid viewer/preview extension installed in your editor (e.g. **Markdown Preview Mermaid Support** for VS Code).
+
 ## 🚀 Two-Track Pipeline Architecture
 
 The system is orchestrated by `scripts/pipeline_planner.py` which prompts you to select your track after running the initial bootstrap steps:

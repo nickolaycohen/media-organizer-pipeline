@@ -125,5 +125,66 @@ def main():
         creation_time = item.get('mediaMetadata', {}).get('creationTime', 'N/A')
         logger.info(f"⭐️ {filename} — {creation_time}")
 
+def run_retroactive(creds):
+    logger.info("Starting retroactive Google favorites sync for bypassed months...")
+    conn = get_connection()
+    cursor = get_cursor()
+
+    cursor.execute("SELECT month FROM month_batches WHERE is_bypassed = 1")
+    bypassed_months = [row[0] for row in cursor.fetchall()]
+    if not bypassed_months:
+        logger.info("ℹ️ No bypassed months found in database.")
+        close_conn()
+        return
+
+    logger.info(f"🔍 Found bypassed months: {bypassed_months}")
+
+    all_favorites = get_all_favorites(creds)
+    logger.info(f"📊 Total favorite items globally: {len(all_favorites)}")
+    favorite_set = {(f.get('filename'), f.get('mediaMetadata', {}).get('creationTime')) for f in all_favorites}
+
+    for month in bypassed_months:
+        logger.info(f"Processing bypassed month: {month}")
+        album_title = f"Currently Curating - {month}"
+        album_id = create_or_get_album(creds, album_title)
+        if not album_id:
+            logger.warning(f"⚠️ Could not find Google Photos album for {month}. Skipping.")
+            continue
+
+        album_items = get_album_items(creds, album_id)
+        logger.info(f"📊 Total media items in Google album '{album_title}': {len(album_items)}")
+
+        matched = [item for item in album_items
+                   if (item.get('filename'), item.get('mediaMetadata', {}).get('creationTime')) in favorite_set]
+        logger.info(f"🔍 Found {len(matched)} remote favorites in album '{album_title}'.")
+
+        update_count = 0
+        for item in matched:
+            filename = item.get('filename')
+            raw_creation_time = item.get('mediaMetadata', {}).get('creationTime', '')
+            creation_time = raw_creation_time.replace('T', ' ').split('.')[0] if raw_creation_time else ''
+            if filename and creation_time:
+                cursor.execute("""
+                    UPDATE assets
+                    SET google_favorite = 1, updated_at_utc = datetime('now')
+                    WHERE original_filename = ? AND date_created_utc = ? AND month = ? AND MomentsAlbumName IS NOT NULL AND google_favorite = 0
+                """, (filename, creation_time, month))
+                if cursor.rowcount:
+                    update_count += 1
+                    logger.info(f"⭐️ Retroactively matched favorite: {filename} for month {month}")
+
+        commit()
+        logger.info(f"✅ Bypassed month {month}: Retroactively updated {update_count} asset(s) as Google favorites.")
+
+    close_conn()
+
 if __name__ == "__main__":
-    main()
+    if "--retroactive" in sys.argv:
+        logger.info("Authenticating with edit access for retroactive operations...")
+        creds = authenticate(scopes=GOOGLE_PHOTOS_EDIT_ACCESS_SCOPES)
+        if not creds:
+            logger.error("Authentication failed. Cannot proceed.")
+            sys.exit(1)
+        run_retroactive(creds)
+    else:
+        main()

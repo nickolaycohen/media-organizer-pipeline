@@ -1893,10 +1893,10 @@ def display_media_cleanup_recommendations(cursor, verbose=True):
     except Exception as e:
         logger.warning(f"Could not attach Photos.sqlite: {e}")
 
-    # Query published moments and their camera/file metrics
+    # Query published moments and their camera/file metrics grouped by calendar month
     cursor.execute("""
         SELECT 
-            p.moment_name,
+            a.month,
             MAX(p.published_at_utc) AS last_published_at,
             COALESCE(zea.ZCAMERAMAKE, i.camera_make, 'Unknown') AS camera_make,
             COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') AS camera_model,
@@ -1904,15 +1904,14 @@ def display_media_cleanup_recommendations(cursor, verbose=True):
             MIN(a.original_filename) AS min_filename,
             MAX(a.original_filename) AS max_filename,
             MIN(a.date_created_utc) AS min_date,
-            MAX(a.date_created_utc) AS max_date,
-            GROUP_CONCAT(DISTINCT a.month) AS batch_months
+            MAX(a.date_created_utc) AS max_date
         FROM publications p
         JOIN assets a ON p.asset_id = a.asset_id
         LEFT JOIN imports i ON a.import_id = i.import_uuid
         LEFT JOIN ZASSET za ON za.ZUUID = a.asset_id
         LEFT JOIN ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
-        GROUP BY p.moment_name, COALESCE(zea.ZCAMERAMAKE, i.camera_make, 'Unknown'), COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown')
-        ORDER BY MAX(p.published_at_utc) DESC, p.moment_name ASC
+        GROUP BY a.month, COALESCE(zea.ZCAMERAMAKE, i.camera_make, 'Unknown'), COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown')
+        ORDER BY MAX(p.published_at_utc) DESC, a.month ASC
     """)
     rows = cursor.fetchall()
 
@@ -1945,7 +1944,7 @@ def display_media_cleanup_recommendations(cursor, verbose=True):
         for device_name, group_rows in sorted(device_groups.items()):
             cleanup_report.append(f"📷 Device: {device_name}")
             cleanup_report.append("-" * 135)
-            header = f"{'No.':<4} {'Moment / Album Name':<32} {'Published':<10} {'Filename Range':<32} {'Date Range':<24} {'Reclaimable from SD Card (Whole Days)':<30}"
+            header = f"{'No.':<4} {'Month':<12} {'Published':<12} {'Filename Range':<32} {'Date Range':<24} {'Reclaimable from SD Card (Whole Month)':<30}"
             cleanup_report.append(header)
             cleanup_report.append("-" * 135)
 
@@ -1955,7 +1954,7 @@ def display_media_cleanup_recommendations(cursor, verbose=True):
             # Gather data and query photos_db for all rows first
             processed_rows = []
             for row in group_rows:
-                m_name = row[0] or "—"
+                month_val = row[0] or "—"
                 c_make = row[2] or ""
                 c_model = row[3] or "Unknown"
                 file_count = str(row[4])
@@ -1966,14 +1965,10 @@ def display_media_cleanup_recommendations(cursor, verbose=True):
                 d_max = (row[8][:10] if row[8] else "—")
                 d_range = f"{d_min} to {d_max}" if d_min != d_max else d_min
 
-                # Fetch whole-day count and size of all files on this device within the date range
+                # Fetch whole-month count and size of all files on this device
                 total_scan_count = 0
                 total_scan_bytes = 0
-                if row[7] and row[8] and device_name != "Unknown":
-                    # Convert to full day boundaries for cleanup
-                    start_date_str = row[7][:10] + " 00:00:00"
-                    end_date_str = row[8][:10] + " 23:59:59"
-                    
+                if row[0] and device_name != "Unknown":
                     try:
                         cursor.execute("""
                             SELECT COUNT(a.Z_PK), SUM(r.ZDATALENGTH)
@@ -1981,8 +1976,8 @@ def display_media_cleanup_recommendations(cursor, verbose=True):
                             JOIN photos_db.ZEXTENDEDATTRIBUTES ea ON ea.ZASSET = a.Z_PK
                             LEFT JOIN photos_db.ZINTERNALRESOURCE r ON r.ZASSET = a.Z_PK AND r.ZRESOURCETYPE = 0
                             WHERE COALESCE(ea.ZCAMERAMODEL, 'Unknown') = ?
-                              AND datetime(a.ZDATECREATED + 978307200, 'unixepoch') BETWEEN ? AND ?
-                        """, (c_model, start_date_str, end_date_str))
+                              AND strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch')) = ?
+                        """, (c_model, month_val))
                         res = cursor.fetchone()
                         if res:
                             total_scan_count = res[0] or 0
@@ -1991,7 +1986,7 @@ def display_media_cleanup_recommendations(cursor, verbose=True):
                         logger.debug(f"Could not scan files size range: {e}")
 
                 processed_rows.append({
-                    "m_name": m_name,
+                    "month_val": month_val,
                     "file_count": file_count,
                     "f_range": f_range,
                     "d_range": d_range,
@@ -2008,7 +2003,7 @@ def display_media_cleanup_recommendations(cursor, verbose=True):
 
                 scan_range_str = f"{item['total_scan_count']} files ({human_readable_size(item['total_scan_bytes'])})" if item['total_scan_count'] > 0 else "—"
 
-                line = f"{global_idx:<4} {item['m_name']:<32} {item['file_count'] + ' files':<10} {item['f_range']:<32} {item['d_range']:<24} {scan_range_str:<30}"
+                line = f"{global_idx:<4} {item['month_val']:<12} {item['file_count'] + ' files':<12} {item['f_range']:<32} {item['d_range']:<24} {scan_range_str:<30}"
                 cleanup_report.append(line)
                 global_idx += 1
 

@@ -1952,6 +1952,8 @@ def display_media_cleanup_recommendations(cursor, verbose=True):
             device_total_files = 0
             device_total_bytes = 0
 
+            # Gather data and query photos_db for all rows first
+            processed_rows = []
             for row in group_rows:
                 m_name = row[0] or "—"
                 c_make = row[2] or ""
@@ -1988,12 +1990,25 @@ def display_media_cleanup_recommendations(cursor, verbose=True):
                     except Exception as e:
                         logger.debug(f"Could not scan files size range: {e}")
 
-                device_total_files += total_scan_count
-                device_total_bytes += total_scan_bytes
+                processed_rows.append({
+                    "m_name": m_name,
+                    "file_count": file_count,
+                    "f_range": f_range,
+                    "d_range": d_range,
+                    "total_scan_count": total_scan_count,
+                    "total_scan_bytes": total_scan_bytes
+                })
 
-                scan_range_str = f"{total_scan_count} files ({human_readable_size(total_scan_bytes)})" if total_scan_count > 0 else "—"
+            # Sort processed_rows by total_scan_bytes descending
+            processed_rows.sort(key=lambda x: x["total_scan_bytes"], reverse=True)
 
-                line = f"{global_idx:<4} {m_name:<32} {file_count + ' files':<10} {f_range:<32} {d_range:<24} {scan_range_str:<30}"
+            for item in processed_rows:
+                device_total_files += item["total_scan_count"]
+                device_total_bytes += item["total_scan_bytes"]
+
+                scan_range_str = f"{item['total_scan_count']} files ({human_readable_size(item['total_scan_bytes'])})" if item['total_scan_count'] > 0 else "—"
+
+                line = f"{global_idx:<4} {item['m_name']:<32} {item['file_count'] + ' files':<10} {item['f_range']:<32} {item['d_range']:<24} {scan_range_str:<30}"
                 cleanup_report.append(line)
                 global_idx += 1
 

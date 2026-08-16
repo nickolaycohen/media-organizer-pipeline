@@ -1,5 +1,8 @@
 import sqlite3
 import os
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 from utils.logger import setup_logger
 from constants import MEDIA_ORGANIZER_DB_PATH as DB_PATH, LOG_PATH
 
@@ -32,7 +35,9 @@ def create_view():
         a.date_created_utc,
         a.MomentsAlbumName
     FROM
-        assets a;
+        assets a
+    WHERE
+        a.ignore_continuity_check = 0 OR a.ignore_continuity_check IS NULL;
     """
 
     try:

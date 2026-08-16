@@ -361,7 +361,8 @@ def sync_assets(media_cursor, logger):
             ) AS score_normalized,
             date_created_utc,
             MomentsAlbumName
-        FROM main.assets;
+        FROM main.assets
+        WHERE ignore_continuity_check = 0 OR ignore_continuity_check IS NULL;
     ''')
     commit()
 

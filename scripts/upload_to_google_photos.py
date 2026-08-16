@@ -182,7 +182,7 @@ def main(args):
     # We store them in a list to match against exported files (which might have suffixes like ' 2').
     existing_metadata = {} 
     cursor.execute("""
-        SELECT original_filename, month, import_id, aesthetic_score, date_created_utc, imported_date_utc, asset_id, uploaded_to_google
+        SELECT original_filename, month, import_id, aesthetic_score, date_created_utc, imported_date_utc, asset_id, uploaded_to_google, ignore_continuity_check
         FROM assets
         WHERE month = ?
     """, (month,))
@@ -199,6 +199,7 @@ def main(args):
             "imported_date_utc": row[5],
             "asset_id": row[6],
             "uploaded_to_google": row[7],
+            "ignore_continuity_check": row[8],
             "matched": False # internal flag to track matches for disk files with suffixes
         })
 
@@ -228,6 +229,11 @@ def main(args):
         
         if not metadata:
             logger.warning(f"⏭️ Skipping {disk_filename}: Not found in database for month {month}. It may belong to another batch.")
+            continue
+
+        if metadata.get("ignore_continuity_check") == 1:
+            logger.info(f"⏭️ Skipping {disk_filename}: Marked as unreasonable/ignored in database.")
+            skipped_count += 1
             continue
 
         if file_size > max_upload_size_bytes:
@@ -400,7 +406,7 @@ def main(args):
                 sys.exit(1)
 
     # Final check: Verify if all eligible assets for this month are now uploaded.
-    cursor.execute("SELECT COUNT(*) FROM assets WHERE month = ?", (month,))
+    cursor.execute("SELECT COUNT(*) FROM assets WHERE month = ? AND (ignore_continuity_check = 0 OR ignore_continuity_check IS NULL)", (month,))
     total_assets_expected = cursor.fetchone()[0]
 
     cursor.execute("SELECT COUNT(*) FROM assets WHERE month = ? AND uploaded_to_google = 1", (month,))

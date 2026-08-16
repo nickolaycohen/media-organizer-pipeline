@@ -2006,6 +2006,34 @@ def manage_device_owners_flow(cursor, conn):
             model_owners.append((item['model'], item['owner']))
 
         print("-" * 185)
+
+        # Filter and group overrides
+        overrides_by_owner = {}
+        for item in models_list:
+            if item['src_type'] == 'Database Override':
+                owner = item['owner']
+                if owner not in overrides_by_owner:
+                    overrides_by_owner[owner] = []
+                overrides_by_owner[owner].append(item)
+
+        if overrides_by_owner:
+            print("\n" + "=" * 100)
+            print("👤  DEVICE TIMELINE BY OWNER (DATABASE OVERRIDES ONLY)")
+            print("=" * 100)
+            print(f"{'Primary Owner':<16} {'Device Camera Model':<36} {'Asset Count':<14} {'Earliest Date':<15} {'Latest Date':<15}")
+            print("-" * 100)
+
+            for owner in sorted(overrides_by_owner.keys()):
+                devices = overrides_by_owner[owner]
+                devices.sort(key=lambda x: x['min_created'] if x['min_created'] != '—' else '9999-12-31')
+                
+                first_row = True
+                for dev in devices:
+                    owner_col = owner if first_row else ""
+                    print(f"{owner_col:<16} {dev['model']:<36} {dev['count']:<14,} {dev['min_created']:<15} {dev['max_created']:<15}")
+                    first_row = False
+            print("-" * 100)
+
         choice = input("\nOptions: [E]dit an owner | [B]ack to main menu: ").strip().lower()
         if choice == 'b' or not choice:
             break

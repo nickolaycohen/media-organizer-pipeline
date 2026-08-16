@@ -58,5 +58,31 @@ PLANNER_REQUIRED_SCOPES = GOOGLE_PHOTOS_EDIT_ACCESS_SCOPES + GOOGLE_PHOTOS_READO
 # List of camera models considered "active sources" for import checks
 ACTIVE_CAMERA_MODELS = ['iPhone 13 Pro Max', 'Canon EOS Rebel T7', 'iPhone 16 Pro', 'iPhone 12 Pro Max', 'iPhone 17 Pro Max', 'iPhone 12']
 
+# Device to primary owner mapping to track who physically carries/holds the assets
+DEVICE_OWNER_MAPPING = {
+    'iPhone 16 Pro': 'Nickolay',
+    'iPhone 13 Pro Max': 'Nickolay',
+    'iPhone 11 Pro': 'Nickolay',
+    'iPhone 8 Plus': 'Nickolay',
+    'iPhone 6s': 'Nickolay',
+    'iPhone 5s': 'Nickolay',
+    'iPhone 4': 'Nickolay',
+    
+    'iPhone 17 Pro Max': 'Wife',
+    'iPhone 12 Pro Max': 'Wife',
+    'iPhone 14 Pro Max': 'Wife',
+    'iPhone 11 Pro Max': 'Wife',
+    'iPhone XS Max': 'Wife',
+    
+    'iPhone 12': 'Kid',
+    'iPhone 13 Pro': 'Kid',
+    
+    'Canon EOS Rebel T7': 'Shared',
+    'Canon EOS 5D Mark IV': 'Shared',
+    'Canon EOS 5D': 'Shared',
+    'HERO12 Black': 'Shared',
+    'HERO7 Silver': 'Shared',
+}
+
 # DEPRECATED/UNUSED - Kept for reference, but should be removed in the future.
 # GOOGLE_PHOTOS_GENERAL_SCOPES = ["https://www.googleapis.com/auth/photoslibrary.readonly", "https://www.googleapis.com/auth/photoslibrary.appendonly"]

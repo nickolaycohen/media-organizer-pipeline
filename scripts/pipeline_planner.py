@@ -13,7 +13,7 @@ from google_photos import check_google_quota, authenticate, get_all_favorites
 import argparse
 import sqlite3
 from constants import MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_COPY_PATH, LOG_PATH, GOOGLE_PHOTOS_READONLY_SCOPES, GOOGLE_DRIVE_READ_ONLY_SCOPES, PLANNER_REQUIRED_SCOPES, CURATION_THRESHOLD_LOG_PATH, SCORING_BREAKDOWN_LOG_PATH, MEDIA_CLEANUP_LOG_PATH, MAX_UPLOAD_FILE_SIZE_BYTES, MAX_UPLOAD_FILE_SIZE_MB
-from constants import ACTIVE_CAMERA_MODELS
+from constants import ACTIVE_CAMERA_MODELS, DEVICE_OWNER_MAPPING
 from db.connections import get_connection, get_cursor, commit, close as close_conn
 from db.queries import get_stage_transitions, get_batch_statuses, get_latest_import_and_month
 import requests
@@ -1928,87 +1928,108 @@ def display_media_cleanup_recommendations(cursor, verbose=True):
         cleanup_report.append("The following events/moments have been curated and published.")
         cleanup_report.append("You can safely format or delete these files from your source cameras / SD cards (grouped by device):\n")
 
-        # Group rows by device model (or make if model is unknown)
-        device_groups = {}
+        # Group rows by device owner and then device model
+        # owner_groups = { owner: { device: [rows] } }
+        owner_groups = {}
         for row in rows:
             c_make = row[2] or ""
             c_model = row[3] or "Unknown"
             c_source = f"{c_model}" if (c_model != "Unknown" and c_model) else (c_make or "Unknown")
             
-            if c_source not in device_groups:
-                device_groups[c_source] = []
-            device_groups[c_source].append(row)
+            # Look up owner
+            owner = DEVICE_OWNER_MAPPING.get(c_source, DEVICE_OWNER_MAPPING.get(c_model, "Shared/Other"))
+            
+            if owner not in owner_groups:
+                owner_groups[owner] = {}
+            if c_source not in owner_groups[owner]:
+                owner_groups[owner][c_source] = []
+            owner_groups[owner][c_source].append(row)
 
         global_idx = 1
-        # Process each device group
-        for device_name, group_rows in sorted(device_groups.items()):
-            cleanup_report.append(f"📷 Device: {device_name}")
+        # Process each owner group
+        for owner_name in sorted(owner_groups.keys()):
+            cleanup_report.append(f"👤 Primary Owner: {owner_name}")
+            cleanup_report.append("=" * 135)
+            
+            owner_total_files = 0
+            owner_total_bytes = 0
+            
+            # Process each device for this owner
+            for device_name, group_rows in sorted(owner_groups[owner_name].items()):
+                cleanup_report.append(f"  📷 Device: {device_name}")
+                cleanup_report.append("  " + "-" * 133)
+                header = f"  {'No.':<4} {'Month':<12} {'Published':<12} {'Filename Range':<32} {'Date Range':<24} {'Reclaimable from SD Card (Whole Month)':<30}"
+                cleanup_report.append(header)
+                cleanup_report.append("  " + "-" * 133)
+
+                device_total_files = 0
+                device_total_bytes = 0
+
+                # Gather data and query photos_db for all rows first
+                processed_rows = []
+                for row in group_rows:
+                    month_val = row[0] or "—"
+                    c_make = row[2] or ""
+                    c_model = row[3] or "Unknown"
+                    file_count = str(row[4])
+                    f_min = row[5] or "—"
+                    f_max = row[6] or "—"
+                    f_range = f"{f_min} -> {f_max}" if f_min != f_max else f_min
+                    d_min = (row[7][:10] if row[7] else "—")
+                    d_max = (row[8][:10] if row[8] else "—")
+                    d_range = f"{d_min} to {d_max}" if d_min != d_max else d_min
+
+                    # Fetch whole-month count and size of all files on this device
+                    total_scan_count = 0
+                    total_scan_bytes = 0
+                    if row[0] and device_name != "Unknown":
+                        try:
+                            cursor.execute("""
+                                SELECT COUNT(a.Z_PK), SUM(r.ZDATALENGTH)
+                                FROM photos_db.ZASSET a
+                                JOIN photos_db.ZEXTENDEDATTRIBUTES ea ON ea.ZASSET = a.Z_PK
+                                LEFT JOIN photos_db.ZINTERNALRESOURCE r ON r.ZASSET = a.Z_PK AND r.ZRESOURCETYPE = 0
+                                WHERE COALESCE(ea.ZCAMERAMODEL, 'Unknown') = ?
+                                  AND strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch')) = ?
+                            """, (c_model, month_val))
+                            res = cursor.fetchone()
+                            if res:
+                                total_scan_count = res[0] or 0
+                                total_scan_bytes = res[1] or 0
+                        except Exception as e:
+                            logger.debug(f"Could not scan files size range: {e}")
+
+                    processed_rows.append({
+                        "month_val": month_val,
+                        "file_count": file_count,
+                        "f_range": f_range,
+                        "d_range": d_range,
+                        "total_scan_count": total_scan_count,
+                        "total_scan_bytes": total_scan_bytes
+                    })
+
+                # Sort processed_rows by total_scan_bytes descending
+                processed_rows.sort(key=lambda x: x["total_scan_bytes"], reverse=True)
+
+                for item in processed_rows:
+                    device_total_files += item["total_scan_count"]
+                    device_total_bytes += item["total_scan_bytes"]
+
+                    scan_range_str = f"{item['total_scan_count']} files ({human_readable_size(item['total_scan_bytes'])})" if item['total_scan_count'] > 0 else "—"
+
+                    line = f"  {global_idx:<4} {item['month_val']:<12} {item['file_count'] + ' files':<12} {item['f_range']:<32} {item['d_range']:<24} {scan_range_str:<30}"
+                    cleanup_report.append(line)
+                    global_idx += 1
+
+                owner_total_files += device_total_files
+                owner_total_bytes += device_total_bytes
+
+                cleanup_report.append("  " + "-" * 133)
+                cleanup_report.append(f"  💰 Subtotal reclaimable space on {device_name}: {device_total_files} files ({human_readable_size(device_total_bytes)})")
+                cleanup_report.append("")
+
             cleanup_report.append("-" * 135)
-            header = f"{'No.':<4} {'Month':<12} {'Published':<12} {'Filename Range':<32} {'Date Range':<24} {'Reclaimable from SD Card (Whole Month)':<30}"
-            cleanup_report.append(header)
-            cleanup_report.append("-" * 135)
-
-            device_total_files = 0
-            device_total_bytes = 0
-
-            # Gather data and query photos_db for all rows first
-            processed_rows = []
-            for row in group_rows:
-                month_val = row[0] or "—"
-                c_make = row[2] or ""
-                c_model = row[3] or "Unknown"
-                file_count = str(row[4])
-                f_min = row[5] or "—"
-                f_max = row[6] or "—"
-                f_range = f"{f_min} -> {f_max}" if f_min != f_max else f_min
-                d_min = (row[7][:10] if row[7] else "—")
-                d_max = (row[8][:10] if row[8] else "—")
-                d_range = f"{d_min} to {d_max}" if d_min != d_max else d_min
-
-                # Fetch whole-month count and size of all files on this device
-                total_scan_count = 0
-                total_scan_bytes = 0
-                if row[0] and device_name != "Unknown":
-                    try:
-                        cursor.execute("""
-                            SELECT COUNT(a.Z_PK), SUM(r.ZDATALENGTH)
-                            FROM photos_db.ZASSET a
-                            JOIN photos_db.ZEXTENDEDATTRIBUTES ea ON ea.ZASSET = a.Z_PK
-                            LEFT JOIN photos_db.ZINTERNALRESOURCE r ON r.ZASSET = a.Z_PK AND r.ZRESOURCETYPE = 0
-                            WHERE COALESCE(ea.ZCAMERAMODEL, 'Unknown') = ?
-                              AND strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch')) = ?
-                        """, (c_model, month_val))
-                        res = cursor.fetchone()
-                        if res:
-                            total_scan_count = res[0] or 0
-                            total_scan_bytes = res[1] or 0
-                    except Exception as e:
-                        logger.debug(f"Could not scan files size range: {e}")
-
-                processed_rows.append({
-                    "month_val": month_val,
-                    "file_count": file_count,
-                    "f_range": f_range,
-                    "d_range": d_range,
-                    "total_scan_count": total_scan_count,
-                    "total_scan_bytes": total_scan_bytes
-                })
-
-            # Sort processed_rows by total_scan_bytes descending
-            processed_rows.sort(key=lambda x: x["total_scan_bytes"], reverse=True)
-
-            for item in processed_rows:
-                device_total_files += item["total_scan_count"]
-                device_total_bytes += item["total_scan_bytes"]
-
-                scan_range_str = f"{item['total_scan_count']} files ({human_readable_size(item['total_scan_bytes'])})" if item['total_scan_count'] > 0 else "—"
-
-                line = f"{global_idx:<4} {item['month_val']:<12} {item['file_count'] + ' files':<12} {item['f_range']:<32} {item['d_range']:<24} {scan_range_str:<30}"
-                cleanup_report.append(line)
-                global_idx += 1
-
-            cleanup_report.append("-" * 135)
-            cleanup_report.append(f"💰 Total reclaimable space on {device_name}: {device_total_files} files ({human_readable_size(device_total_bytes)})")
+            cleanup_report.append(f"💰 Total reclaimable space for owner {owner_name}: {owner_total_files} files ({human_readable_size(owner_total_bytes)})")
             cleanup_report.append("==================================================================================================================================\n")
 
     # Detach database safely

@@ -1948,7 +1948,7 @@ def manage_device_owners_flow(cursor, conn):
                     LEFT JOIN photos_db.ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
                     WHERE date(za.ZDATECREATED + 978307200, 'unixepoch') > '1970-01-01'
                       AND date(za.ZDATECREATED + 978307200, 'unixepoch') NOT LIKE '0001-%'
-                      AND a.original_filename NOT IN ('gex[1].jpg', 'Lubka.JPG', 'IMG_0027.PNG')
+                      AND a.original_filename NOT IN ('gex[1].jpg', 'Lubka.JPG', 'IMG_0027.PNG', 'IMG_0285.JPEG', 'ogl_sm.jpg')
                       AND a.original_filename NOT LIKE '%.png'
                       AND a.original_filename NOT LIKE '%.PNG'
                       AND a.original_filename NOT LIKE 'MAH%'

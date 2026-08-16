@@ -1919,55 +1919,27 @@ def manage_device_owners_flow(cursor, conn):
             cursor.execute("""
                 WITH model_stats AS (
                     SELECT 
-                        COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') AS model,
+                        zea.ZCAMERAMODEL AS model,
                         COUNT(a.asset_id) AS total_count
                     FROM assets a
-                    LEFT JOIN (
-                        SELECT import_uuid, MAX(camera_model) AS camera_model
-                        FROM imports
-                        GROUP BY import_uuid
-                    ) i ON a.import_id = i.import_uuid
-                    LEFT JOIN photos_db.ZASSET za ON za.ZUUID = a.asset_id
-                    LEFT JOIN photos_db.ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
+                    JOIN photos_db.ZASSET za ON za.ZUUID = a.asset_id
+                    JOIN photos_db.ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
+                    WHERE zea.ZCAMERAMODEL IS NOT NULL AND zea.ZCAMERAMODEL != ''
                     GROUP BY model
                 ),
                 ranked_assets AS (
                     SELECT 
-                        COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') AS model,
+                        zea.ZCAMERAMODEL AS model,
                         a.original_filename,
                         date(za.ZDATECREATED + 978307200, 'unixepoch') AS created_time,
-                        ROW_NUMBER() OVER(PARTITION BY COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') ORDER BY za.ZDATECREATED ASC, a.original_filename ASC) as rn_asc,
-                        ROW_NUMBER() OVER(PARTITION BY COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') ORDER BY za.ZDATECREATED DESC, a.original_filename DESC) as rn_desc
+                        ROW_NUMBER() OVER(PARTITION BY zea.ZCAMERAMODEL ORDER BY za.ZDATECREATED ASC, a.original_filename ASC) as rn_asc,
+                        ROW_NUMBER() OVER(PARTITION BY zea.ZCAMERAMODEL ORDER BY za.ZDATECREATED DESC, a.original_filename DESC) as rn_desc
                     FROM assets a
-                    LEFT JOIN (
-                        SELECT import_uuid, MAX(camera_model) AS camera_model
-                        FROM imports
-                        GROUP BY import_uuid
-                    ) i ON a.import_id = i.import_uuid
-                    LEFT JOIN photos_db.ZASSET za ON za.ZUUID = a.asset_id
-                    LEFT JOIN photos_db.ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
-                    WHERE date(za.ZDATECREATED + 978307200, 'unixepoch') > '1970-01-01'
+                    JOIN photos_db.ZASSET za ON za.ZUUID = a.asset_id
+                    JOIN photos_db.ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
+                    WHERE zea.ZCAMERAMODEL IS NOT NULL AND zea.ZCAMERAMODEL != ''
+                      AND date(za.ZDATECREATED + 978307200, 'unixepoch') > '1970-01-01'
                       AND date(za.ZDATECREATED + 978307200, 'unixepoch') NOT LIKE '0001-%'
-                      AND a.original_filename NOT IN ('gex[1].jpg', 'Lubka.JPG', 'IMG_0027.PNG', 'IMG_0285.JPEG', 'ogl_sm.jpg')
-                      AND a.original_filename NOT LIKE '%.png'
-                      AND a.original_filename NOT LIKE '%.PNG'
-                      AND a.original_filename NOT LIKE 'MAH%'
-                      AND NOT (
-                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone 4' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2010-06-24') OR
-                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone 5s' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2013-09-20') OR
-                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone 6s' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2015-09-25') OR
-                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone 7' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2016-09-16') OR
-                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone 8 Plus' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2017-09-22') OR
-                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone XS' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2018-09-21') OR
-                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone XS Max' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2018-09-21') OR
-                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone XR' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2018-10-26') OR
-                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone 11 Pro' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2019-09-20') OR
-                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone 12' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2020-10-23') OR
-                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone 12 Pro Max' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2020-11-13') OR
-                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone 13 Pro Max' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2021-09-24') OR
-                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone 16 Pro' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2024-09-20') OR
-                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone 17 Pro Max' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2026-09-18')
-                      )
                 )
                 SELECT 
                     ms.model,
@@ -2090,8 +2062,8 @@ def display_media_cleanup_recommendations(cursor, verbose=True):
         SELECT 
             a.month,
             MAX(p.published_at_utc) AS last_published_at,
-            COALESCE(zea.ZCAMERAMAKE, i.camera_make, 'Unknown') AS camera_make,
-            COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') AS camera_model,
+            zea.ZCAMERAMAKE AS camera_make,
+            zea.ZCAMERAMODEL AS camera_model,
             COUNT(DISTINCT a.asset_id) AS total_published_assets,
             MIN(a.original_filename) AS min_filename,
             MAX(a.original_filename) AS max_filename,
@@ -2099,10 +2071,10 @@ def display_media_cleanup_recommendations(cursor, verbose=True):
             MAX(a.date_created_utc) AS max_date
         FROM publications p
         JOIN assets a ON p.asset_id = a.asset_id
-        LEFT JOIN imports i ON a.import_id = i.import_uuid
         LEFT JOIN ZASSET za ON za.ZUUID = a.asset_id
         LEFT JOIN ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
-        GROUP BY a.month, COALESCE(zea.ZCAMERAMAKE, i.camera_make, 'Unknown'), COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown')
+        WHERE zea.ZCAMERAMODEL IS NOT NULL AND zea.ZCAMERAMODEL != ''
+        GROUP BY a.month, zea.ZCAMERAMAKE, zea.ZCAMERAMODEL
         ORDER BY MAX(p.published_at_utc) DESC, a.month ASC
     """)
     rows = cursor.fetchall()

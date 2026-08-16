@@ -1935,7 +1935,7 @@ def manage_device_owners_flow(cursor, conn):
                     SELECT 
                         COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') AS model,
                         a.original_filename,
-                        datetime(za.ZDATECREATED + 978307200, 'unixepoch') AS created_time,
+                        date(za.ZDATECREATED + 978307200, 'unixepoch') AS created_time,
                         ROW_NUMBER() OVER(PARTITION BY COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') ORDER BY za.ZDATECREATED ASC, a.original_filename ASC) as rn_asc,
                         ROW_NUMBER() OVER(PARTITION BY COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') ORDER BY za.ZDATECREATED DESC, a.original_filename DESC) as rn_desc
                     FROM assets a
@@ -1998,17 +1998,17 @@ def manage_device_owners_flow(cursor, conn):
         # Sort by asset count ascending, then model name ascending to keep most-used at the bottom
         models_list.sort(key=lambda x: (x['count'], x['model']))
 
-        print("\n" + "=" * 185)
+        print("\n" + "=" * 161)
         print("👤  MANAGE DEVICE PRIMARY OWNERS")
-        print("=" * 185)
-        print(f"{'No.':<4} {'Device Camera Model':<36} {'Asset Count':<13} {'Earliest Created Asset (Filename & Timestamp)':<50} {'Latest Created Asset (Filename & Timestamp)':<50} {'Current Owner':<16} {'Source Type':<16}")
-        print("-" * 185)
+        print("=" * 161)
+        print(f"{'No.':<4} {'Device Camera Model':<36} {'Asset Count':<13} {'Earliest Created Asset (Filename & Date)':<38} {'Latest Created Asset (Filename & Date)':<38} {'Current Owner':<16} {'Source Type':<16}")
+        print("-" * 161)
 
         model_owners = []
         for idx, item in enumerate(models_list, 1):
             earliest_str = f"{item['min_filename']} ({item['min_created']})" if item['min_filename'] != '—' else '—'
             latest_str = f"{item['max_filename']} ({item['max_created']})" if item['max_filename'] != '—' else '—'
-            print(f"{idx:<4} {item['model']:<36} {item['count']:<13,} {earliest_str:<50} {latest_str:<50} {item['owner']:<16} {item['src_type']:<16}")
+            print(f"{idx:<4} {item['model']:<36} {item['count']:<13,} {earliest_str:<38} {latest_str:<38} {item['owner']:<16} {item['src_type']:<16}")
             model_owners.append((item['model'], item['owner']))
 
         print("-" * 185)

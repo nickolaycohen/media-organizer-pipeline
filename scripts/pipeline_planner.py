@@ -1917,22 +1917,54 @@ def manage_device_owners_flow(cursor, conn):
         counts_dict = {}
         try:
             cursor.execute("""
+                WITH model_stats AS (
+                    SELECT 
+                        COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') AS model,
+                        COUNT(a.asset_id) AS total_count
+                    FROM assets a
+                    LEFT JOIN (
+                        SELECT import_uuid, MAX(camera_model) AS camera_model
+                        FROM imports
+                        GROUP BY import_uuid
+                    ) i ON a.import_id = i.import_uuid
+                    LEFT JOIN photos_db.ZASSET za ON za.ZUUID = a.asset_id
+                    LEFT JOIN photos_db.ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
+                    GROUP BY model
+                ),
+                ranked_assets AS (
+                    SELECT 
+                        COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') AS model,
+                        a.original_filename,
+                        datetime(za.ZDATECREATED + 978307200, 'unixepoch') AS created_time,
+                        ROW_NUMBER() OVER(PARTITION BY COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') ORDER BY za.ZDATECREATED ASC, a.original_filename ASC) as rn_asc,
+                        ROW_NUMBER() OVER(PARTITION BY COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') ORDER BY za.ZDATECREATED DESC, a.original_filename DESC) as rn_desc
+                    FROM assets a
+                    LEFT JOIN (
+                        SELECT import_uuid, MAX(camera_model) AS camera_model
+                        FROM imports
+                        GROUP BY import_uuid
+                    ) i ON a.import_id = i.import_uuid
+                    LEFT JOIN photos_db.ZASSET za ON za.ZUUID = a.asset_id
+                    LEFT JOIN photos_db.ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
+                )
                 SELECT 
-                    COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') AS model,
-                    COUNT(a.asset_id) AS total_count,
-                    MIN(datetime(za.ZDATECREATED + 978307200, 'unixepoch')) AS min_created,
-                    MAX(datetime(za.ZDATECREATED + 978307200, 'unixepoch')) AS max_created
-                FROM assets a
-                LEFT JOIN imports i ON a.import_id = i.import_uuid
-                LEFT JOIN photos_db.ZASSET za ON za.ZUUID = a.asset_id
-                LEFT JOIN photos_db.ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
-                GROUP BY model
+                    ms.model,
+                    ms.total_count,
+                    MAX(case when ra.rn_asc = 1 then ra.original_filename end) as min_filename,
+                    MAX(case when ra.rn_asc = 1 then ra.created_time end) as min_created,
+                    MAX(case when ra.rn_desc = 1 then ra.original_filename end) as max_filename,
+                    MAX(case when ra.rn_desc = 1 then ra.created_time end) as max_created
+                FROM model_stats ms
+                LEFT JOIN ranked_assets ra ON ms.model = ra.model AND (ra.rn_asc = 1 OR ra.rn_desc = 1)
+                GROUP BY ms.model, ms.total_count
             """)
             for r in cursor.fetchall():
                 counts_dict[r[0]] = {
                     'count': r[1],
-                    'min_created': r[2],
-                    'max_created': r[3]
+                    'min_filename': r[2],
+                    'min_created': r[3],
+                    'max_filename': r[4],
+                    'max_created': r[5]
                 }
         except Exception as e:
             logger.debug(f"Could not count assets by device model: {e}")
@@ -1947,13 +1979,17 @@ def manage_device_owners_flow(cursor, conn):
                 continue
             item_data = counts_dict.get(model, {})
             count = item_data.get('count', 0)
+            min_filename = item_data.get('min_filename', '—') or '—'
             min_created = item_data.get('min_created', '—') or '—'
+            max_filename = item_data.get('max_filename', '—') or '—'
             max_created = item_data.get('max_created', '—') or '—'
             owner, src_type = resolve_device_owner(cursor, model)
             models_list.append({
                 'model': model,
                 'count': count,
+                'min_filename': min_filename,
                 'min_created': min_created,
+                'max_filename': max_filename,
                 'max_created': max_created,
                 'owner': owner,
                 'src_type': src_type
@@ -1962,18 +1998,20 @@ def manage_device_owners_flow(cursor, conn):
         # Sort by asset count ascending, then model name ascending to keep most-used at the bottom
         models_list.sort(key=lambda x: (x['count'], x['model']))
 
-        print("\n" + "=" * 142)
+        print("\n" + "=" * 185)
         print("👤  MANAGE DEVICE PRIMARY OWNERS")
-        print("=" * 142)
-        print(f"{'No.':<4} {'Device Camera Model':<36} {'Asset Count':<16} {'Earliest Created':<22} {'Latest Created':<22} {'Current Owner':<22} {'Source Type':<20}")
-        print("-" * 142)
+        print("=" * 185)
+        print(f"{'No.':<4} {'Device Camera Model':<36} {'Asset Count':<13} {'Earliest Created Asset (Filename & Timestamp)':<50} {'Latest Created Asset (Filename & Timestamp)':<50} {'Current Owner':<16} {'Source Type':<16}")
+        print("-" * 185)
 
         model_owners = []
         for idx, item in enumerate(models_list, 1):
-            print(f"{idx:<4} {item['model']:<36} {item['count']:<16,} {item['min_created']:<22} {item['max_created']:<22} {item['owner']:<22} {item['src_type']:<20}")
+            earliest_str = f"{item['min_filename']} ({item['min_created']})" if item['min_filename'] != '—' else '—'
+            latest_str = f"{item['max_filename']} ({item['max_created']})" if item['max_filename'] != '—' else '—'
+            print(f"{idx:<4} {item['model']:<36} {item['count']:<13,} {earliest_str:<50} {latest_str:<50} {item['owner']:<16} {item['src_type']:<16}")
             model_owners.append((item['model'], item['owner']))
 
-        print("-" * 142)
+        print("-" * 185)
         choice = input("\nOptions: [E]dit an owner | [B]ack to main menu: ").strip().lower()
         if choice == 'b' or not choice:
             break

@@ -1947,8 +1947,8 @@ def manage_device_owners_flow(cursor, conn):
                 'src_type': src_type
             })
 
-        # Sort by asset count descending, then model name ascending
-        models_list.sort(key=lambda x: (-x['count'], x['model']))
+        # Sort by asset count ascending, then model name ascending to keep most-used at the bottom
+        models_list.sort(key=lambda x: (x['count'], x['model']))
 
         print("\n" + "=" * 105)
         print("👤  MANAGE DEVICE PRIMARY OWNERS")

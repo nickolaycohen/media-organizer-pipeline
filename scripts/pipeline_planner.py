@@ -1949,6 +1949,7 @@ def manage_device_owners_flow(cursor, conn):
                     WHERE date(za.ZDATECREATED + 978307200, 'unixepoch') > '1970-01-01'
                       AND date(za.ZDATECREATED + 978307200, 'unixepoch') NOT LIKE '0001-%'
                       AND a.original_filename != 'gex[1].jpg'
+                      AND a.original_filename NOT LIKE 'MAH%'
                 )
                 SELECT 
                     ms.model,

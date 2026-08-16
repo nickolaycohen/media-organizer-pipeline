@@ -1883,8 +1883,17 @@ def run_memory_publishing_flow(cursor, conn):
 def display_media_cleanup_recommendations(cursor, verbose=True):
     """
     Generates and displays media cleanup recommendations for source cameras based on published albums.
-    For each published album, identifies contributing camera sources, date ranges, and filename ranges.
+    Groups recommendations by device model. For each recommendation row, queries Apple Photos DB copy
+    for the total asset count and size within the corresponding date range to quantify storage gains.
     """
+    # First, attach photos_db to query full camera/source libraries
+    try:
+        cursor.execute(f"ATTACH DATABASE '{APPLE_PHOTOS_DB_COPY_PATH}' AS photos_db")
+        logger.debug("Attached Photos.sqlite database for cleanup scan.")
+    except Exception as e:
+        logger.warning(f"Could not attach Photos.sqlite: {e}")
+
+    # Query published moments and their camera/file metrics
     cursor.execute("""
         SELECT 
             p.moment_name,
@@ -1918,48 +1927,86 @@ def display_media_cleanup_recommendations(cursor, verbose=True):
         cleanup_report.append("==================================================================================================================================\n")
     else:
         cleanup_report.append("The following events/moments have been curated and published.")
-        cleanup_report.append("You can safely format or delete these files from your source cameras / SD cards:\n")
-        header = f"{'No.':<4} {'Moment / Album Name':<30} {'Camera Source':<24} {'Files':<6} {'Filename Range':<32} {'Date Range':<24} {'Published At (Local)':<22}"
-        cleanup_report.append(header)
-        cleanup_report.append("-" * len(header))
+        cleanup_report.append("You can safely format or delete these files from your source cameras / SD cards (grouped by device):\n")
 
-        for idx, row in enumerate(rows, 1):
-            m_name = row[0] or "—"
-            p_date_raw = row[1]
-            pub_date_str = "—"
-            if p_date_raw:
-                try:
-                    dt_utc = None
-                    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
-                        try:
-                            dt_utc = datetime.strptime(p_date_raw, fmt)
-                            break
-                        except ValueError:
-                            continue
-                    if dt_utc:
-                        dt_utc = dt_utc.replace(tzinfo=timezone.utc)
-                        dt_local = dt_utc.astimezone()
-                        pub_date_str = dt_local.strftime("%Y-%m-%d %H:%M:%S")
-                    else:
-                        pub_date_str = p_date_raw[:19]
-                except Exception:
-                    pub_date_str = p_date_raw[:19]
-
+        # Group rows by device model (or make if model is unknown)
+        device_groups = {}
+        for row in rows:
             c_make = row[2] or ""
             c_model = row[3] or "Unknown"
             c_source = f"{c_model}" if (c_model != "Unknown" and c_model) else (c_make or "Unknown")
-            file_count = str(row[4])
-            f_min = row[5] or "—"
-            f_max = row[6] or "—"
-            f_range = f"{f_min} -> {f_max}" if f_min != f_max else f_min
-            d_min = (row[7][:10] if row[7] else "—")
-            d_max = (row[8][:10] if row[8] else "—")
-            d_range = f"{d_min} to {d_max}" if d_min != d_max else d_min
+            
+            if c_source not in device_groups:
+                device_groups[c_source] = []
+            device_groups[c_source].append(row)
 
-            line = f"{idx:<4} {m_name:<30} {c_source:<24} {file_count:<6} {f_range:<32} {d_range:<24} {pub_date_str:<22}"
-            cleanup_report.append(line)
+        global_idx = 1
+        # Process each device group
+        for device_name, group_rows in sorted(device_groups.items()):
+            cleanup_report.append(f"📷 Device: {device_name}")
+            cleanup_report.append("-" * 135)
+            header = f"{'No.':<4} {'Moment / Album Name':<32} {'Published':<10} {'Filename Range':<32} {'Date Range':<24} {'Reclaimable from SD Card (Whole Days)':<30}"
+            cleanup_report.append(header)
+            cleanup_report.append("-" * 135)
 
-        cleanup_report.append("==================================================================================================================================\n")
+            device_total_files = 0
+            device_total_bytes = 0
+
+            for row in group_rows:
+                m_name = row[0] or "—"
+                c_make = row[2] or ""
+                c_model = row[3] or "Unknown"
+                file_count = str(row[4])
+                f_min = row[5] or "—"
+                f_max = row[6] or "—"
+                f_range = f"{f_min} -> {f_max}" if f_min != f_max else f_min
+                d_min = (row[7][:10] if row[7] else "—")
+                d_max = (row[8][:10] if row[8] else "—")
+                d_range = f"{d_min} to {d_max}" if d_min != d_max else d_min
+
+                # Fetch whole-day count and size of all files on this device within the date range
+                total_scan_count = 0
+                total_scan_bytes = 0
+                if row[7] and row[8] and device_name != "Unknown":
+                    # Convert to full day boundaries for cleanup
+                    start_date_str = row[7][:10] + " 00:00:00"
+                    end_date_str = row[8][:10] + " 23:59:59"
+                    
+                    try:
+                        cursor.execute("""
+                            SELECT COUNT(a.Z_PK), SUM(r.ZDATALENGTH)
+                            FROM photos_db.ZASSET a
+                            JOIN photos_db.ZEXTENDEDATTRIBUTES ea ON ea.ZASSET = a.Z_PK
+                            LEFT JOIN photos_db.ZINTERNALRESOURCE r ON r.ZASSET = a.Z_PK AND r.ZRESOURCETYPE = 0
+                            WHERE COALESCE(ea.ZCAMERAMODEL, 'Unknown') = ?
+                              AND datetime(a.ZDATECREATED + 978307200, 'unixepoch') BETWEEN ? AND ?
+                        """, (c_model, start_date_str, end_date_str))
+                        res = cursor.fetchone()
+                        if res:
+                            total_scan_count = res[0] or 0
+                            total_scan_bytes = res[1] or 0
+                    except Exception as e:
+                        logger.debug(f"Could not scan files size range: {e}")
+
+                device_total_files += total_scan_count
+                device_total_bytes += total_scan_bytes
+
+                scan_range_str = f"{total_scan_count} files ({human_readable_size(total_scan_bytes)})" if total_scan_count > 0 else "—"
+
+                line = f"{global_idx:<4} {m_name:<32} {file_count + ' files':<10} {f_range:<32} {d_range:<24} {scan_range_str:<30}"
+                cleanup_report.append(line)
+                global_idx += 1
+
+            cleanup_report.append("-" * 135)
+            cleanup_report.append(f"💰 Total reclaimable space on {device_name}: {device_total_files} files ({human_readable_size(device_total_bytes)})")
+            cleanup_report.append("==================================================================================================================================\n")
+
+    # Detach database safely
+    try:
+        cursor.execute("DETACH DATABASE photos_db")
+        logger.debug("Detached Photos.sqlite database after cleanup scan.")
+    except Exception:
+        pass
 
     # Write to dedicated log file
     try:

@@ -1880,6 +1880,84 @@ def run_memory_publishing_flow(cursor, conn):
         elif choice == 'e':
             break
 
+def resolve_device_owner(cursor, camera_model):
+    """
+    Looks up the owner of a camera model. Checks database overrides first,
+    then defaults to DEVICE_OWNER_MAPPING, then 'Shared/Other'.
+    """
+    try:
+        cursor.execute("SELECT owner_name FROM device_owners WHERE camera_model = ?", (camera_model,))
+        row = cursor.fetchone()
+        if row:
+            return row[0], "Database Override"
+    except Exception:
+        pass
+    
+    if camera_model in DEVICE_OWNER_MAPPING:
+        return DEVICE_OWNER_MAPPING[camera_model], "Default Mapping"
+    
+    return "Shared/Other", "Default Fallback"
+
+def manage_device_owners_flow(cursor, conn):
+    """
+    Interactive flow to view and edit primary owners of camera devices.
+    """
+    while True:
+        # Get all distinct camera models from imports
+        try:
+            cursor.execute("SELECT DISTINCT camera_model FROM imports WHERE camera_model IS NOT NULL AND camera_model != 'Unknown'")
+            db_models = [r[0] for r in cursor.fetchall()]
+        except Exception:
+            db_models = []
+
+        # Merge with constants DEVICE_OWNER_MAPPING
+        all_models = sorted(list(set(db_models + list(DEVICE_OWNER_MAPPING.keys()))))
+
+        print("\n" + "=" * 80)
+        print("👤  MANAGE DEVICE PRIMARY OWNERS")
+        print("=" * 80)
+        print(f"{'No.':<4} {'Device Camera Model':<36} {'Current Owner':<20} {'Source Type':<20}")
+        print("-" * 80)
+
+        model_owners = []
+        for idx, model in enumerate(all_models, 1):
+            owner, src_type = resolve_device_owner(cursor, model)
+            print(f"{idx:<4} {model:<36} {owner:<20} {src_type:<20}")
+            model_owners.append((model, owner))
+
+        print("-" * 80)
+        choice = input("\nOptions: [E]dit an owner | [B]ack to main menu: ").strip().lower()
+        if choice == 'b' or not choice:
+            break
+        elif choice == 'e':
+            num_input = input(f"Enter device number to edit (1-{len(all_models)}) or Q to cancel: ").strip()
+            if num_input.lower() == 'q':
+                continue
+            try:
+                num = int(num_input)
+                if num < 1 or num > len(all_models):
+                    print("⚠️ Invalid number selection.")
+                    continue
+                selected_model, current_owner = model_owners[num - 1]
+                new_owner = input(f"Enter new owner name for '{selected_model}' (leave empty to reset to default): ").strip()
+                
+                # Check if empty, then delete override
+                if not new_owner:
+                    cursor.execute("DELETE FROM device_owners WHERE camera_model = ?", (selected_model,))
+                    conn.commit()
+                    print(f"✅ Reset '{selected_model}' to its default configuration.")
+                else:
+                    cursor.execute("""
+                        INSERT OR REPLACE INTO device_owners (camera_model, owner_name)
+                        VALUES (?, ?)
+                    """, (selected_model, new_owner))
+                    conn.commit()
+                    print(f"✅ Updated owner of '{selected_model}' to '{new_owner}'.")
+            except ValueError:
+                print("⚠️ Please enter a valid number.")
+            except Exception as e:
+                print(f"⚠️ Failed to update database: {e}")
+
 def display_media_cleanup_recommendations(cursor, verbose=True):
     """
     Generates and displays media cleanup recommendations for source cameras based on published albums.
@@ -1936,8 +2014,11 @@ def display_media_cleanup_recommendations(cursor, verbose=True):
             c_model = row[3] or "Unknown"
             c_source = f"{c_model}" if (c_model != "Unknown" and c_model) else (c_make or "Unknown")
             
-            # Look up owner
-            owner = DEVICE_OWNER_MAPPING.get(c_source, DEVICE_OWNER_MAPPING.get(c_model, "Shared/Other"))
+            # Look up owner dynamically via database or defaults
+            owner_resolved, _ = resolve_device_owner(cursor, c_source)
+            if owner_resolved == "Shared/Other" and c_model != c_source:
+                owner_resolved, _ = resolve_device_owner(cursor, c_model)
+            owner = owner_resolved
             
             if owner not in owner_groups:
                 owner_groups[owner] = {}
@@ -2096,10 +2177,10 @@ def main(auto_apply, no_sync=False):
     else:
         logger.info("⚡ Fast Mode: Skipping bootstrap sync steps.")
 
-    # Prompt for session mode: Batch Management, Memory Feature & Publishing, or Media Cleanup
+    # Prompt for session mode: Batch Management, Memory Feature & Publishing, Media Cleanup, or Manage Device Owners
     if not auto_apply:
         print("\n--- 🛠️  Session Mode ---")
-        mode = input("Select mode: [B] Batch Management (default) | [M] Memory Feature & Publishing | [C] Media Cleanup: ").strip().lower()
+        mode = input("Select mode: [B] Batch Management (default) | [M] Memory Feature & Publishing | [C] Media Cleanup | [O] Manage Device Owners: ").strip().lower()
         if mode == 'm':
             conn = get_connection()
             conn.execute("PRAGMA busy_timeout = 30000")
@@ -2114,6 +2195,14 @@ def main(auto_apply, no_sync=False):
             display_media_cleanup_recommendations(cursor, verbose=True)
             close_conn()
             sys.exit(0)
+        elif mode == 'o':
+            conn = get_connection()
+            conn.execute("PRAGMA busy_timeout = 30000")
+            cursor = get_cursor()
+            manage_device_owners_flow(cursor, conn)
+            close_conn()
+            # Restart the script to return to the main menu clean
+            os.execv(sys.executable, [sys.executable] + sys.argv)
 
     conn = get_connection()
     conn.execute("PRAGMA busy_timeout = 30000")

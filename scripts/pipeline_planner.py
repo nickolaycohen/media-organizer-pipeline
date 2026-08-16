@@ -1948,23 +1948,25 @@ def manage_device_owners_flow(cursor, conn):
                     LEFT JOIN photos_db.ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
                     WHERE date(za.ZDATECREATED + 978307200, 'unixepoch') > '1970-01-01'
                       AND date(za.ZDATECREATED + 978307200, 'unixepoch') NOT LIKE '0001-%'
-                      AND a.original_filename NOT IN ('gex[1].jpg', 'Lubka.JPG')
+                      AND a.original_filename NOT IN ('gex[1].jpg', 'Lubka.JPG', 'IMG_0027.PNG')
+                      AND a.original_filename NOT LIKE '%.png'
+                      AND a.original_filename NOT LIKE '%.PNG'
                       AND a.original_filename NOT LIKE 'MAH%'
                       AND NOT (
-                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone 4' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2010-06-01') OR
-                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone 5s' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2013-09-01') OR
-                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone 6s' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2015-09-01') OR
-                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone 7' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2016-09-01') OR
-                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone 8 Plus' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2017-09-01') OR
-                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone XS' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2018-09-01') OR
-                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone XS Max' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2018-09-01') OR
-                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone XR' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2018-09-01') OR
-                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone 11 Pro' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2019-09-01') OR
-                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone 12' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2020-09-01') OR
-                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone 12 Pro Max' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2020-09-01') OR
-                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone 13 Pro Max' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2021-09-01') OR
-                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone 16 Pro' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2024-09-01') OR
-                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone 17 Pro Max' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2026-09-01')
+                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone 4' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2010-06-24') OR
+                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone 5s' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2013-09-20') OR
+                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone 6s' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2015-09-25') OR
+                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone 7' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2016-09-16') OR
+                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone 8 Plus' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2017-09-22') OR
+                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone XS' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2018-09-21') OR
+                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone XS Max' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2018-09-21') OR
+                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone XR' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2018-10-26') OR
+                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone 11 Pro' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2019-09-20') OR
+                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone 12' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2020-10-23') OR
+                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone 12 Pro Max' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2020-11-13') OR
+                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone 13 Pro Max' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2021-09-24') OR
+                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone 16 Pro' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2024-09-20') OR
+                          (COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') = 'iPhone 17 Pro Max' AND date(za.ZDATECREATED + 978307200, 'unixepoch') < '2026-09-18')
                       )
                 )
                 SELECT 

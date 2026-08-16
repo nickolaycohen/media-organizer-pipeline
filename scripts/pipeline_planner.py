@@ -1901,41 +1901,77 @@ def resolve_device_owner(cursor, camera_model):
 def manage_device_owners_flow(cursor, conn):
     """
     Interactive flow to view and edit primary owners of camera devices.
+    Lists devices ordered by their total asset count in the database copy.
     """
-    while True:
-        # Get all distinct camera models from imports
+    # Attach photos_db for counting assets by camera model
+    try:
+        cursor.execute("SELECT 1 FROM photos_db.ZASSET LIMIT 1")
+    except Exception:
         try:
-            cursor.execute("SELECT DISTINCT camera_model FROM imports WHERE camera_model IS NOT NULL AND camera_model != 'Unknown'")
-            db_models = [r[0] for r in cursor.fetchall()]
+            cursor.execute(f"ATTACH DATABASE '{APPLE_PHOTOS_DB_COPY_PATH}' AS photos_db")
         except Exception:
-            db_models = []
+            pass
+
+    while True:
+        # Get all distinct camera models from imports/assets and count them
+        counts_dict = {}
+        try:
+            cursor.execute("""
+                SELECT 
+                    COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') AS model,
+                    COUNT(a.asset_id) AS total_count
+                FROM assets a
+                LEFT JOIN imports i ON a.import_id = i.import_uuid
+                LEFT JOIN photos_db.ZASSET za ON za.ZUUID = a.asset_id
+                LEFT JOIN photos_db.ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
+                GROUP BY model
+            """)
+            counts_dict = {r[0]: r[1] for r in cursor.fetchall()}
+        except Exception as e:
+            logger.debug(f"Could not count assets by device model: {e}")
 
         # Merge with constants DEVICE_OWNER_MAPPING
-        all_models = sorted(list(set(db_models + list(DEVICE_OWNER_MAPPING.keys()))))
+        db_models = list(counts_dict.keys())
+        all_unique_models = list(set(db_models + list(DEVICE_OWNER_MAPPING.keys())))
+        
+        models_list = []
+        for model in all_unique_models:
+            if model == 'Unknown' or not model:
+                continue
+            count = counts_dict.get(model, 0)
+            owner, src_type = resolve_device_owner(cursor, model)
+            models_list.append({
+                'model': model,
+                'count': count,
+                'owner': owner,
+                'src_type': src_type
+            })
 
-        print("\n" + "=" * 80)
+        # Sort by asset count descending, then model name ascending
+        models_list.sort(key=lambda x: (-x['count'], x['model']))
+
+        print("\n" + "=" * 105)
         print("👤  MANAGE DEVICE PRIMARY OWNERS")
-        print("=" * 80)
-        print(f"{'No.':<4} {'Device Camera Model':<36} {'Current Owner':<20} {'Source Type':<20}")
-        print("-" * 80)
+        print("=" * 105)
+        print(f"{'No.':<4} {'Device Camera Model':<36} {'Asset Count':<16} {'Current Owner':<22} {'Source Type':<20}")
+        print("-" * 105)
 
         model_owners = []
-        for idx, model in enumerate(all_models, 1):
-            owner, src_type = resolve_device_owner(cursor, model)
-            print(f"{idx:<4} {model:<36} {owner:<20} {src_type:<20}")
-            model_owners.append((model, owner))
+        for idx, item in enumerate(models_list, 1):
+            print(f"{idx:<4} {item['model']:<36} {item['count']:<16,} {item['owner']:<22} {item['src_type']:<20}")
+            model_owners.append((item['model'], item['owner']))
 
-        print("-" * 80)
+        print("-" * 105)
         choice = input("\nOptions: [E]dit an owner | [B]ack to main menu: ").strip().lower()
         if choice == 'b' or not choice:
             break
         elif choice == 'e':
-            num_input = input(f"Enter device number to edit (1-{len(all_models)}) or Q to cancel: ").strip()
+            num_input = input(f"Enter device number to edit (1-{len(models_list)}) or Q to cancel: ").strip()
             if num_input.lower() == 'q':
                 continue
             try:
                 num = int(num_input)
-                if num < 1 or num > len(all_models):
+                if num < 1 or num > len(models_list):
                     print("⚠️ Invalid number selection.")
                     continue
                 selected_model, current_owner = model_owners[num - 1]
@@ -1957,6 +1993,12 @@ def manage_device_owners_flow(cursor, conn):
                 print("⚠️ Please enter a valid number.")
             except Exception as e:
                 print(f"⚠️ Failed to update database: {e}")
+
+    # Detach database safely at exit of flow
+    try:
+        cursor.execute("DETACH DATABASE photos_db")
+    except Exception:
+        pass
 
 def display_media_cleanup_recommendations(cursor, verbose=True):
     """

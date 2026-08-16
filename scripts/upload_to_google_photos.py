@@ -257,20 +257,13 @@ def main(args):
 
     if not files_to_process:
         logger.info(f"✅ No new files to upload for month {month}. (Checked {len(files)} files, {skipped_count} already uploaded, {skipped_oversized_count} skipped > {max_upload_size_mb:.0f} MB).")
-        # Finalize status from partial (399) or error (400E) to complete (400) if all eligible assets have been processed
-        cursor.execute("SELECT COUNT(*) FROM assets WHERE month = ?", (month,))
-        total_assets_expected = cursor.fetchone()[0]
-
-        cursor.execute("SELECT COUNT(*) FROM assets WHERE month = ? AND uploaded_to_google = 1", (month,))
-        uploaded_count = cursor.fetchone()[0]
-
-        if (uploaded_count + skipped_oversized_count) >= total_assets_expected or (total_assets_expected > 0 and len(files) == (skipped_count + skipped_oversized_count)):
-            cursor.execute("SELECT status_code FROM month_batches WHERE month = ?", (month,))
-            row = cursor.fetchone()
-            if row and row[0] < '400':
-                cursor.execute("UPDATE month_batches SET status_code = '400' WHERE month = ?", (month,))
-                conn.commit()
-                logger.info(f"✅ Batch {month} status finalized to 400.")
+        # Since all eligible files in the staging folder have been processed, we finalize the status to 400.
+        cursor.execute("SELECT status_code FROM month_batches WHERE month = ?", (month,))
+        row = cursor.fetchone()
+        if row and row[0] < '400':
+            cursor.execute("UPDATE month_batches SET status_code = '400' WHERE month = ?", (month,))
+            conn.commit()
+            logger.info(f"✅ Batch {month} status finalized to 400.")
         return
     else:
         logger.info(f"🔍 Batch Analysis: {len(files_to_process) + skipped_count + skipped_oversized_count} total files found. "
@@ -413,7 +406,8 @@ def main(args):
     cursor.execute("SELECT COUNT(*) FROM assets WHERE month = ? AND uploaded_to_google = 1", (month,))
     uploaded_count = cursor.fetchone()[0]
 
-    if (uploaded_count + skipped_oversized_count) >= total_assets_expected or (total_assets_expected > 0 and len(files) == (skipped_count + len(files_to_process) + skipped_oversized_count + skipped_quota_count) and not args.dry_run):
+    # If no files were skipped due to quota limits, we can finalize the status to 400
+    if skipped_quota_count == 0 and not args.dry_run:
         logger.info(f"🎊 All eligible assets for {month} are verified as uploaded in the database ({uploaded_count} uploaded, {skipped_oversized_count} skipped > {max_upload_size_mb:.0f} MB).")
         # Finalize status to complete (400)
         cursor.execute("SELECT status_code FROM month_batches WHERE month = ?", (month,))
@@ -422,7 +416,7 @@ def main(args):
             cursor.execute("UPDATE month_batches SET status_code = '400' WHERE month = ?", (month,))
             logger.info(f"✅ Batch {month} status finalized to 400.")
     else:
-        logger.info(f"⚠️ Month {month} remains partially uploaded ({uploaded_count}/{total_assets_expected} assets).")
+        logger.info(f"⚠️ Month {month} remains partially uploaded due to quota limits ({uploaded_count}/{total_assets_expected} assets).")
 
     conn.commit()
     logger.info(f"✅ Upload process completed at {datetime.now(timezone.utc).isoformat()}")

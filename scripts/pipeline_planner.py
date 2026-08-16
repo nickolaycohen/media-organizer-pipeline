@@ -1913,20 +1913,27 @@ def manage_device_owners_flow(cursor, conn):
             pass
 
     while True:
-        # Get all distinct camera models from imports/assets and count them
+        # Get all distinct camera models from imports/assets and count/timestamp them
         counts_dict = {}
         try:
             cursor.execute("""
                 SELECT 
                     COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown') AS model,
-                    COUNT(a.asset_id) AS total_count
+                    COUNT(a.asset_id) AS total_count,
+                    MIN(datetime(za.ZDATECREATED + 978307200, 'unixepoch')) AS min_created,
+                    MAX(datetime(za.ZDATECREATED + 978307200, 'unixepoch')) AS max_created
                 FROM assets a
                 LEFT JOIN imports i ON a.import_id = i.import_uuid
                 LEFT JOIN photos_db.ZASSET za ON za.ZUUID = a.asset_id
                 LEFT JOIN photos_db.ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
                 GROUP BY model
             """)
-            counts_dict = {r[0]: r[1] for r in cursor.fetchall()}
+            for r in cursor.fetchall():
+                counts_dict[r[0]] = {
+                    'count': r[1],
+                    'min_created': r[2],
+                    'max_created': r[3]
+                }
         except Exception as e:
             logger.debug(f"Could not count assets by device model: {e}")
 
@@ -1938,11 +1945,16 @@ def manage_device_owners_flow(cursor, conn):
         for model in all_unique_models:
             if model == 'Unknown' or not model:
                 continue
-            count = counts_dict.get(model, 0)
+            item_data = counts_dict.get(model, {})
+            count = item_data.get('count', 0)
+            min_created = item_data.get('min_created', '—') or '—'
+            max_created = item_data.get('max_created', '—') or '—'
             owner, src_type = resolve_device_owner(cursor, model)
             models_list.append({
                 'model': model,
                 'count': count,
+                'min_created': min_created,
+                'max_created': max_created,
                 'owner': owner,
                 'src_type': src_type
             })
@@ -1950,18 +1962,18 @@ def manage_device_owners_flow(cursor, conn):
         # Sort by asset count ascending, then model name ascending to keep most-used at the bottom
         models_list.sort(key=lambda x: (x['count'], x['model']))
 
-        print("\n" + "=" * 105)
+        print("\n" + "=" * 142)
         print("👤  MANAGE DEVICE PRIMARY OWNERS")
-        print("=" * 105)
-        print(f"{'No.':<4} {'Device Camera Model':<36} {'Asset Count':<16} {'Current Owner':<22} {'Source Type':<20}")
-        print("-" * 105)
+        print("=" * 142)
+        print(f"{'No.':<4} {'Device Camera Model':<36} {'Asset Count':<16} {'Earliest Created':<22} {'Latest Created':<22} {'Current Owner':<22} {'Source Type':<20}")
+        print("-" * 142)
 
         model_owners = []
         for idx, item in enumerate(models_list, 1):
-            print(f"{idx:<4} {item['model']:<36} {item['count']:<16,} {item['owner']:<22} {item['src_type']:<20}")
+            print(f"{idx:<4} {item['model']:<36} {item['count']:<16,} {item['min_created']:<22} {item['max_created']:<22} {item['owner']:<22} {item['src_type']:<20}")
             model_owners.append((item['model'], item['owner']))
 
-        print("-" * 105)
+        print("-" * 142)
         choice = input("\nOptions: [E]dit an owner | [B]ack to main menu: ").strip().lower()
         if choice == 'b' or not choice:
             break

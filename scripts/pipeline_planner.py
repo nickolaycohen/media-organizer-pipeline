@@ -1946,6 +1946,9 @@ def manage_device_owners_flow(cursor, conn):
                     ) i ON a.import_id = i.import_uuid
                     LEFT JOIN photos_db.ZASSET za ON za.ZUUID = a.asset_id
                     LEFT JOIN photos_db.ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
+                    WHERE date(za.ZDATECREATED + 978307200, 'unixepoch') > '1970-01-01'
+                      AND date(za.ZDATECREATED + 978307200, 'unixepoch') NOT LIKE '0001-%'
+                      AND a.original_filename != 'gex[1].jpg'
                 )
                 SELECT 
                     ms.model,

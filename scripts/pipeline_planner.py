@@ -3,6 +3,10 @@ import os
 import subprocess
 import re
 import time
+import json
+import socket
+import errno
+import atexit
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import logging
@@ -12,7 +16,7 @@ from utils.utils import get_full_transition_path, human_readable_size
 from google_photos import check_google_quota, authenticate, get_all_favorites
 import argparse
 import sqlite3
-from constants import MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_COPY_PATH, LOG_PATH, GOOGLE_PHOTOS_READONLY_SCOPES, GOOGLE_DRIVE_READ_ONLY_SCOPES, PLANNER_REQUIRED_SCOPES, CURATION_THRESHOLD_LOG_PATH, SCORING_BREAKDOWN_LOG_PATH, MEDIA_CLEANUP_LOG_PATH, MAX_UPLOAD_FILE_SIZE_BYTES, MAX_UPLOAD_FILE_SIZE_MB
+from constants import MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_COPY_PATH, APPLE_PHOTOS_DB_LOCK_PATH, APPLE_PHOTOS_DB_PATH, LOG_PATH, GOOGLE_PHOTOS_READONLY_SCOPES, GOOGLE_DRIVE_READ_ONLY_SCOPES, PLANNER_REQUIRED_SCOPES, CURATION_THRESHOLD_LOG_PATH, SCORING_BREAKDOWN_LOG_PATH, MEDIA_CLEANUP_LOG_PATH, MAX_UPLOAD_FILE_SIZE_BYTES, MAX_UPLOAD_FILE_SIZE_MB
 from constants import ACTIVE_CAMERA_MODELS, DEVICE_OWNER_MAPPING
 from db.connections import get_connection, get_cursor, commit, close as close_conn
 from db.queries import get_stage_transitions, get_batch_statuses, get_latest_import_and_month
@@ -36,62 +40,122 @@ def set_planned_month(cursor, month):
         cursor.execute("INSERT INTO planned_execution (planned_month, active, set_at_utc) VALUES (?, 1, datetime('now'))", (month,))
         logger.info(f"Added month {month} to planned_execution queue.")
 
-def should_run_sync_metadata(cursor):
-    """
-    Determine whether the sync_photos_metadata.py step should run.
-    It should run if the last successful sync is older than the Apple Photos DB modification time.
-    """
-    # Get last successful sync time from a hypothetical table sync_status
-    cursor.execute("""
-        SELECT MAX(executed_at_utc)
-        FROM pipeline_executions
-        WHERE (label = '0.3 Sync Metadata' OR label = '0.3 Sync assets' OR label = '0.3 Sync metadata') AND status = 'success'
-    """)
-    last_sync = cursor.fetchone()
-    last_sync_time = last_sync[0] if last_sync else None
-
-    # Get Apple Photos DB modification time
-    # APPLE_PHOTOS_DB_COPY_PATH = os.path.expanduser("~/Pictures/Photos Library.photoslibrary/database/Photos.sqlite")
-    if not os.path.exists(APPLE_PHOTOS_DB_COPY_PATH):
-        return True  # If DB does not exist, better to run sync
-
-    # Check if necessary columns exist in imports table
+def is_pid_alive(pid):
+    if pid is None:
+        return False
     try:
-        cursor.execute("SELECT min_date, max_date, months_detected FROM imports LIMIT 1")
-    except sqlite3.OperationalError:
-        logger.info("Schema mismatch detected in 'imports' table. Resetting sync flags to force metadata sync.")
-        cursor.execute("UPDATE db_updates SET raw_synced = 0, derived_synced = 0")
-        cursor.connection.commit()
+        os.kill(pid, 0)
+        return True
+    except OSError as err:
+        if err.errno == errno.ESRCH:
+            return False
         return True
 
-    # Check if ranked_assets_view exists
+def read_lock_file():
+    if not os.path.exists(APPLE_PHOTOS_DB_LOCK_PATH):
+        return None
     try:
-        cursor.execute("SELECT score_normalized FROM ranked_assets_view LIMIT 1")
-    except sqlite3.OperationalError:
-        logger.info("Missing 'ranked_assets_view' detected. Resetting sync flags to force metadata sync.")
-        cursor.execute("UPDATE db_updates SET raw_synced = 0, derived_synced = 0")
-        cursor.connection.commit()
-        return True
+        with open(APPLE_PHOTOS_DB_LOCK_PATH, "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
 
-    db_mod_time = os.path.getmtime(APPLE_PHOTOS_DB_COPY_PATH)
+def write_lock_file(status, pid, started_at=None, latest_successful_refresh_utc="—"):
+    try:
+        lock_data = {
+            "status": status,
+            "pid": pid,
+            "started_at": started_at,
+            "host": socket.gethostname(),
+            "latest_successful_refresh_utc": latest_successful_refresh_utc
+        }
+        with open(APPLE_PHOTOS_DB_LOCK_PATH, "w") as f:
+            json.dump(lock_data, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Failed to write lock file: {e}")
 
-    if last_sync_time is None:
-        return True
+def release_planner_lock():
+    lock = read_lock_file()
+    if lock and lock.get("pid") == os.getpid() and lock.get("status") == "planner_active":
+        logger.info("🔓 Releasing planner active lock.")
+        write_lock_file(
+            status="available",
+            pid=None,
+            latest_successful_refresh_utc=lock.get("latest_successful_refresh_utc", "—")
+        )
 
-    last_sync_timestamp = datetime.strptime(last_sync_time, "%Y-%m-%d %H:%M:%S").timestamp()
+def acquire_planner_lock():
+    while True:
+        lock = read_lock_file()
+        last_refresh = "—"
+        
+        if lock:
+            last_refresh = lock.get("latest_successful_refresh_utc", "—")
+            status = lock.get("status")
+            lock_pid = lock.get("pid")
+            
+            if status == "refreshing":
+                if is_pid_alive(lock_pid):
+                    print(f"\rℹ️  Apple Photos database copy is currently being refreshed in the background (PID: {lock_pid}). Waiting for lock release...", end="", flush=True)
+                    time.sleep(10)
+                    continue
+                else:
+                    print(f"\n⚠️ Found stale refreshing lock file from dead PID {lock_pid}. Overriding lock.")
+            elif status == "planner_active":
+                if is_pid_alive(lock_pid) and lock_pid != os.getpid():
+                    logger.error(f"❌ Another instance of the pipeline planner is currently active (PID: {lock_pid}). Exiting to prevent DB write contention.")
+                    sys.exit(1)
+                elif lock_pid == os.getpid():
+                    return
+                else:
+                    print(f"\n⚠️ Found stale planner active lock file from dead PID {lock_pid}. Overriding lock.")
+        
+        # Lock is available, acquire it
+        print(f"\n🔐 Acquiring planner lock (PID: {os.getpid()}).")
+        write_lock_file(
+            status="planner_active",
+            pid=os.getpid(),
+            started_at=datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            latest_successful_refresh_utc=last_refresh
+        )
+        atexit.register(release_planner_lock)
+        break
 
-    return db_mod_time > last_sync_timestamp
+def check_if_refresh_needed():
+    if not os.path.exists(APPLE_PHOTOS_DB_PATH):
+        return
+        
+    src_mod_time = os.path.getmtime(APPLE_PHOTOS_DB_PATH)
+    src_wal_path = APPLE_PHOTOS_DB_PATH + "-wal"
+    if os.path.exists(src_wal_path):
+        src_mod_time = max(src_mod_time, os.path.getmtime(src_wal_path))
+        
+    lock = read_lock_file()
+    last_refresh_timestamp = 0
+    last_refresh_str = "—"
+    if lock and lock.get("latest_successful_refresh_utc") and lock.get("latest_successful_refresh_utc") != "—":
+        try:
+            last_refresh_str = lock.get("latest_successful_refresh_utc")
+            last_refresh_dt = datetime.strptime(last_refresh_str, "%Y-%m-%d %H:%M:%S")
+            last_refresh_timestamp = last_refresh_dt.timestamp()
+        except Exception:
+            pass
+            
+    # Check if src_mod_time is newer than last successful refresh with a 2.0 second tolerance
+    if src_mod_time > (last_refresh_timestamp + 2.0):
+        print("\n" + "!" * 100)
+        print("⚠️  WARNING: Apple Photos database has new changes since the last sync.")
+        print(f"   • Last Sync Time: {last_refresh_str}")
+        print(f"   • Source DB Time: {datetime.fromtimestamp(src_mod_time).strftime('%Y-%m-%d %H:%M:%S')}")
+        print("👉 Please run 'python3 scripts/bg_copy_db_service.py' in a separate background window to refresh.")
+        print("!" * 100 + "\n")
 
 # Helper to run bootstrap steps
 def run_bootstrap_steps(auto_apply, logger):
     """
-    Run the bootstrap steps: copy_all_media_db.py, storage_status.py, sync_photos_metadata.py.
+    Run the bootstrap steps: only 1.0 Generate Batches is synchronous now.
     """
     steps = [
-        ("0.0 Copy all media DB", "copy_all_media_photos_db.py", []),
-        ("0.1 Run storage manager", "storage_manager_main.py", ["--migrate"]),
-        ("0.2 Sync assets", "sync_photos_raw.py", []),
-        ("0.3 Sync metadata", "sync_photos_derived.py", ["--force"]),
         ("1.0 Generate Batches", "generate_month_batches.py", [])
     ]
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -99,27 +163,11 @@ def run_bootstrap_steps(auto_apply, logger):
         script_path = os.path.join(script_dir, script_file)
         logger.info(f"🔧 Running bootstrap step: {step_name} ({script_file})")
         try:
-            if script_file in ["sync_photos_raw.py", "sync_photos_derived.py", "sync_photos_metadata.py"]:
-                # Isolate the check so the connection is definitely closed before the subprocess starts
-                tmp_conn = sqlite3.connect(MEDIA_ORGANIZER_DB_PATH)
-                tmp_conn.execute("PRAGMA journal_mode=WAL;")
-                tmp_conn.execute("PRAGMA busy_timeout = 30000;")
-                tmp_cursor = tmp_conn.cursor()
-                should_sync = should_run_sync_metadata(tmp_cursor)
-                tmp_conn.close()
-                
-                if not should_sync:
-                    logger.info(f"Skipping {script_file} as sync is up to date.")
-                    continue
             subprocess.run([sys.executable, script_path] + step_args, check=True)
             logger.info(f"✅ Completed: {step_name}")
         except subprocess.CalledProcessError as e:
             logger.error(f"❌ Error in bootstrap step {step_name}: {e}")
-            if script_file == "storage_status.py":
-                logger.error("Storage status check failed. Exiting planner due to migration failure.")
-                sys.exit(1)
-            else:
-                sys.exit(1)
+            sys.exit(1)
 
 def print_assets_table(assets):
     """
@@ -2248,6 +2296,8 @@ def display_media_cleanup_recommendations(cursor, verbose=True):
 
 def main(auto_apply, no_sync=False):
     # Set up logger with line number in format
+    acquire_planner_lock()
+    check_if_refresh_needed()
 
     # Check for active planned executions in queue
     check_conn = sqlite3.connect(MEDIA_ORGANIZER_DB_PATH)

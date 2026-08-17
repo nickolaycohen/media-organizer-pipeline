@@ -20,6 +20,7 @@ MOMENTS_EXPORT_DIR = TO_BE_CURATED_DIR
 
 APPLE_PHOTOS_DB_COPY_PATH = "/Volumes/Macintosh HD/Users/nickolaycohen/Photos Library DB/All-Media-Extreme/database/Photos.sqlite"
 APPLE_PHOTOS_DB_MARKER = APPLE_PHOTOS_DB_COPY_PATH + ".lastcopy"
+APPLE_PHOTOS_DB_LOCK_PATH = APPLE_PHOTOS_DB_COPY_PATH + ".lock"
 
 # Scoring Weights
 AESTHETIC_SCORE_WEIGHT = 0.875

@@ -136,17 +136,18 @@ def check_if_refresh_needed():
     if lock and lock.get("latest_successful_refresh_utc") and lock.get("latest_successful_refresh_utc") != "—":
         try:
             last_refresh_str = lock.get("latest_successful_refresh_utc")
-            last_refresh_dt = datetime.strptime(last_refresh_str, "%Y-%m-%d %H:%M:%S")
+            last_refresh_dt = datetime.strptime(last_refresh_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
             last_refresh_timestamp = last_refresh_dt.timestamp()
         except Exception:
             pass
             
     # Check if src_mod_time is newer than last successful refresh with a 2.0 second tolerance
     if src_mod_time > (last_refresh_timestamp + 2.0):
+        src_utc_str = datetime.fromtimestamp(src_mod_time, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         print("\n" + "!" * 100)
         print("⚠️  WARNING: Apple Photos database has new changes since the last sync.")
-        print(f"   • Last Sync Time: {last_refresh_str}")
-        print(f"   • Source DB Time: {datetime.fromtimestamp(src_mod_time).strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"   • Last Sync Time: {last_refresh_str} UTC")
+        print(f"   • Source DB Time: {src_utc_str} UTC")
         print("👉 Please run 'python3 scripts/bg_copy_db_service.py' in a separate background window to refresh.")
         print("!" * 100 + "\n")
 

@@ -5,16 +5,16 @@ import socket
 import errno
 import subprocess
 import time
-import functools
-from datetime import datetime
-
-# Force unbuffered prints for background logging
-print = functools.partial(print, flush=True)
+from datetime import datetime, timezone
 
 # Setup script path imports
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from scripts.constants import APPLE_PHOTOS_DB_LOCK_PATH, APPLE_PHOTOS_DB_PATH
+from utils.logger import setup_logger
+from scripts.constants import APPLE_PHOTOS_DB_LOCK_PATH, APPLE_PHOTOS_DB_PATH, BG_SERVICE_LOG_PATH
+
+# Set up dedicated logger for the service
+logger = setup_logger(BG_SERVICE_LOG_PATH, "bg_copy_db_service")
 
 def get_current_utc_str():
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
@@ -38,7 +38,7 @@ def read_lock_file():
         with open(APPLE_PHOTOS_DB_LOCK_PATH, "r") as f:
             return json.load(f)
     except Exception as e:
-        print(f"⚠️ Error reading lock file: {e}")
+        logger.warning(f"Error reading lock file: {e}")
         return None
 
 def write_lock_file(status, pid, started_at=None, latest_successful_refresh_utc="—"):
@@ -53,7 +53,7 @@ def write_lock_file(status, pid, started_at=None, latest_successful_refresh_utc=
         with open(APPLE_PHOTOS_DB_LOCK_PATH, "w") as f:
             json.dump(lock_data, f, indent=2)
     except Exception as e:
-        print(f"❌ Error writing lock file: {e}")
+        logger.error(f"Error writing lock file: {e}")
 
 def is_refresh_needed(last_refresh_str):
     if not os.path.exists(APPLE_PHOTOS_DB_PATH):
@@ -68,19 +68,20 @@ def is_refresh_needed(last_refresh_str):
         return True, "No prior successful refresh recorded."
         
     try:
-        last_refresh_dt = datetime.strptime(last_refresh_str, "%Y-%m-%d %H:%M:%S")
+        last_refresh_dt = datetime.strptime(last_refresh_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
         last_refresh_ts = last_refresh_dt.timestamp()
         
         # 2.0-second tolerance threshold for filesystem comparison precision
         if src_mod_time > (last_refresh_ts + 2.0):
-            return True, f"Source DB modified time ({datetime.fromtimestamp(src_mod_time).strftime('%Y-%m-%d %H:%M:%S')}) is newer than last refresh ({last_refresh_str})."
+            src_utc_str = datetime.fromtimestamp(src_mod_time, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            return True, f"Source DB modified time ({src_utc_str} UTC) is newer than last refresh ({last_refresh_str} UTC)."
         else:
             return False, "Database copy is up to date."
     except Exception as e:
         return True, f"Failed to parse last refresh time: {e}"
 
 def main():
-    print(f"[{get_current_utc_str()}] 🔄 Background database copy & sync service started.")
+    logger.info("🔄 Background database copy & sync service started.")
     
     # Check if another service instance is already running
     lock = read_lock_file()
@@ -88,7 +89,7 @@ def main():
         status = lock.get("status")
         lock_pid = lock.get("pid")
         if status == "refreshing" and is_pid_alive(lock_pid) and lock_pid != os.getpid():
-            print(f"[{get_current_utc_str()}] ℹ️ Another background service is already running (PID: {lock_pid}). Exiting.")
+            logger.info(f"ℹ️ Another background service is already running (PID: {lock_pid}). Exiting.")
             return 0
 
     loop_interval = 60 # Check every 60 seconds
@@ -113,17 +114,17 @@ def main():
                 # 3. Check if planner is active
                 if status == "planner_active":
                     if is_pid_alive(lock_pid):
-                        print(f"[{get_current_utc_str()}] ℹ️ Planner is currently active (PID: {lock_pid}). Delaying database refresh...")
+                        logger.info(f"ℹ️ Planner is currently active (PID: {lock_pid}). Delaying database refresh...")
                         time.sleep(loop_interval)
                         continue
                     else:
-                        print(f"[{get_current_utc_str()}] ⚠️ Found stale planner active lock from dead PID {lock_pid}. Overriding lock.")
+                        logger.warning(f"⚠️ Found stale planner active lock from dead PID {lock_pid}. Overriding lock.")
                 
                 # 4. Acquire Lock
                 current_pid = os.getpid()
                 start_time_str = get_current_utc_str()
-                print(f"[{get_current_utc_str()}] 🔐 Refresh needed: {reason}")
-                print(f"[{get_current_utc_str()}] 🔐 Acquiring lock...")
+                logger.info(f"🔐 Refresh needed: {reason}")
+                logger.info("🔐 Acquiring lock...")
                 write_lock_file(
                     status="refreshing",
                     pid=current_pid,
@@ -143,27 +144,39 @@ def main():
                 success = True
                 for step_name, args in steps:
                     script_path = os.path.join(script_dir, args[0])
-                    print(f"\n[{get_current_utc_str()}] 🚀 Running step: {step_name}")
+                    logger.info(f"🚀 Running step: {step_name}")
                     
                     try:
-                        res = subprocess.run([sys.executable, script_path] + args[1:], check=False)
-                        if res.returncode != 0:
-                            print(f"[{get_current_utc_str()}] ❌ Step failed: {step_name} (Exit code {res.returncode})")
+                        p = subprocess.Popen(
+                            [sys.executable, script_path] + args[1:],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            text=True,
+                            bufsize=1
+                        )
+                        
+                        for line in p.stdout:
+                            logger.info(line.rstrip('\r\n'))
+                            
+                        p.wait()
+                        
+                        if p.returncode != 0:
+                            logger.error(f"❌ Step failed: {step_name} (Exit code {p.returncode})")
                             success = False
                             break
-                        print(f"[{get_current_utc_str()}] ✅ Step completed successfully: {step_name}")
+                        logger.info(f"✅ Step completed successfully: {step_name}")
                     except Exception as step_err:
-                        print(f"[{get_current_utc_str()}] ❌ Execution exception in step {step_name}: {step_err}")
+                        logger.error(f"❌ Execution exception in step {step_name}: {step_err}")
                         success = False
                         break
 
                 # 6. Release Lock
-                print(f"\n[{get_current_utc_str()}] 🔓 Releasing lock...")
+                logger.info("🔓 Releasing lock...")
                 if success:
                     last_refresh_timestamp = get_current_utc_str()
-                    print(f"[{get_current_utc_str()}] 🎉 Database refresh and metadata sync completed successfully.")
+                    logger.info("🎉 Database refresh and metadata sync completed successfully.")
                 else:
-                    print(f"[{get_current_utc_str()}] ⚠️ Database copy and sync pipeline failed.")
+                    logger.error("⚠️ Database copy and sync pipeline failed.")
                 
                 write_lock_file(
                     status="available",
@@ -171,16 +184,16 @@ def main():
                     latest_successful_refresh_utc=last_refresh_timestamp
                 )
             else:
-                print(f"[{get_current_utc_str()}] 💤 Database copy is up to date (Last sync: {last_refresh_timestamp}). Sleeping {loop_interval}s...")
+                logger.info(f"💤 Database copy is up to date (Last sync: {last_refresh_timestamp}). Sleeping {loop_interval}s...")
                 
             time.sleep(loop_interval)
             
     except KeyboardInterrupt:
-        print(f"\n[{get_current_utc_str()}] 🛑 Background service stopped by user.")
+        logger.info("🛑 Background service stopped by user.")
         # Ensure we release lock if we hold it
         lock = read_lock_file()
         if lock and lock.get("pid") == os.getpid() and lock.get("status") == "refreshing":
-            print(f"[{get_current_utc_str()}] 🔓 Releasing lock before exit...")
+            logger.info("🔓 Releasing lock before exit...")
             write_lock_file(
                 status="available",
                 pid=None,

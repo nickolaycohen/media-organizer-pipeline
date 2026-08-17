@@ -1816,6 +1816,7 @@ def run_memory_publishing_flow(cursor, conn):
                     conn.close()
                 except Exception:
                     pass
+            release_planner_lock()
             os.execv(sys.executable, [sys.executable] + sys.argv)
         elif choice == '1':
             script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -2297,7 +2298,6 @@ def display_media_cleanup_recommendations(cursor, verbose=True):
 
 def main(auto_apply, no_sync=False):
     # Set up logger with line number in format
-    acquire_planner_lock()
     check_if_refresh_needed()
 
     # Check for active planned executions in queue
@@ -2338,7 +2338,9 @@ def main(auto_apply, no_sync=False):
 
     # Run bootstrap steps before proceeding
     if not no_sync:
+        acquire_planner_lock()
         run_bootstrap_steps(auto_apply, logger)
+        release_planner_lock()
     else:
         logger.info("⚡ Fast Mode: Skipping bootstrap sync steps.")
 
@@ -2347,28 +2349,35 @@ def main(auto_apply, no_sync=False):
         print("\n--- 🛠️  Session Mode ---")
         mode = input("Select mode: [B] Batch Management (default) | [M] Memory Feature & Publishing | [C] Media Cleanup | [O] Manage Device Owners: ").strip().lower()
         if mode == 'm':
+            acquire_planner_lock()
             conn = get_connection()
             conn.execute("PRAGMA busy_timeout = 30000")
             cursor = get_cursor()
             run_memory_publishing_flow(cursor, conn)
             close_conn()
+            release_planner_lock()
             sys.exit(0)
         elif mode == 'c':
+            acquire_planner_lock()
             conn = get_connection()
             conn.execute("PRAGMA busy_timeout = 30000")
             cursor = get_cursor()
             display_media_cleanup_recommendations(cursor, verbose=True)
             close_conn()
+            release_planner_lock()
             sys.exit(0)
         elif mode == 'o':
+            acquire_planner_lock()
             conn = get_connection()
             conn.execute("PRAGMA busy_timeout = 30000")
             cursor = get_cursor()
             manage_device_owners_flow(cursor, conn)
             close_conn()
+            release_planner_lock()
             # Restart the script to return to the main menu clean
             os.execv(sys.executable, [sys.executable] + sys.argv)
 
+    acquire_planner_lock()
     conn = get_connection()
     conn.execute("PRAGMA busy_timeout = 30000")
     cursor = get_cursor()
@@ -2753,6 +2762,7 @@ def main(auto_apply, no_sync=False):
                             cursor.execute("UPDATE db_updates SET raw_synced = 0, derived_synced = 0")
                             conn.commit()
                             close_conn()
+                            release_planner_lock()
                             os.execv(sys.executable, [sys.executable] + sys.argv)
                     logger.info("Then, re-run the pipeline planner to sync the changes and proceed.")
                     close_conn()
@@ -2894,6 +2904,7 @@ def main(auto_apply, no_sync=False):
             exec_now = input("\n🚀 Would you like to start the pipeline executor now? [y/N]: ").strip().lower()
             if exec_now == 'y':
                 close_conn()
+                release_planner_lock()
                 executor_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pipeline_executor.py")
                 logger.info(f"🚀 Launching pipeline_executor: {executor_path}")
                 os.execv(sys.executable, [sys.executable, executor_path])

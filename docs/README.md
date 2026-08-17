@@ -30,20 +30,31 @@ An independent, time-based workflow for curating and publishing specific events/
 
 ## 🛠️ Daily Workflow
 
-The pipeline is split into two phases: **Planning** and **Execution**.
+The pipeline is split into two phases: **Database Ingestion/Refresh** and **Interactive Planning & Execution**.
 
-### Step 1: Plan the Session
+### Step 1: Run the Database Refresh Service (Background)
+
+The database copy, SQLite index verification/repair, and metadata sync operations are offloaded to an independent background service. This prevents blocking your interactive planning session:
 
 ```bash
-# Interactive mode (recommended)
-python3 scripts/pipeline_planner.py
-
-# Fast mode (skips copying and syncing the 13 GB Photos database)
-python3 scripts/pipeline_planner.py --no-sync
+# Run the database refresh and metadata sync sequence in a separate terminal window
+python3 scripts/bg_copy_db_service.py
 ```
-This runs the bootstrap phase (which can be skipped using `--no-sync` if you want to bypass database syncing) and prompts you to select either Batch Management (`[B]`) or Memory Feature & Publishing (`[M]`).
+This runs the full ingestion pipeline: copying the database copy, running storage manager migrations, syncing raw tables, and syncing derived attributes (aesthetic scores, dates).
 
-### Step 2: Execute the Plan (For Batch Management)
+### Step 2: Plan the Session (Interactive)
+
+The planner starts up near-instantly since the database refresh runs in the background:
+
+```bash
+# Run the interactive planning menu
+python3 scripts/pipeline_planner.py
+```
+
+* **Locking**: The planner and background service use a shared bidirectional lock. The planner will automatically wait and probe every 10 seconds if a background sync is currently running, and the background service will exit immediately if you are currently using the interactive planner to prevent write contention.
+* **Stale Warnings**: At startup, the planner checks if the source Photos database contains changes since the last background refresh. If it does, it will log a warning indicating that a refresh is recommended.
+
+### Step 3: Execute the Plan (For Batch Management)
 Once a monthly batch is planned under Batch Management, run the executor to perform the file operations.
 ```bash
 python3 scripts/pipeline_executor.py
@@ -53,7 +64,9 @@ python3 scripts/pipeline_executor.py
 
 
 
-## 📂 Stage 0 – Initialization & Setup
+## 📂 Stage 0 – Initialization & Setup (Handled in background by `bg_copy_db_service.py`)
+
+All of the following steps are executed sequentially by running `python3 scripts/bg_copy_db_service.py`:
 
 | Step | Label        | Description                                          | Script/Tool                   | Status    |
 | ---- | ------------ | ---------------------------------------------------- | ----------------------------- | --------- |

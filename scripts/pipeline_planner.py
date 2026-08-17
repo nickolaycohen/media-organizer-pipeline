@@ -948,7 +948,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                         AND ga.ZTRASHEDSTATE = 0
                   ))
                 ORDER BY v.score_normalized DESC
-                LIMIT 5
+                LIMIT 10
             """)
         else:
             cursor.execute("""
@@ -958,7 +958,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                 WHERE mb.status_code >= '600' AND (v.MomentsAlbumName IS NULL OR v.MomentsAlbumName = '')
                   AND v.score_normalized > 0.50
                 ORDER BY v.score_normalized DESC
-                LIMIT 5
+                LIMIT 10
             """)
 
         unassigned = cursor.fetchall()

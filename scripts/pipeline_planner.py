@@ -783,14 +783,20 @@ def display_summary(transitions, batches, cursor, remote_favs_cache=None):
             for month in sorted(fav_counts.keys(), reverse=True):
                 print(f"Month: {month}, Favorites: {fav_counts[month]}")
 
-def run_memory_publishing_flow(cursor, conn):
+def run_memory_publishing_flow(cursor=None, conn=None):
     logger.info("🎨 Starting Memory Feature & Publishing session...")
     from constants import CURATED_LACIE_DIR, TO_BE_CURATED_DIR
     import math
 
+    # Acquire lock and get connection for initialization
+    acquire_planner_lock()
+    init_conn = get_connection()
+    init_conn.execute("PRAGMA busy_timeout = 30000")
+    init_cursor = get_cursor()
+
     # Create threshold_history table if it doesn't exist
     try:
-        cursor.execute("""
+        init_cursor.execute("""
             CREATE TABLE IF NOT EXISTS threshold_history (
                 id                  INTEGER PRIMARY KEY AUTOINCREMENT,
                 recorded_at_utc    TEXT NOT NULL DEFAULT (datetime('now')),
@@ -798,22 +804,31 @@ def run_memory_publishing_flow(cursor, conn):
                 notes               TEXT
             )
         """)
-        conn.commit()
+        init_conn.commit()
     except Exception as e:
         logger.warning(f"Could not initialize threshold_history table: {e}")
 
     # Fetch historical minimum threshold
     historical_min = 0.0
     try:
-        cursor.execute("SELECT MIN(threshold_score) FROM threshold_history WHERE threshold_score > 0.0")
-        row = cursor.fetchone()
+        init_cursor.execute("SELECT MIN(threshold_score) FROM threshold_history WHERE threshold_score > 0.0")
+        row = init_cursor.fetchone()
         if row and row[0] is not None:
             historical_min = row[0]
             logger.info(f"Loaded historical minimum threshold from DB: {historical_min:.4f}")
     except Exception as e:
         logger.warning(f"Could not fetch historical minimum threshold: {e}")
+
+    # Release for the first menu listing/user input wait
+    close_conn()
+    release_planner_lock()
     
     while True:
+        acquire_planner_lock()
+        conn = get_connection()
+        conn.execute("PRAGMA busy_timeout = 30000")
+        cursor = get_cursor()
+
         displayed_moments_map = {}
         # Clear/rollback any open transactions to get a fresh snapshot of the database
         try:
@@ -1801,6 +1816,15 @@ def run_memory_publishing_flow(cursor, conn):
                 
             print("✅ 'Publishing Recommendation' folder is up to date!")
 
+        # Close database connection and release lock before action prompt
+        if photos_db_attached:
+            try:
+                cursor.execute("DETACH DATABASE photos_db")
+            except Exception:
+                pass
+        close_conn()
+        release_planner_lock()
+
         print("\n--- Actions ---")
         print(" [1] Sync proposed assets to ToBeCurated albums in Apple Photos")
         print(" [2] Export Curated album from Apple Photos to LaCie filesystem")
@@ -1819,6 +1843,7 @@ def run_memory_publishing_flow(cursor, conn):
             release_planner_lock()
             os.execv(sys.executable, [sys.executable] + sys.argv)
         elif choice == '1':
+            acquire_planner_lock()
             script_dir = os.path.dirname(os.path.abspath(__file__))
             logger.info("Syncing proposed assets to Apple Photos...")
             try:
@@ -1826,6 +1851,7 @@ def run_memory_publishing_flow(cursor, conn):
                 logger.info("Sync complete.")
             except subprocess.CalledProcessError as e:
                 logger.error(f"Sync failed: {e}")
+            release_planner_lock()
         elif choice == '2':
             moment_name = input("Enter Moment Name to export (or index from list): ").strip()
             if moment_name.isdigit():
@@ -1846,11 +1872,13 @@ def run_memory_publishing_flow(cursor, conn):
                     logger.warning("Aborted export.")
                     continue
                     
+            acquire_planner_lock()
             script_dir = os.path.dirname(os.path.abspath(__file__))
             try:
                 subprocess.run([sys.executable, os.path.join(script_dir, "export_curated_album.py"), moment_name], check=True)
             except subprocess.CalledProcessError as e:
                 logger.error(f"Export failed: {e}")
+            release_planner_lock()
         elif choice == '3':
             moment_name = input("Enter Moment Name to publish (or index from list): ").strip()
             selected_rec = None
@@ -1869,6 +1897,11 @@ def run_memory_publishing_flow(cursor, conn):
                 print(f"⚠️ Cannot publish '{moment_name}': {selected_rec['action']}")
                 continue
 
+            acquire_planner_lock()
+            conn = get_connection()
+            conn.execute("PRAGMA busy_timeout = 30000")
+            cursor = get_cursor()
+
             cursor.execute("""
                 SELECT me.asset_id, a.original_filename
                 FROM moment_exports me
@@ -1879,6 +1912,8 @@ def run_memory_publishing_flow(cursor, conn):
             
             if not curated_assets_info:
                 print(f"⚠️ No curated assets found in the DB for '{moment_name}'. Please export the Curated album first.")
+                close_conn()
+                release_planner_lock()
                 continue
                 
             cursor.execute("SELECT asset_id FROM publications WHERE moment_name = ?", (moment_name,))
@@ -1901,6 +1936,8 @@ def run_memory_publishing_flow(cursor, conn):
 
             if not target_assets:
                 print(f"ℹ️ All selected assets for '{moment_name}' are already marked as published.")
+                close_conn()
+                release_planner_lock()
                 continue
 
             confirm = input(f"Confirm publication of {len(target_assets)} assets of '{moment_name}' to Shutterfly/YouTube? [y/N]: ").strip().lower()
@@ -1927,6 +1964,8 @@ def run_memory_publishing_flow(cursor, conn):
                 except Exception as e:
                     logger.warning(f"Failed to record publication: {e}")
                     conn.rollback()
+            close_conn()
+            release_planner_lock()
         elif choice == 'e':
             break
 

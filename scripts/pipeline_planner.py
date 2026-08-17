@@ -1987,21 +1987,27 @@ def resolve_device_owner(cursor, camera_model):
     
     return "Shared/Other", "Default Fallback"
 
-def manage_device_owners_flow(cursor, conn):
+def manage_device_owners_flow(cursor=None, conn=None):
     """
     Interactive flow to view and edit primary owners of camera devices.
     Lists devices ordered by their total asset count in the database copy.
     """
-    # Attach photos_db for counting assets by camera model
-    try:
-        cursor.execute("SELECT 1 FROM photos_db.ZASSET LIMIT 1")
-    except Exception:
+    from constants import DEVICE_OWNER_MAPPING
+    
+    while True:
+        acquire_planner_lock()
+        conn = get_connection()
+        conn.execute("PRAGMA busy_timeout = 30000")
+        cursor = get_cursor()
+
+        # Attach photos_db for counting assets by camera model
+        photos_db_attached = False
         try:
             cursor.execute(f"ATTACH DATABASE '{APPLE_PHOTOS_DB_COPY_PATH}' AS photos_db")
+            photos_db_attached = True
         except Exception:
             pass
 
-    while True:
         # Get all distinct camera models from imports/assets and count/timestamp them
         counts_dict = {}
         try:
@@ -2123,7 +2129,16 @@ def manage_device_owners_flow(cursor, conn):
                     first_row = False
             print("-" * 100)
 
-        choice = input("\nOptions: [E]dit an owner | [B]ack to main menu: ").strip().lower()
+        # Detach and release before waiting for user action prompts
+        if photos_db_attached:
+            try:
+                cursor.execute("DETACH DATABASE photos_db")
+            except Exception:
+                pass
+        close_conn()
+        release_planner_lock()
+
+        choice = input("\nOptions: [E]it an owner | [B]ack to main menu: ").strip().lower()
         if choice == 'b' or not choice:
             break
         elif choice == 'e':
@@ -2138,6 +2153,12 @@ def manage_device_owners_flow(cursor, conn):
                 selected_model, current_owner = model_owners[num - 1]
                 new_owner = input(f"Enter new owner name for '{selected_model}' (leave empty to reset to default): ").strip()
                 
+                # Now perform the update, acquire lock and connect
+                acquire_planner_lock()
+                conn = get_connection()
+                conn.execute("PRAGMA busy_timeout = 30000")
+                cursor = get_cursor()
+                
                 # Check if empty, then delete override
                 if not new_owner:
                     cursor.execute("DELETE FROM device_owners WHERE camera_model = ?", (selected_model,))
@@ -2150,10 +2171,18 @@ def manage_device_owners_flow(cursor, conn):
                     """, (selected_model, new_owner))
                     conn.commit()
                     print(f"✅ Updated owner of '{selected_model}' to '{new_owner}'.")
+                
+                close_conn()
+                release_planner_lock()
             except ValueError:
                 print("⚠️ Please enter a valid number.")
             except Exception as e:
                 print(f"⚠️ Failed to update database: {e}")
+                try:
+                    close_conn()
+                except Exception:
+                    pass
+                release_planner_lock()
 
     # Detach database safely at exit of flow
     try:
@@ -2388,13 +2417,7 @@ def main(auto_apply, no_sync=False):
         print("\n--- 🛠️  Session Mode ---")
         mode = input("Select mode: [B] Batch Management (default) | [M] Memory Feature & Publishing | [C] Media Cleanup | [O] Manage Device Owners: ").strip().lower()
         if mode == 'm':
-            acquire_planner_lock()
-            conn = get_connection()
-            conn.execute("PRAGMA busy_timeout = 30000")
-            cursor = get_cursor()
-            run_memory_publishing_flow(cursor, conn)
-            close_conn()
-            release_planner_lock()
+            run_memory_publishing_flow(None, None)
             sys.exit(0)
         elif mode == 'c':
             acquire_planner_lock()
@@ -2406,13 +2429,7 @@ def main(auto_apply, no_sync=False):
             release_planner_lock()
             sys.exit(0)
         elif mode == 'o':
-            acquire_planner_lock()
-            conn = get_connection()
-            conn.execute("PRAGMA busy_timeout = 30000")
-            cursor = get_cursor()
-            manage_device_owners_flow(cursor, conn)
-            close_conn()
-            release_planner_lock()
+            manage_device_owners_flow(None, None)
             # Restart the script to return to the main menu clean
             os.execv(sys.executable, [sys.executable] + sys.argv)
 
@@ -2795,8 +2812,14 @@ def main(auto_apply, no_sync=False):
                     logger.warning(f"⚠️ Smart Album '{latest_month}' does not exist in Apple Photos.")
                     logger.info(f"👉 Please create the Smart Album '{latest_month}' inside 'Media Organizer on LaCie > Google Photos Pipeline > MonthlyExports' in Apple Photos first.")
                     if not auto_apply:
+                        close_conn()
+                        release_planner_lock()
                         ans = input("\nPress [Enter] once created to resync and restart the planner (or [Q] to quit): ").strip().lower()
                         if ans != 'q':
+                            acquire_planner_lock()
+                            conn = get_connection()
+                            conn.execute("PRAGMA busy_timeout = 30000")
+                            cursor = get_cursor()
                             logger.info("🔄 Forcing metadata resync and restarting planner...")
                             cursor.execute("UPDATE db_updates SET raw_synced = 0, derived_synced = 0")
                             conn.commit()
@@ -2805,6 +2828,7 @@ def main(auto_apply, no_sync=False):
                             os.execv(sys.executable, [sys.executable] + sys.argv)
                     logger.info("Then, re-run the pipeline planner to sync the changes and proceed.")
                     close_conn()
+                    release_planner_lock()
                     sys.exit(0)
 
             check_active_sources_import_status(cursor, conn, latest_month, auto_apply)
@@ -2939,11 +2963,12 @@ def main(auto_apply, no_sync=False):
         conn.commit()
         logger.info(f"📌 Month {latest_month} recorded in planned_execution for next pipeline run.")
 
+        close_conn()
+        release_planner_lock()
+
         if not auto_apply:
             exec_now = input("\n🚀 Would you like to start the pipeline executor now? [y/N]: ").strip().lower()
             if exec_now == 'y':
-                close_conn()
-                release_planner_lock()
                 executor_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pipeline_executor.py")
                 logger.info(f"🚀 Launching pipeline_executor: {executor_path}")
                 os.execv(sys.executable, [sys.executable, executor_path])

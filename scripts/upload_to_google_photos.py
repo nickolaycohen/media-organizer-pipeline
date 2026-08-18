@@ -8,7 +8,12 @@ import argparse
 import hashlib
 import re
 import subprocess
-from constants import MEDIA_ORGANIZER_DB_PATH, STAGING_ROOT, LOG_PATH, MAX_UPLOAD_FILE_SIZE_MB, MAX_UPLOAD_FILE_SIZE_BYTES, SKIPPED_UPLOADS_ALBUM_NAME
+from constants import MEDIA_ORGANIZER_DB_PATH, STAGING_ROOT, LOG_PATH, MAX_UPLOAD_FILE_SIZE_MB, MAX_UPLOAD_FILE_SIZE_BYTES, SKIPPED_UPLOADS_ALBUM_NAME, APPLE_PHOTOS_DB_LOCK_PATH
+import json
+import socket
+import errno
+import time
+import atexit
 from db.queries import get_planned_month
 from db.connections import get_connection, get_cursor, commit, close as close_conn
 from utils.logger import setup_logger
@@ -20,6 +25,81 @@ from utils.logger import compute_file_hash
 
 MODULE_TAG = 'upload_to_google_photos'
 logger = setup_logger(LOG_PATH, MODULE_TAG)
+
+def read_lock_file():
+    if not os.path.exists(APPLE_PHOTOS_DB_LOCK_PATH):
+        return None
+    try:
+        with open(APPLE_PHOTOS_DB_LOCK_PATH, "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def write_lock_file(status, pid, started_at=None, latest_successful_refresh_utc="—"):
+    try:
+        lock_data = {
+            "status": status,
+            "pid": pid,
+            "started_at": started_at,
+            "host": socket.gethostname(),
+            "latest_successful_refresh_utc": latest_successful_refresh_utc
+        }
+        with open(APPLE_PHOTOS_DB_LOCK_PATH, "w") as f:
+            json.dump(lock_data, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Failed to write lock file: {e}")
+
+def is_pid_alive(pid):
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError as err:
+        if err.errno == errno.ESRCH:
+            return False
+        return True
+
+def acquire_db_lock():
+    while True:
+        lock = read_lock_file()
+        last_refresh = "—"
+        
+        if lock:
+            last_refresh = lock.get("latest_successful_refresh_utc", "—")
+            status = lock.get("status")
+            lock_pid = lock.get("pid")
+            
+            if status in ["refreshing", "planner_active"]:
+                if is_pid_alive(lock_pid):
+                    logger.info(f"ℹ️ Database copy is currently locked by {status} (PID: {lock_pid}). Waiting for lock release...")
+                    time.sleep(10)
+                    continue
+                else:
+                    logger.warning(f"⚠️ Found stale {status} lock file from dead PID {lock_pid}. Overriding lock.")
+            elif status == "executor_active" and lock_pid == os.getpid():
+                # Already own the lock
+                return
+        
+        # Lock is available, acquire it
+        logger.info(f"🔐 Acquiring executor database lock (PID: {os.getpid()}).")
+        write_lock_file(
+            status="executor_active",
+            pid=os.getpid(),
+            started_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+            latest_successful_refresh_utc=last_refresh
+        )
+        break
+
+def release_db_lock():
+    lock = read_lock_file()
+    if lock and lock.get("pid") == os.getpid() and lock.get("status") == "executor_active":
+        logger.info("🔓 Releasing executor database lock.")
+        write_lock_file(
+            status="available",
+            pid=None,
+            latest_successful_refresh_utc=lock.get("latest_successful_refresh_utc", "—")
+        )
 
 SUPPORTED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.heic', '.mov', '.mp4'}
 
@@ -158,13 +238,9 @@ def main(args):
     for handler in logger.handlers:
         handler.setFormatter(logging.Formatter('%(asctime)s [%(name)s:%(lineno)d] - %(levelname)s - %(message)s'))
 
-
     month = args.month
     max_upload_size_mb = getattr(args, 'max_size_mb', MAX_UPLOAD_FILE_SIZE_MB)
     max_upload_size_bytes = max_upload_size_mb * 1024 * 1024
-    conn = get_connection()
-    cursor = get_cursor()
-
 
     album_path = os.path.join(STAGING_ROOT, month)
     if not os.path.exists(album_path):
@@ -177,6 +253,14 @@ def main(args):
         return
 
     logger.info(f"Found {len(files)} media files to upload from batch {month} (Max size per file: {max_upload_size_mb:.0f} MB)")
+
+    # Register cleanup for safety
+    atexit.register(release_db_lock)
+
+    # Acquire DB lock and open connection to read metadata
+    acquire_db_lock()
+    conn = get_connection()
+    cursor = get_cursor()
 
     # Store metadata by original_filename. Multiple sources can have the same original_filename.
     # We store them in a list to match against exported files (which might have suffixes like ' 2').
@@ -202,6 +286,10 @@ def main(args):
             "ignore_continuity_check": row[8],
             "matched": False # internal flag to track matches for disk files with suffixes
         })
+
+    # Close connection and release DB lock immediately after reading
+    close_conn()
+    release_db_lock()
 
     def find_metadata_match(filename):
         # Strip the " 2", " 3" suffix added by Apple Photos export to find the original DB record
@@ -264,12 +352,18 @@ def main(args):
     if not files_to_process:
         logger.info(f"✅ No new files to upload for month {month}. (Checked {len(files)} files, {skipped_count} already uploaded, {skipped_oversized_count} skipped > {max_upload_size_mb:.0f} MB).")
         # Since all eligible files in the staging folder have been processed, we finalize the status to 400.
-        cursor.execute("SELECT status_code FROM month_batches WHERE month = ?", (month,))
-        row = cursor.fetchone()
-        if row and row[0] < '400':
-            cursor.execute("UPDATE month_batches SET status_code = '400' WHERE month = ?", (month,))
-            conn.commit()
-            logger.info(f"✅ Batch {month} status finalized to 400.")
+        if not args.dry_run:
+            acquire_db_lock()
+            conn = get_connection()
+            cursor = get_cursor()
+            cursor.execute("SELECT status_code FROM month_batches WHERE month = ?", (month,))
+            row = cursor.fetchone()
+            if row and row[0] < '400':
+                cursor.execute("UPDATE month_batches SET status_code = '400' WHERE month = ?", (month,))
+                conn.commit()
+                logger.info(f"✅ Batch {month} status finalized to 400.")
+            close_conn()
+            release_db_lock()
         return
     else:
         logger.info(f"🔍 Batch Analysis: {len(files_to_process) + skipped_count + skipped_oversized_count} total files found. "
@@ -290,7 +384,6 @@ def main(args):
         remaining_quota_bytes = check_google_quota()
         if remaining_quota_bytes is None:
             logger.error("❌ Aborting: Failed to verify Google Drive quota via API.")
-            close_conn()
             sys.exit(1)
 
         if remaining_quota_bytes is not None and batch_remaining_size > remaining_quota_bytes:
@@ -320,6 +413,9 @@ def main(args):
             files_to_process = selected_files
 
             # Mark batch as partial upload if not all files fit AND it's not already further along (e.g. 500)
+            acquire_db_lock()
+            conn = get_connection()
+            cursor = get_cursor()
             cursor.execute("SELECT status_code FROM month_batches WHERE month = ?", (month,))
             current_status_row = cursor.fetchone()
             current_status = current_status_row[0] if current_status_row else '000'
@@ -332,6 +428,8 @@ def main(args):
                 """, (month,))
                 conn.commit()
                 logger.info(f"Batch {month} status set to partial upload (399).")
+            close_conn()
+            release_db_lock()
 
         album_title = f"Currently Curating - {month}"
         # Authenticate with a scope that can list albums
@@ -341,12 +439,13 @@ def main(args):
         # Authenticate with append-only scope for uploading
         creds_append = authenticate(scopes=GOOGLE_PHOTOS_APPEND_ONLY_SCOPES)
 
-    import time
     historical_speed = calculate_historical_throughput()
     total_files = len(files_to_process)
     total_remaining_size = sum(f[1] for f in files_to_process)
     uploaded_size_this_session = 0
     session_durations = 0.0
+    successful_uploads = []
+    has_error = False
 
     for idx, (file_path, file_size, metadata) in enumerate(files_to_process, start=1):
         filename = os.path.basename(file_path)
@@ -391,41 +490,57 @@ def main(args):
                 remaining_completion_str = remaining_completion_time.strftime("%H:%M:%S")
 
                 logger.info(f"[{idx}/{total_files}] Uploaded: {filename} - Est. Completion: {remaining_completion_str} ({remaining_eta_minutes:.1f}m remaining)")
-                
+                successful_uploads.append((file_hash, metadata.get("asset_id")))
+            except Exception as e:
+                logger.error(f"[{idx}/{total_files}] Failed to upload {filename}: {e}")
+                logger.error("Halting upload process due to error.")
+                has_error = True
+                break
+
+    # Save successful uploads and finalize batch status
+    if not args.dry_run:
+        acquire_db_lock()
+        conn = get_connection()
+        cursor = get_cursor()
+
+        if successful_uploads:
+            logger.info(f"💾 Saving {len(successful_uploads)} upload record(s) to the database...")
+            for file_hash, asset_id in successful_uploads:
                 cursor.execute("""
                     UPDATE assets SET
                         file_hash = ?,
                         uploaded_to_google = 1,
                         updated_at_utc = datetime('now')
                     WHERE asset_id = ?
-                """, (file_hash, metadata.get("asset_id")))
-                conn.commit()
-            except Exception as e:
-                logger.error(f"[{idx}/{total_files}] Failed to upload {filename}: {e}")
-                logger.error("Halting upload process due to error.")
-                sys.exit(1)
+                """, (file_hash, asset_id))
+            conn.commit()
 
-    # Final check: Verify if all eligible assets for this month are now uploaded.
-    cursor.execute("SELECT COUNT(*) FROM assets WHERE month = ? AND (ignore_continuity_check = 0 OR ignore_continuity_check IS NULL)", (month,))
-    total_assets_expected = cursor.fetchone()[0]
+        # Final check: Verify if all eligible assets for this month are now uploaded.
+        cursor.execute("SELECT COUNT(*) FROM assets WHERE month = ? AND (ignore_continuity_check = 0 OR ignore_continuity_check IS NULL)", (month,))
+        total_assets_expected = cursor.fetchone()[0]
 
-    cursor.execute("SELECT COUNT(*) FROM assets WHERE month = ? AND uploaded_to_google = 1", (month,))
-    uploaded_count = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM assets WHERE month = ? AND uploaded_to_google = 1", (month,))
+        uploaded_count = cursor.fetchone()[0]
 
-    # If no files were skipped due to quota limits, we can finalize the status to 400
-    if skipped_quota_count == 0 and not args.dry_run:
-        logger.info(f"🎊 All eligible assets for {month} are verified as uploaded in the database ({uploaded_count} uploaded, {skipped_oversized_count} skipped > {max_upload_size_mb:.0f} MB).")
-        # Finalize status to complete (400)
-        cursor.execute("SELECT status_code FROM month_batches WHERE month = ?", (month,))
-        row = cursor.fetchone()
-        if row and row[0] < '400':
-            cursor.execute("UPDATE month_batches SET status_code = '400' WHERE month = ?", (month,))
-            logger.info(f"✅ Batch {month} status finalized to 400.")
-    else:
-        logger.info(f"⚠️ Month {month} remains partially uploaded due to quota limits ({uploaded_count}/{total_assets_expected} assets).")
+        # If no files were skipped due to quota limits and no errors occurred, we can finalize the status to 400
+        if skipped_quota_count == 0 and not has_error:
+            logger.info(f"🎊 All eligible assets for {month} are verified as uploaded in the database ({uploaded_count} uploaded, {skipped_oversized_count} skipped > {max_upload_size_mb:.0f} MB).")
+            # Finalize status to complete (400)
+            cursor.execute("SELECT status_code FROM month_batches WHERE month = ?", (month,))
+            row = cursor.fetchone()
+            if row and row[0] < '400':
+                cursor.execute("UPDATE month_batches SET status_code = '400' WHERE month = ?", (month,))
+                logger.info(f"✅ Batch {month} status finalized to 400.")
+        else:
+            logger.info(f"⚠️ Month {month} remains partially uploaded due to quota limits or error ({uploaded_count}/{total_assets_expected} assets).")
 
-    conn.commit()
+        conn.commit()
+        close_conn()
+        release_db_lock()
+
     logger.info(f"✅ Upload process completed at {datetime.now(timezone.utc).isoformat()}")
+    if has_error:
+        sys.exit(1)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Upload media files to Google Photos.")

@@ -9,7 +9,10 @@ import logging
 from db.queries import get_next_code
 from utils.utils import set_batch_status
 from utils.logger import setup_logger
-from constants import LOG_PATH, APPLE_PHOTOS_DB_COPY_PATH
+from constants import LOG_PATH, APPLE_PHOTOS_DB_COPY_PATH, APPLE_PHOTOS_DB_LOCK_PATH
+import json
+import socket
+import errno
 import sqlite3
 from uuid import uuid4
 import time
@@ -54,6 +57,81 @@ def release_lock():
     except Exception as e:
         logger.warning(f"Failed to release lock file: {e}")
 
+def read_lock_file():
+    if not os.path.exists(APPLE_PHOTOS_DB_LOCK_PATH):
+        return None
+    try:
+        with open(APPLE_PHOTOS_DB_LOCK_PATH, "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def write_lock_file(status, pid, started_at=None, latest_successful_refresh_utc="—"):
+    try:
+        lock_data = {
+            "status": status,
+            "pid": pid,
+            "started_at": started_at,
+            "host": socket.gethostname(),
+            "latest_successful_refresh_utc": latest_successful_refresh_utc
+        }
+        with open(APPLE_PHOTOS_DB_LOCK_PATH, "w") as f:
+            json.dump(lock_data, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Failed to write lock file: {e}")
+
+def is_pid_alive(pid):
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError as err:
+        if err.errno == errno.ESRCH:
+            return False
+        return True
+
+def acquire_db_lock():
+    while True:
+        lock = read_lock_file()
+        last_refresh = "—"
+        
+        if lock:
+            last_refresh = lock.get("latest_successful_refresh_utc", "—")
+            status = lock.get("status")
+            lock_pid = lock.get("pid")
+            
+            if status in ["refreshing", "planner_active"]:
+                if is_pid_alive(lock_pid):
+                    logger.info(f"ℹ️ Database copy is currently locked by {status} (PID: {lock_pid}). Waiting for lock release...")
+                    time.sleep(10)
+                    continue
+                else:
+                    logger.warning(f"⚠️ Found stale {status} lock file from dead PID {lock_pid}. Overriding lock.")
+            elif status == "executor_active" and lock_pid == os.getpid():
+                # Already own the lock
+                return
+        
+        # Lock is available, acquire it
+        logger.info(f"🔐 Acquiring executor database lock (PID: {os.getpid()}).")
+        write_lock_file(
+            status="executor_active",
+            pid=os.getpid(),
+            started_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+            latest_successful_refresh_utc=last_refresh
+        )
+        break
+
+def release_db_lock():
+    lock = read_lock_file()
+    if lock and lock.get("pid") == os.getpid() and lock.get("status") == "executor_active":
+        logger.info("🔓 Releasing executor database lock.")
+        write_lock_file(
+            status="available",
+            pid=None,
+            latest_successful_refresh_utc=lock.get("latest_successful_refresh_utc", "—")
+        )
+
 
 
 @dataclass
@@ -95,16 +173,15 @@ for handler in logger.handlers:
     handler.setFormatter(logging.Formatter('%(asctime)s [%(name)s:%(lineno)d] - %(levelname)s - %(message)s'))
 
 
-def run_bootstrap_steps(bootstrap_steps, from_index, to_index, dry_run, sync_metadata_label, conn, month):
+def run_bootstrap_steps(bootstrap_steps, from_index, to_index, dry_run, sync_metadata_label, month):
     for i, step in enumerate(bootstrap_steps):
         if i < from_index or (to_index is not None and i >= to_index):
             continue
-        if not run_step(conn, step, dry_run):
+        if not run_step(step, dry_run, month):
             logger.error(f"❌ Pipeline execution halted. Session ID: {session_id}")
-            conn.close()
             sys.exit(1)
 
-def run_regular_steps(bootstrap_steps, steps, from_index, to_index, dry_run, month, conn):
+def run_regular_steps(bootstrap_steps, steps, from_index, to_index, dry_run, month):
     for i, step in enumerate(steps, start=len(bootstrap_steps)):
         if i < from_index or (to_index is not None and i >= to_index):
             continue
@@ -116,22 +193,30 @@ def run_regular_steps(bootstrap_steps, steps, from_index, to_index, dry_run, mon
         # --- Begin status check logic ---
         # For a planned month, we check its current status against what the step expects.
         if month and step.code:
+            acquire_db_lock()
+            conn = get_connection()
             cur_status = conn.cursor()
             # Find the status of the month we are supposed to process
             cur_status.execute("SELECT status_code FROM month_batches WHERE month = ?", (month,))
             row = cur_status.fetchone()
-            if row:
-                batch_status_code = row[0]
+            batch_status_code = row[0] if row else None
+            
+            expected_prev_code = None
+            if batch_status_code:
                 cur_status.execute("SELECT preceding_code FROM batch_status WHERE code = ? AND transition_type IN ('pipeline', 'retryable')", (step.code,))
                 expected_prev = cur_status.fetchone()
                 expected_prev_code = expected_prev[0] if expected_prev else None
-                if expected_prev_code and batch_status_code != expected_prev_code:
-                    # Allow retry if the batch is in the error state of the CURRENT step
-                    if batch_status_code == str(step.code) + 'E':
-                        logger.info(f"🔄 Retrying failed step '{step.label}' for month {month} (Current status: {batch_status_code}).")
-                    else:
-                        logger.info(f"⏭️ Skipping step '{step.label}' for month {month}. Its status '{batch_status_code}' doesn't match the expected preceding status '{expected_prev_code}'.")
-                        continue
+                
+            close_conn()
+            release_db_lock()
+            
+            if batch_status_code and expected_prev_code and batch_status_code != expected_prev_code:
+                # Allow retry if the batch is in the error state of the CURRENT step
+                if batch_status_code == str(step.code) + 'E':
+                    logger.info(f"🔄 Retrying failed step '{step.label}' for month {month} (Current status: {batch_status_code}).")
+                else:
+                    logger.info(f"⏭️ Skipping step '{step.label}' for month {month}. Its status '{batch_status_code}' doesn't match the expected preceding status '{expected_prev_code}'.")
+                    continue
         # --- End status check logic ---
 
         # Prompt for confirmation if about to pull favorites (Step 550)
@@ -140,7 +225,6 @@ def run_regular_steps(bootstrap_steps, steps, from_index, to_index, dry_run, mon
             confirm = input(f"Have all old assets for {month} NOT uploaded by this app been removed from Google Account? (Required to accurately pull Favorites) [y/N]: ").strip().lower()
             if confirm != 'y':
                 logger.error(f"❌ Execution halted: Old assets for {month} must be removed from Google Account before pulling favorites to ensure matching accuracy.")
-                conn.close()
                 sys.exit(1)
 
         # Prompt for confirmation for Cleanup (Step 650)
@@ -156,9 +240,8 @@ def run_regular_steps(bootstrap_steps, steps, from_index, to_index, dry_run, mon
         # Prepare command with current_month replaced if available
         command = [arg.replace("{month}", month) if month else arg for arg in step.command]
 
-        if not run_step(conn, step, dry_run, month, command):
+        if not run_step(step, dry_run, month, command):
             logger.error(f"❌ Pipeline execution halted. Session ID: {session_id}")
-            conn.close()
             sys.exit(1)
 
 def log_execution(conn, label, status, batch_month_id=None):
@@ -168,29 +251,42 @@ def log_execution(conn, label, status, batch_month_id=None):
     """, (session_id, label, status, batch_month_id))
     conn.commit()
 
-def run_step(conn, step: PipelineStep, dry_run=False, month=None, command=None):
+def run_step(step: PipelineStep, dry_run=False, month=None, command=None):
     logger.info(f"▶️ Starting: {step.label}")
     batch_month_id = None
     if month is not None:
+        acquire_db_lock()
+        conn = get_connection()
         cur_lookup = conn.cursor()
         cur_lookup.execute("SELECT id FROM month_batches WHERE month = ?", (month,))
         row = cur_lookup.fetchone()
         if row:
             batch_month_id = row[0]
+        close_conn()
+        release_db_lock()
+        
     if dry_run:
         cmd_str = ' '.join(command if command else step.command)
         logger.info(f"[Dry Run] Would run: {cmd_str}")
+        acquire_db_lock()
+        conn = get_connection()
         log_execution(conn, step.label, "dry-run", batch_month_id)
+        close_conn()
+        release_db_lock()
         return True
+        
     try:
         cmd_to_run = command if command else step.command
         subprocess.run(cmd_to_run, check=True)
         logger.info(f"✅ Completed: {step.label}")
+        
+        acquire_db_lock()
+        conn = get_connection()
+        cursor = conn.cursor()
         log_execution(conn, step.label, "success", batch_month_id)
+        
         # Always update batch status centrally after a successful step with a valid code
         if step.code and month is not None:
-            cursor = conn.cursor()
-            
             # For upload steps, the script itself determines the final status (399 or 400).
             # We read the actual status from the database instead of blindly setting it to step.code.
             if step.code in ['399', '400']:
@@ -273,12 +369,18 @@ def run_step(conn, step: PipelineStep, dry_run=False, month=None, command=None):
                 """, (session_id, resolved_code, month))
                 conn.commit()
                 logger.info(f"🏁 Final step reached for month {month}; batch status set and imports updated with execution_id={session_id}, status_code={resolved_code}")
+                
+        close_conn()
+        release_db_lock()
         return True
     except subprocess.CalledProcessError as e:
         logger.error(f"❌ Failed: {step.label} with error: {e}")
+        
+        acquire_db_lock()
+        conn = get_connection()
+        cursor = conn.cursor()
         log_execution(conn, step.label, "failed", batch_month_id)
         if step.code is not None and month is not None:
-            cursor = conn.cursor()
             error_code = None
             cursor.execute("SELECT code FROM batch_status WHERE code = ?", (step.code + 'E',))
             row = cursor.fetchone()
@@ -288,6 +390,8 @@ def run_step(conn, step: PipelineStep, dry_run=False, month=None, command=None):
                 set_batch_status(cursor, month, error_code, session_id=session_id)
                 conn.commit()
                 logger.info(f"⚠️ Batch {month} moved to error state {error_code} due to failure in step {step.label}.")
+        close_conn()
+        release_db_lock()
         return False
 
 def is_applescript_available():
@@ -304,7 +408,7 @@ def get_current_quarter_start(dt):
     minute = (dt.minute // 15) * 15
     return dt.replace(minute=minute, second=0, microsecond=0)
 
-def get_pipeline_steps(cursor, script_dir, use_mock_data=False):
+def get_pipeline_steps(script_dir, use_mock_data=False):
     """
     Fetches and constructs the pipeline steps from the batch_status table.
     If use_mock_data is True, returns a hardcoded list of steps for testing.
@@ -323,6 +427,9 @@ def get_pipeline_steps(cursor, script_dir, use_mock_data=False):
 
     steps = []
     logger.info("Fetching pipeline steps from the database.")
+    acquire_db_lock()
+    conn = get_connection()
+    cursor = conn.cursor()
     cursor.execute("""
         SELECT pipeline_stage, full_description, code, script_name, transition_type
         FROM batch_status
@@ -340,16 +447,14 @@ def get_pipeline_steps(cursor, script_dir, use_mock_data=False):
             if "{month}" in script_name:
                 cmd.append("{month}")
         steps.append(PipelineStep(label, code, cmd))
+    close_conn()
+    release_db_lock()
     return [step for step, (_, _, _, _, ttype) in zip(steps, rows) if ttype in ['pipeline', 'retryable']]
 
 
 def main(args):
     acquire_lock()
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-
-    # Open a single SQLite connection to be used throughout
-    conn = get_connection()
-    cursor = get_cursor()
 
     # Bootstrap: run initial steps before determining which batch to process
     bootstrap_steps = [
@@ -359,22 +464,26 @@ def main(args):
         # PipelineStep("1.1 Detect Gaps", "000", ["python3", os.path.join(SCRIPT_DIR, "generate_month_batches.py")]),
     ]
 
-    steps = get_pipeline_steps(cursor, SCRIPT_DIR, use_mock_data=args.mock_steps)
+    steps = get_pipeline_steps(SCRIPT_DIR, use_mock_data=args.mock_steps)
 
     all_steps = bootstrap_steps.copy()
     all_steps.extend(steps)
 
     # Check for active planned executions in queue
+    acquire_db_lock()
+    conn = get_connection()
+    cursor = conn.cursor()
     cursor.execute("SELECT id, planned_month FROM planned_execution WHERE active = 1 ORDER BY id ASC")
     planned_rows = cursor.fetchall()
+    close_conn()
+    release_db_lock()
+
     if not planned_rows:
         if args.cron:
             logger.info("No active planned execution found in queue. Exiting silently.")
-            conn.close()
             sys.exit(0)
         else:
             logger.error("🚫 No active planned execution found in queue. Please run pipeline_planner first.")
-            conn.close()
             sys.exit(1)
 
     total_plans = len(planned_rows)
@@ -385,17 +494,21 @@ def main(args):
     for idx, (plan_id, month) in enumerate(planned_rows, 1):
         logger.info(f"\n{'='*60}\n🚀 [{idx}/{total_plans}] Starting execution for planned batch: {month} (Queue ID: {plan_id})\n{'='*60}")
         
-        run_bootstrap_steps(bootstrap_steps, from_index, to_index, args.dry_run, None, conn, month)
-        run_regular_steps(bootstrap_steps, steps, from_index, to_index, args.dry_run, month, conn)
+        run_bootstrap_steps(bootstrap_steps, from_index, to_index, args.dry_run, None, month)
+        run_regular_steps(bootstrap_steps, steps, from_index, to_index, args.dry_run, month)
 
         # Mark this specific planned execution as inactive upon successful completion
         if not args.dry_run:
+            acquire_db_lock()
+            conn = get_connection()
+            cursor = conn.cursor()
             cursor.execute("UPDATE planned_execution SET active = 0 WHERE id = ?", (plan_id,))
             conn.commit()
+            close_conn()
+            release_db_lock()
             logger.info(f"✅ Planned execution for {month} (Queue ID: {plan_id}) completed and marked as inactive.")
 
     logger.info(f"🎉 Completed all {total_plans} queued planned execution(s).")
-    conn.close()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Execute the media organizer pipeline.")

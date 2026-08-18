@@ -16,7 +16,7 @@ from utils.utils import get_full_transition_path, human_readable_size
 from google_photos import check_google_quota, authenticate, get_all_favorites
 import argparse
 import sqlite3
-from constants import MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_COPY_PATH, APPLE_PHOTOS_DB_LOCK_PATH, APPLE_PHOTOS_DB_PATH, LOG_PATH, GOOGLE_PHOTOS_READONLY_SCOPES, GOOGLE_DRIVE_READ_ONLY_SCOPES, PLANNER_REQUIRED_SCOPES, CURATION_THRESHOLD_LOG_PATH, SCORING_BREAKDOWN_LOG_PATH, MEDIA_CLEANUP_LOG_PATH, MAX_UPLOAD_FILE_SIZE_BYTES, MAX_UPLOAD_FILE_SIZE_MB
+from constants import MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_COPY_PATH, APPLE_PHOTOS_DB_LOCK_PATH, APPLE_PHOTOS_DB_PATH, LOG_PATH, GOOGLE_PHOTOS_READONLY_SCOPES, GOOGLE_DRIVE_READ_ONLY_SCOPES, PLANNER_REQUIRED_SCOPES, CURATION_THRESHOLD_LOG_PATH, SCORING_BREAKDOWN_LOG_PATH, MEDIA_CLEANUP_LOG_PATH, MAX_UPLOAD_FILE_SIZE_BYTES, MAX_UPLOAD_FILE_SIZE_MB, BG_SERVICE_PID_PATH
 from constants import ACTIVE_CAMERA_MODELS, DEVICE_OWNER_MAPPING
 from db.connections import get_connection, get_cursor, commit, close as close_conn
 from db.queries import get_stage_transitions, get_batch_statuses, get_latest_import_and_month
@@ -115,11 +115,58 @@ def acquire_planner_lock():
         write_lock_file(
             status="planner_active",
             pid=os.getpid(),
-            started_at=datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            started_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
             latest_successful_refresh_utc=last_refresh
         )
         atexit.register(release_planner_lock)
         break
+
+def ensure_bg_service_running():
+    service_running = False
+    service_pid = None
+    if os.path.exists(BG_SERVICE_PID_PATH):
+        try:
+            with open(BG_SERVICE_PID_PATH, "r") as f:
+                service_pid = int(f.read().strip())
+            if is_pid_alive(service_pid):
+                service_running = True
+        except (ValueError, OSError):
+            pass
+
+    if service_running:
+        logger.info(f"ℹ️ Background sync service is running (PID: {service_pid}).")
+        print(f"ℹ️ Background sync service is running (PID: {service_pid}).")
+    else:
+        logger.info("⚙️ Background sync service is not running. Starting it automatically...")
+        print("⚙️ Background sync service is not running. Starting it automatically...")
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        service_script = os.path.join(script_dir, "bg_copy_db_service.py")
+        try:
+            # Spawn the background service in a detached process
+            subprocess.Popen(
+                [sys.executable, service_script],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True
+            )
+            # Wait up to 2 seconds for it to create the PID file
+            for _ in range(20):
+                time.sleep(0.1)
+                if os.path.exists(BG_SERVICE_PID_PATH):
+                    try:
+                        with open(BG_SERVICE_PID_PATH, "r") as f:
+                            new_pid = int(f.read().strip())
+                        if is_pid_alive(new_pid):
+                            logger.info(f"✅ Started background sync service (PID: {new_pid}).")
+                            print(f"✅ Started background sync service (PID: {new_pid}).")
+                            return
+                    except (ValueError, OSError):
+                        pass
+            logger.warning("⚠️ Background sync service was spawned but PID file could not be verified.")
+            print("⚠️ Background sync service was spawned but PID file could not be verified.")
+        except Exception as e:
+            logger.error(f"❌ Failed to start background sync service: {e}")
+            print(f"❌ Failed to start background sync service: {e}")
 
 def check_if_refresh_needed():
     if not os.path.exists(APPLE_PHOTOS_DB_PATH):
@@ -148,7 +195,19 @@ def check_if_refresh_needed():
         print("⚠️  WARNING: Apple Photos database has new changes since the last sync.")
         print(f"   • Last Sync Time: {last_refresh_str} UTC")
         print(f"   • Source DB Time: {src_utc_str} UTC")
-        print("👉 Please run 'python3 scripts/bg_copy_db_service.py' in a separate background window to refresh.")
+        
+        service_pid = None
+        if os.path.exists(BG_SERVICE_PID_PATH):
+            try:
+                with open(BG_SERVICE_PID_PATH, "r") as f:
+                    service_pid = int(f.read().strip())
+            except Exception:
+                pass
+                
+        if service_pid and is_pid_alive(service_pid):
+            print(f"ℹ️  Background sync service is running (PID: {service_pid}) and will automatically sync these changes.")
+        else:
+            print("👉 Please run 'python3 scripts/bg_copy_db_service.py' in a separate background window to refresh.")
         print("!" * 100 + "\n")
 
 # Helper to run bootstrap steps
@@ -2366,6 +2425,8 @@ def display_media_cleanup_recommendations(cursor, verbose=True):
 
 def main(auto_apply, no_sync=False):
     # Set up logger with line number in format
+    if not no_sync:
+        ensure_bg_service_running()
     check_if_refresh_needed()
 
     # Check for active planned executions in queue

@@ -11,13 +11,45 @@ from datetime import datetime, timezone
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from utils.logger import setup_logger
-from scripts.constants import APPLE_PHOTOS_DB_LOCK_PATH, APPLE_PHOTOS_DB_PATH, BG_SERVICE_LOG_PATH
+from scripts.constants import APPLE_PHOTOS_DB_LOCK_PATH, APPLE_PHOTOS_DB_PATH, BG_SERVICE_LOG_PATH, BG_SERVICE_PID_PATH
 
 # Set up dedicated logger for the service
 logger = setup_logger(BG_SERVICE_LOG_PATH, "bg_copy_db_service")
 
+def check_and_write_service_pid():
+    if os.path.exists(BG_SERVICE_PID_PATH):
+        try:
+            with open(BG_SERVICE_PID_PATH, "r") as f:
+                pid = int(f.read().strip())
+            if is_pid_alive(pid) and pid != os.getpid():
+                logger.info(f"ℹ️ Background service is already running (PID: {pid}). Exiting.")
+                sys.exit(0)
+        except (ValueError, OSError):
+            pass
+            
+    # Write current pid
+    try:
+        with open(BG_SERVICE_PID_PATH, "w") as f:
+            f.write(str(os.getpid()))
+        import atexit
+        atexit.register(cleanup_service_pid)
+        logger.info(f"📝 Wrote service PID file: {BG_SERVICE_PID_PATH} (PID: {os.getpid()})")
+    except Exception as e:
+        logger.error(f"Error writing service PID file: {e}")
+
+def cleanup_service_pid():
+    try:
+        if os.path.exists(BG_SERVICE_PID_PATH):
+            with open(BG_SERVICE_PID_PATH, "r") as f:
+                pid = int(f.read().strip())
+            if pid == os.getpid():
+                os.remove(BG_SERVICE_PID_PATH)
+                logger.info("🗑️ Removed service PID file.")
+    except Exception as e:
+        logger.warning(f"Error cleaning up service PID file: {e}")
+
 def get_current_utc_str():
-    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 def is_pid_alive(pid):
     if pid is None:
@@ -84,13 +116,7 @@ def main():
     logger.info("🔄 Background database copy & sync service started.")
     
     # Check if another service instance is already running
-    lock = read_lock_file()
-    if lock:
-        status = lock.get("status")
-        lock_pid = lock.get("pid")
-        if status == "refreshing" and is_pid_alive(lock_pid) and lock_pid != os.getpid():
-            logger.info(f"ℹ️ Another background service is already running (PID: {lock_pid}). Exiting.")
-            return 0
+    check_and_write_service_pid()
 
     loop_interval = 60 # Check every 60 seconds
     
@@ -111,14 +137,15 @@ def main():
             needed, reason = is_refresh_needed(last_refresh_timestamp)
             
             if needed:
-                # 3. Check if planner is active
-                if status == "planner_active":
+                # 3. Check if planner or executor is active
+                if status in ["planner_active", "executor_active"]:
                     if is_pid_alive(lock_pid):
-                        logger.info(f"ℹ️ Planner is currently active (PID: {lock_pid}). Delaying database refresh...")
+                        friendly_name = "Planner" if status == "planner_active" else "Executor"
+                        logger.info(f"ℹ️ {friendly_name} is currently active (PID: {lock_pid}). Delaying database refresh...")
                         time.sleep(loop_interval)
                         continue
                     else:
-                        logger.warning(f"⚠️ Found stale planner active lock from dead PID {lock_pid}. Overriding lock.")
+                        logger.warning(f"⚠️ Found stale {status} lock from dead PID {lock_pid}. Overriding lock.")
                 
                 # 4. Acquire Lock
                 current_pid = os.getpid()

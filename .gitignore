@@ -19,3 +19,4 @@ media_organizer.sqlite
 logs/
 db/media_organizer.db-shm
 db/media_organizer.db-wal
+backups

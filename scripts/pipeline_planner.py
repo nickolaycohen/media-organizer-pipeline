@@ -16,7 +16,7 @@ from utils.utils import get_full_transition_path, human_readable_size
 from google_photos import check_google_quota, authenticate, get_all_favorites
 import argparse
 import sqlite3
-from constants import MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_COPY_PATH, APPLE_PHOTOS_DB_LOCK_PATH, APPLE_PHOTOS_DB_PATH, LOG_PATH, GOOGLE_PHOTOS_READONLY_SCOPES, GOOGLE_DRIVE_READ_ONLY_SCOPES, PLANNER_REQUIRED_SCOPES, CURATION_THRESHOLD_LOG_PATH, SCORING_BREAKDOWN_LOG_PATH, MEDIA_CLEANUP_LOG_PATH, MAX_UPLOAD_FILE_SIZE_BYTES, MAX_UPLOAD_FILE_SIZE_MB, BG_SERVICE_PID_PATH
+from constants import MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_LOCK_PATH, APPLE_PHOTOS_DB_PATH, LOG_PATH, GOOGLE_PHOTOS_READONLY_SCOPES, GOOGLE_DRIVE_READ_ONLY_SCOPES, PLANNER_REQUIRED_SCOPES, CURATION_THRESHOLD_LOG_PATH, SCORING_BREAKDOWN_LOG_PATH, MEDIA_CLEANUP_LOG_PATH, MAX_UPLOAD_FILE_SIZE_BYTES, MAX_UPLOAD_FILE_SIZE_MB, BG_SERVICE_PID_PATH
 from constants import ACTIVE_CAMERA_MODELS, DEVICE_OWNER_MAPPING
 from db.connections import get_connection, get_cursor, commit, close as close_conn
 from db.queries import get_stage_transitions, get_batch_statuses, get_latest_import_and_month
@@ -368,8 +368,8 @@ def check_active_sources_import_status(cursor, conn, month, auto_apply):
     months_to_check = [month]
 
     try:
-        cursor.execute(f"ATTACH DATABASE '{APPLE_PHOTOS_DB_COPY_PATH}' AS photos_db;")
-        logger.debug("Attached Photos.sqlite database for active source check.")
+        cursor.execute(f"ATTACH DATABASE 'file:{APPLE_PHOTOS_DB_PATH}?mode=ro' AS photos_db;")
+        logger.debug("Attached Photos.sqlite database read-only for active source check.")
 
         for month_str in months_to_check:
             source_metadata = []
@@ -898,16 +898,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
         # Try attaching Apple Photos DB copy to fetch Apple's auto-generated moments and filter ignored items
         photos_db_attached = False
         try:
-            from constants import APPLE_PHOTOS_DB_COPY_PATH
-            # Pre-open direct connection to force SQLite recovery/WAL resolution on the copy
-            try:
-                temp_conn = sqlite3.connect(APPLE_PHOTOS_DB_COPY_PATH, timeout=5)
-                temp_conn.execute("SELECT 1;")  # quick query to force file access/recovery
-                temp_conn.close()
-            except Exception as e:
-                logger.debug(f"Pre-open of Photos.sqlite copy failed/warned: {e}")
-
-            cursor.execute(f"ATTACH DATABASE '{APPLE_PHOTOS_DB_COPY_PATH}' AS photos_db;")
+            cursor.execute(f"ATTACH DATABASE 'file:{APPLE_PHOTOS_DB_PATH}?mode=ro' AS photos_db;")
             photos_db_attached = True
         except Exception as e:
             logger.warning(f"Could not attach Photos.sqlite for Apple moment lookup: {e}")
@@ -2062,7 +2053,7 @@ def manage_device_owners_flow(cursor=None, conn=None):
         # Attach photos_db for counting assets by camera model
         photos_db_attached = False
         try:
-            cursor.execute(f"ATTACH DATABASE '{APPLE_PHOTOS_DB_COPY_PATH}' AS photos_db")
+            cursor.execute(f"ATTACH DATABASE 'file:{APPLE_PHOTOS_DB_PATH}?mode=ro' AS photos_db")
             photos_db_attached = True
         except Exception:
             pass
@@ -2257,8 +2248,8 @@ def display_media_cleanup_recommendations(cursor, verbose=True):
     """
     # First, attach photos_db to query full camera/source libraries
     try:
-        cursor.execute(f"ATTACH DATABASE '{APPLE_PHOTOS_DB_COPY_PATH}' AS photos_db")
-        logger.debug("Attached Photos.sqlite database for cleanup scan.")
+        cursor.execute(f"ATTACH DATABASE 'file:{APPLE_PHOTOS_DB_PATH}?mode=ro' AS photos_db")
+        logger.debug("Attached Photos.sqlite database read-only for cleanup scan.")
     except Exception as e:
         logger.warning(f"Could not attach Photos.sqlite: {e}")
 

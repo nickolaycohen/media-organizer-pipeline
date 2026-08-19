@@ -7,7 +7,7 @@ _conn = None
 def get_connection():
     global _conn
     if _conn is None:
-        _conn = sqlite3.connect(MEDIA_ORGANIZER_DB_PATH, timeout=30, detect_types=sqlite3.PARSE_DECLTYPES)
+        _conn = sqlite3.connect(MEDIA_ORGANIZER_DB_PATH, timeout=30, detect_types=sqlite3.PARSE_DECLTYPES, uri=True)
     return _conn
 
 def get_cursor():

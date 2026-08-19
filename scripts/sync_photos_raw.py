@@ -4,20 +4,20 @@ import time
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import sqlite3
 import logging
-from constants import BASE_DIR, MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_COPY_PATH, LOG_PATH, MAX_RETRIES, RETRY_DELAY
+from constants import BASE_DIR, MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_PATH, LOG_PATH, MAX_RETRIES, RETRY_DELAY
 from utils.logger import setup_logger, close_logger
 
 MODULE_TAG = 'sync_photos_raw'
 
 def sync_metadata(logger):
-    if not os.path.exists(APPLE_PHOTOS_DB_COPY_PATH):
-        logger.error(f"Apple Photos database not found at {APPLE_PHOTOS_DB_COPY_PATH}")
+    if not os.path.exists(APPLE_PHOTOS_DB_PATH):
+        logger.error(f"Apple Photos database not found at {APPLE_PHOTOS_DB_PATH}")
         return
 
     for attempt in range(1, MAX_RETRIES + 1):
         conn_media = None
         try:
-            conn_media = sqlite3.connect(MEDIA_ORGANIZER_DB_PATH, timeout=30)
+            conn_media = sqlite3.connect(MEDIA_ORGANIZER_DB_PATH, timeout=30, uri=True)
             conn_media.execute("PRAGMA journal_mode=WAL;")
             conn_media.execute("PRAGMA busy_timeout = 30000;")
             cursor_media = conn_media.cursor()
@@ -31,9 +31,9 @@ def sync_metadata(logger):
                 logger.info("Raw sync flag is already set. Skipping raw assets sync.")
                 return
 
-            # Attach the Apple Photos database
-            cursor_media.execute(f"ATTACH DATABASE '{APPLE_PHOTOS_DB_COPY_PATH}' AS photos_db;")
-            logger.info("Attached Photos.sqlite database.")
+            # Attach the Apple Photos database in read-only mode
+            cursor_media.execute(f"ATTACH DATABASE 'file:{APPLE_PHOTOS_DB_PATH}?mode=ro' AS photos_db;")
+            logger.info("Attached Photos.sqlite database read-only.")
 
             # Verify attached database integrity
             # logger.info("Verifying attached database integrity (this may take a while)...")
@@ -46,10 +46,56 @@ def sync_metadata(logger):
             for table in ["ZASSET", "ZADDITIONALASSETATTRIBUTES", "ZEXTENDEDATTRIBUTES", "ZIMPORTSESSION"]:
                 cursor_media.execute("SELECT name FROM photos_db.sqlite_master WHERE type='table' AND name=?", (table,))
                 if cursor_media.fetchone():
-                    logger.info(f"Copying {table} from Apple Photos...")
-                    cursor_media.execute(f"DROP TABLE IF EXISTS main.{table};")
-                    cursor_media.execute(f"CREATE TABLE main.{table} AS SELECT * FROM photos_db.{table};")
-                    conn_media.commit()
+                    # Check if local table exists and has Z_PK as primary key
+                    cursor_media.execute("SELECT name FROM main.sqlite_master WHERE type='table' AND name=?", (table,))
+                    local_exists = cursor_media.fetchone() is not None
+                    
+                    has_pk = False
+                    if local_exists:
+                        cursor_media.execute(f"PRAGMA main.table_info({table});")
+                        columns = cursor_media.fetchall()
+                        for col in columns:
+                            # col[1] is name, col[5] is pk flag (1 or 0)
+                            if col[1] == "Z_PK" and col[5] == 1:
+                                has_pk = True
+                                break
+                    
+                    if not local_exists or not has_pk:
+                        logger.info(f"Creating/upgrading local table main.{table} with primary key schema...")
+                        # Drop if exists (since it doesn't have PK)
+                        cursor_media.execute(f"DROP TABLE IF EXISTS main.{table};")
+                        # Get creation SQL from source DB
+                        cursor_media.execute("SELECT sql FROM photos_db.sqlite_master WHERE type='table' AND name=?", (table,))
+                        create_sql = cursor_media.fetchone()[0]
+                        # Execute creation SQL in main
+                        cursor_media.execute(create_sql)
+                        
+                        # Populate table initially
+                        logger.info(f"Performing initial full sync for main.{table}...")
+                        cursor_media.execute(f"INSERT INTO main.{table} SELECT * FROM photos_db.{table};")
+                        conn_media.commit()
+                    else:
+                        # Table exists and has PK, perform incremental sync (upsert and delete)
+                        logger.info(f"Performing incremental sync for main.{table}...")
+                        
+                        # 1. Upsert new/modified rows
+                        cursor_media.execute(f"""
+                            INSERT OR REPLACE INTO main.{table}
+                            SELECT src.* FROM photos_db.{table} src
+                            LEFT JOIN main.{table} dest ON dest.Z_PK = src.Z_PK
+                            WHERE dest.Z_PK IS NULL OR src.Z_OPT > dest.Z_OPT;
+                        """)
+                        inserted_updated = cursor_media.rowcount
+                        
+                        # 2. Delete removed rows
+                        cursor_media.execute(f"""
+                            DELETE FROM main.{table}
+                            WHERE Z_PK NOT IN (SELECT Z_PK FROM photos_db.{table});
+                        """)
+                        deleted = cursor_media.rowcount
+                        
+                        logger.info(f"Incremental sync for {table} completed: upserted {inserted_updated} rows, deleted {deleted} rows.")
+                        conn_media.commit()
                 else:
                     if table == "ZIMPORTSESSION":
                         logger.warning(f"Optional table {table} not found in Apple Photos DB. Skipping.")

@@ -5,7 +5,7 @@ import argparse
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from utils.logger import setup_logger, close_logger
-from constants import LOG_PATH, MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_COPY_PATH, AESTHETIC_SCORE_WEIGHT, GOOGLE_FAVORITES_WEIGHT, APPLE_SELECTION_WEIGHT, APPLE_FEATURED_WEIGHT
+from constants import LOG_PATH, MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_PATH, AESTHETIC_SCORE_WEIGHT, GOOGLE_FAVORITES_WEIGHT, APPLE_SELECTION_WEIGHT, APPLE_FEATURED_WEIGHT
 from db.connections import get_connection, get_cursor, commit, close as close_conn
 
 MODULE_TAG = 'sync_photos_derived'
@@ -13,13 +13,9 @@ MODULE_TAG = 'sync_photos_derived'
 def sync_assets(media_cursor, logger):
     logger.info("Photos assets sync started.")
 
-    # media_conn = sqlite3.connect(MEDIA_ORGANIZER_DB_PATH)
-    # logger.info(f"Connected to Media Organizer DB: {MEDIA_ORGANIZER_DB_PATH}")
-    # media_cursor = media_conn.cursor()
-
-    # Attach the Apple Photos database
-    media_cursor.execute(f"ATTACH DATABASE '{APPLE_PHOTOS_DB_COPY_PATH}' AS photos_db;")
-    logger.info("Attached Photos.sqlite database.")
+    # Attach the Apple Photos database in read-only mode
+    media_cursor.execute(f"ATTACH DATABASE 'file:{APPLE_PHOTOS_DB_PATH}?mode=ro' AS photos_db;")
+    logger.info("Attached Photos.sqlite database read-only.")
 
     # Drop the broken view immediately if it exists to clear schema errors
     # that prevent subsequent queries from running.

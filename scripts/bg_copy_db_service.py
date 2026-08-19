@@ -162,13 +162,13 @@ def main():
                 # 5. Execute processing sequence
                 script_dir = os.path.dirname(os.path.abspath(__file__))
                 steps = [
-                    ("0.0 Copy Apple Photos Database Copy", ["copy_all_media_photos_db.py"]),
                     ("0.1 Storage Manager Migrations", ["storage_manager_main.py", "--migrate"]),
                     ("0.2 Sync Raw Assets", ["sync_photos_raw.py"]),
                     ("0.3 Sync Derived Metadata", ["sync_photos_derived.py", "--force"])
                 ]
                 
                 success = True
+                sync_start_time = time.time()
                 for step_name, args in steps:
                     script_path = os.path.join(script_dir, args[0])
                     logger.info(f"🚀 Running step: {step_name}")
@@ -201,7 +201,8 @@ def main():
                 logger.info("🔓 Releasing lock...")
                 if success:
                     last_refresh_timestamp = get_current_utc_str()
-                    logger.info("🎉 Database refresh and metadata sync completed successfully.")
+                    elapsed = time.time() - sync_start_time
+                    logger.info(f"🎉 Database refresh and metadata sync completed successfully in {elapsed:.2f} seconds.")
                 else:
                     logger.error("⚠️ Database copy and sync pipeline failed.")
                 

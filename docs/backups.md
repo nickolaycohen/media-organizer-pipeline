@@ -24,11 +24,11 @@ To automate the backup, you can schedule it to run daily using macOS `launchd` o
    <dict>
        <key>Label</key>
        <string>com.mediaorganizer.backup</string>
-       <key>ProgramArguments</key>
-       <array>
-           <string>/usr/bin/python3</string>
-           <string>/Users/nickolaycohen/dev/media-organizer-pipeline/scripts/backup_database.py</string>
-       </array>
+        <key>ProgramArguments</key>
+        <array>
+            <string>/Library/Frameworks/Python.framework/Versions/3.12/bin/python3</string>
+            <string>/Users/nickolaycohen/dev/media-organizer-pipeline/scripts/backup_database.py</string>
+        </array>
        <key>StartCalendarInterval</key>
        <dict>
            <key>Hour</key>
@@ -62,7 +62,7 @@ This will run the backup automatically every day at 2:00 AM.
 
 2. Add a line to execute the script daily at 2 AM (saving output to a log file):
    ```text
-   0 2 * * * /usr/bin/python3 /Users/nickolaycohen/dev/media-organizer-pipeline/scripts/backup_database.py >> /Users/nickolaycohen/dev/media-organizer-pipeline/logs/backup.log 2>&1
+   0 2 * * * /Library/Frameworks/Python.framework/Versions/3.12/bin/python3 /Users/nickolaycohen/dev/media-organizer-pipeline/scripts/backup_database.py >> /Users/nickolaycohen/dev/media-organizer-pipeline/logs/backup.log 2>&1
    ```
 
 ---

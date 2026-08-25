@@ -351,6 +351,23 @@ def main(args):
 
     if not files_to_process:
         logger.info(f"✅ No new files to upload for month {month}. (Checked {len(files)} files, {skipped_count} already uploaded, {skipped_oversized_count} skipped > {max_upload_size_mb:.0f} MB).")
+        
+        # Verify that we actually have the assets uploaded in the database
+        acquire_db_lock()
+        conn = get_connection()
+        cursor = get_cursor()
+        cursor.execute("SELECT COUNT(*) FROM assets WHERE month = ? AND (ignore_continuity_check = 0 OR ignore_continuity_check IS NULL)", (month,))
+        total_assets_expected = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM assets WHERE month = ? AND uploaded_to_google = 1", (month,))
+        uploaded_db_count = cursor.fetchone()[0]
+        close_conn()
+        release_db_lock()
+
+        if total_assets_expected > 0 and uploaded_db_count < total_assets_expected:
+            logger.error(f"❌ Error: Batch {month} has {uploaded_db_count}/{total_assets_expected} assets uploaded, but no eligible files were found in staging folder '{album_path}'.")
+            logger.error("Please verify that your Apple Photos Smart Album has the correct date filters for this month and has exported files successfully.")
+            sys.exit(1)
+
         # Since all eligible files in the staging folder have been processed, we finalize the status to 400.
         if not args.dry_run:
             acquire_db_lock()

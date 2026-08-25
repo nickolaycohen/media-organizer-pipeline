@@ -1073,7 +1073,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
             LEFT JOIN ZASSET za ON za.ZUUID = a.asset_id
             LEFT JOIN ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
             GROUP BY p.moment_name
-            ORDER BY MAX(p.published_at_utc) DESC, p.moment_name ASC
+            ORDER BY AVG(v.score_normalized) DESC NULLS LAST, MAX(p.published_at_utc) DESC, p.moment_name ASC
         """)
         published_folders = cursor.fetchall()
 

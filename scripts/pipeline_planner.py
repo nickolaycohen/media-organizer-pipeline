@@ -1088,7 +1088,8 @@ def run_memory_publishing_flow(cursor=None, conn=None):
             threshold_report.append(pub_header)
             threshold_report.append("-" * len(pub_header))
             for idx, p_row in enumerate(published_folders, 1):
-                p_name = p_row[0] or "—"
+                p_name_raw = p_row[0] or "—"
+                p_name = p_name_raw[:26] + "..." if len(p_name_raw) > 29 else p_name_raw
                 p_date_raw = p_row[1]
                 p_date_str = "—"
                 if p_date_raw:
@@ -1531,7 +1532,10 @@ def run_memory_publishing_flow(cursor=None, conn=None):
             else:
                 published_str = f"🔄 Part ({m['pub_count']})"
 
-            print(f"{idx:<4} {m['name']:<30} {m['rank_score']:<12.4f} {m['avg_score']:<10.4f} {m['min_score']:<10.4f} {m['max_score']:<10.4f} {m['assets_display']:<8} {m['pub_display']:<6} {m['pub_avg_str']:<10} {m['pub_range_str']:<17} {to_be_curated_str:<13} {curated_str:<15} {published_str:<13} {m['can_publish_str']:<18} {m['last_pub_str']:<18}")
+            m_name_raw = m['name'] or "—"
+            m_name = m_name_raw[:26] + "..." if len(m_name_raw) > 29 else m_name_raw
+
+            print(f"{idx:<4} {m_name:<30} {m['rank_score']:<12.4f} {m['avg_score']:<10.4f} {m['min_score']:<10.4f} {m['max_score']:<10.4f} {m['assets_display']:<8} {m['pub_display']:<6} {m['pub_avg_str']:<10} {m['pub_range_str']:<17} {to_be_curated_str:<13} {curated_str:<15} {published_str:<13} {m['can_publish_str']:<18} {m['last_pub_str']:<18}")
 
         # Build timeline map of moments to find closest merge suggestions for disjoint moments
         cursor.execute("""
@@ -1801,6 +1805,77 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                     assets_str = "—"
                 print(f"{idx:<4} {rec['name']:<30} {rec['avg_score']:<10.4f} {rec['total_unique']:<6} {rec['pub_count']:<5} {rec['rec_count']:<5} {rec['action']:<40} {assets_str}")
             print("==================================================================================================================================================================\n")
+
+            # Display Skipped Videos Table
+            skipped_db_attached = False
+            try:
+                cursor.execute(f"ATTACH DATABASE 'file:{APPLE_PHOTOS_DB_PATH}?mode=ro' AS photos_db;")
+                skipped_db_attached = True
+            except Exception as e:
+                logger.warning(f"Could not attach Photos.sqlite for skipped videos check: {e}")
+
+            if skipped_db_attached:
+                try:
+                    cursor.execute("""
+                        SELECT 
+                            a.original_filename,
+                            a.month,
+                            COALESCE(v.score_normalized, 0.0) as score,
+                            a.date_created_utc,
+                            za.Z_PK
+                        FROM assets a
+                        JOIN photos_db.ZASSET za ON za.ZUUID = a.asset_id
+                        JOIN photos_db.Z_30ASSETS aa ON aa.Z_3ASSETS = za.Z_PK
+                        JOIN photos_db.ZGENERICALBUM ga ON ga.Z_PK = aa.Z_30ALBUMS
+                        LEFT JOIN ranked_assets_view v ON v.asset_id = a.asset_id
+                        WHERE ga.ZTITLE = 'Google Upload Skipped Videos'
+                          AND ga.ZTRASHEDSTATE = 0
+                        ORDER BY v.score_normalized DESC NULLS LAST
+                        LIMIT 15
+                    """)
+                    skipped_rows = cursor.fetchall()
+                    if skipped_rows:
+                        print("==================================================================================================================================================================")
+                        print("🎥 Skipped Videos - Curation & Score Ranking (Google Upload Skipped Videos - Top 15)")
+                        print("==================================================================================================================================================================")
+                        print(f"{'No.':<4} {'Video Filename':<30} {'Month':<10} {'Avg Score':<11} {'Capture Date & Time':<24} {'Suggested Moment'}")
+                        print("-" * 168)
+                        for s_idx, (fname, smonth, sscore, sdate, z_pk) in enumerate(skipped_rows, 1):
+                            # Query all other albums this asset is in
+                            cursor.execute("""
+                                SELECT ga.ZTITLE 
+                                FROM photos_db.Z_30ASSETS aa 
+                                JOIN photos_db.ZGENERICALBUM ga ON ga.Z_PK = aa.Z_30ALBUMS 
+                                WHERE aa.Z_3ASSETS = ? 
+                                  AND ga.ZTRASHEDSTATE = 0
+                            """, (z_pk,))
+                            albums = [r[0] for r in cursor.fetchall() if r[0] != 'Google Upload Skipped Videos']
+                            
+                            suggested_moment = "—"
+                            valid_albums = []
+                            for name in albums:
+                                if name and re.match(r'^\d{4}(?:-\d{2})?(?:-\d{2})?(?:\b|\s|-)', name):
+                                    valid_albums.append(name.strip())
+                            if valid_albums:
+                                # Sort by date specificity: YYYY-MM-DD > YYYY-MM > YYYY, then length
+                                def prefix_specificity(name):
+                                    if re.match(r'^\d{4}-\d{2}-\d{2}', name):
+                                        return 3
+                                    if re.match(r'^\d{4}-\d{2}', name):
+                                        return 2
+                                    return 1
+                                valid_albums.sort(key=lambda x: (-prefix_specificity(x), -len(x)))
+                                suggested_moment = valid_albums[0]
+                                
+                            print(f"{s_idx:<4} {fname:<30} {smonth:<10} {sscore:<11.4f} {sdate:<24} {suggested_moment}")
+                        print("==================================================================================================================================================================\n")
+                except Exception as e:
+                    logger.warning(f"Error querying skipped videos: {e}")
+                finally:
+                    try:
+                        cursor.execute("DETACH DATABASE photos_db;")
+                    except Exception:
+                        pass
 
             # Sync folders and files to 'Publishing Recommendation' directory
             PUBLISHING_RECOMMENDATION_DIR = "/Volumes/LaCie/Media Organizer/Publishing Recommendation"

@@ -104,6 +104,12 @@ def stop_bg_service_on_exit():
         except Exception as e:
             logger.warning(f"Error stopping background service: {e}")
 
+def restart_planner():
+    logger.info("🔄 Restarting planner to refresh status...")
+    close_conn()
+    release_planner_lock()
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
 def acquire_planner_lock():
     while True:
         lock = read_lock_file()
@@ -2793,11 +2799,12 @@ def main(auto_apply, no_sync=False):
                 elapsed_days = (now_utc - last_dt).total_seconds() / 86400
             except: pass
 
-        if elapsed_days is not None and elapsed_days < 3:
-            logger.info(f"    ⏸️ Too soon: Only {elapsed_days:.1f} days since upload. Need 3 days for Google AI curation.")
+        fav_count, source, _ = check_favorites_count(cursor, month, check_remote=True, all_favs=remote_favs_cache, creds=creds)
+
+        if fav_count == 0 and elapsed_days is not None and elapsed_days < 3:
+            logger.info(f"    ⏸️ Too soon: Only {elapsed_days:.1f} days since upload and no favorites found. Need 3 days for Google AI curation.")
             continue
 
-        fav_count, source, _ = check_favorites_count(cursor, month, check_remote=True, all_favs=remote_favs_cache, creds=creds)
         if fav_count == 0:
             if selected_prev == '500':
                 logger.info(f"    ⏸️ Manual transition blocked: No favorites in Google Photos.")
@@ -2817,13 +2824,13 @@ def main(auto_apply, no_sync=False):
                 cursor.execute("UPDATE month_batches SET status_code = ?, is_bypassed = 0, bypass_timestamp = NULL WHERE month = ?", (selected_code, month))
                 conn.commit()
                 logger.info(f"✅ Month {month} status updated to {selected_code}.")
-                close_conn(); sys.exit(0)
+                restart_planner()
             elif proceed_input == 'bypass' and fav_count == 0:
                 now_str = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
                 cursor.execute("UPDATE month_batches SET status_code = ?, is_bypassed = 1, bypass_timestamp = ? WHERE month = ?", (selected_code, now_str, month))
                 conn.commit()
                 logger.info(f"✅ Month {month} status updated to {selected_code} (Direct-Rank Bypassed).")
-                close_conn(); sys.exit(0)
+                restart_planner()
             else:
                 logger.info(f"  Skipped manual transition for {month}. Checking next candidate...")
                 continue
@@ -2896,7 +2903,9 @@ def main(auto_apply, no_sync=False):
                     proceed_transition = ans == 'y'
                 if proceed_transition:
                     cursor.execute("UPDATE month_batches SET status_code = '400' WHERE month = ?", (month,))
-                    conn.commit(); logger.info(f"Month {month} updated to 400."); close_conn(); sys.exit(0)
+                    conn.commit()
+                    logger.info(f"Month {month} updated to 400.")
+                    restart_planner()
             elif staging_folder and free_space >= remaining_to_upload:
                 logger.info(f"🚀 Found {human_readable_size(remaining_to_upload)} left to upload for {month}. "
                             f"Available space: {human_readable_size(free_space)}. Priority given to finishing this batch.")

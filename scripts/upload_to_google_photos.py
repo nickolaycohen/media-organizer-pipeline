@@ -35,12 +35,14 @@ def read_lock_file():
     except Exception:
         return None
 
-def write_lock_file(status, pid, started_at=None, latest_successful_refresh_utc="—"):
+def write_lock_file(status, pid, started_at_utc=None, latest_successful_refresh_utc="—"):
     try:
+        if started_at_utc and not started_at_utc.endswith(" UTC"):
+            started_at_utc = f"{started_at_utc} UTC"
         lock_data = {
             "status": status,
             "pid": pid,
-            "started_at": started_at,
+            "started_at_utc": started_at_utc,
             "host": socket.gethostname(),
             "latest_successful_refresh_utc": latest_successful_refresh_utc
         }
@@ -86,7 +88,7 @@ def acquire_db_lock():
         write_lock_file(
             status="executor_active",
             pid=os.getpid(),
-            started_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+            started_at_utc=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
             latest_successful_refresh_utc=last_refresh
         )
         break

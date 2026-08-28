@@ -6,7 +6,7 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, project_root)
 import logging
 from utils.logger import setup_logger, close_logger
-from constants import LOG_PATH, STAGING_ROOT
+from constants import LOG_PATH, STAGING_ROOT, UNPROCESSED_MONTHS_LOG_PATH
 from db.connections import get_connection, get_cursor, commit, close as close_conn
 
 MODULE_TAG = 'generate_batches'
@@ -32,8 +32,17 @@ def main_process(logger):
         """)
         unprocessed_months = {row[0]: row[1] for row in cursor.fetchall()}
 
+        unprocessed_report = []
         for month, count in unprocessed_months.items():
-            logger.info(f"Unprocessed month: {month}, distinct imports count: {count}")
+            unprocessed_report.append(f"Unprocessed month: {month}, distinct imports count: {count}")
+
+        if unprocessed_report:
+            try:
+                with open(UNPROCESSED_MONTHS_LOG_PATH, 'w', encoding='utf-8') as f:
+                    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]
+                    f.write('\n'.join(f"{timestamp} [{MODULE_TAG}:36] - INFO - {line}" for line in unprocessed_report) + '\n')
+            except Exception as e:
+                logger.warning(f"Could not write unprocessed months log: {e}")
 
         # Determine months needing new batch entries
         new_months = set(unprocessed_months.keys()) - existing_months

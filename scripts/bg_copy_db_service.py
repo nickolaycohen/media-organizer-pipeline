@@ -5,6 +5,7 @@ import socket
 import errno
 import subprocess
 import time
+import signal
 from datetime import datetime, timezone
 
 # Setup script path imports
@@ -73,12 +74,14 @@ def read_lock_file():
         logger.warning(f"Error reading lock file: {e}")
         return None
 
-def write_lock_file(status, pid, started_at=None, latest_successful_refresh_utc="—"):
+def write_lock_file(status, pid, started_at_utc=None, latest_successful_refresh_utc="—"):
     try:
+        if started_at_utc and not started_at_utc.endswith(" UTC"):
+            started_at_utc = f"{started_at_utc} UTC"
         lock_data = {
             "status": status,
             "pid": pid,
-            "started_at": started_at,
+            "started_at_utc": started_at_utc,
             "host": socket.gethostname(),
             "latest_successful_refresh_utc": latest_successful_refresh_utc
         }
@@ -114,6 +117,12 @@ def is_refresh_needed(last_refresh_str):
 
 def main():
     logger.info("🔄 Background database copy & sync service started.")
+    
+    # Register SIGTERM handler to exit cleanly
+    def handle_sigterm(signum, frame):
+        logger.info("🛑 Background service received SIGTERM.")
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, handle_sigterm)
     
     # Check if another service instance is already running
     check_and_write_service_pid()
@@ -155,7 +164,7 @@ def main():
                 write_lock_file(
                     status="refreshing",
                     pid=current_pid,
-                    started_at=start_time_str,
+                    started_at_utc=start_time_str,
                     latest_successful_refresh_utc=last_refresh_timestamp
                 )
                 
@@ -217,7 +226,7 @@ def main():
             time.sleep(loop_interval)
             
     except KeyboardInterrupt:
-        logger.info("🛑 Background service stopped by user.")
+        logger.info("🛑 Background service stopped.")
         # Ensure we release lock if we hold it
         lock = read_lock_file()
         if lock and lock.get("pid") == os.getpid() and lock.get("status") == "refreshing":

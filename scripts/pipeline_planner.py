@@ -16,7 +16,7 @@ from utils.utils import get_full_transition_path, human_readable_size
 from google_photos import check_google_quota, authenticate, get_all_favorites
 import argparse
 import sqlite3
-from constants import MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_LOCK_PATH, APPLE_PHOTOS_DB_PATH, LOG_PATH, GOOGLE_PHOTOS_READONLY_SCOPES, GOOGLE_DRIVE_READ_ONLY_SCOPES, PLANNER_REQUIRED_SCOPES, CURATION_THRESHOLD_LOG_PATH, SCORING_BREAKDOWN_LOG_PATH, MEDIA_CLEANUP_LOG_PATH, MAX_UPLOAD_FILE_SIZE_BYTES, MAX_UPLOAD_FILE_SIZE_MB, BG_SERVICE_PID_PATH
+from constants import MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_LOCK_PATH, APPLE_PHOTOS_DB_PATH, LOG_PATH, GOOGLE_PHOTOS_READONLY_SCOPES, GOOGLE_DRIVE_READ_ONLY_SCOPES, PLANNER_REQUIRED_SCOPES, CURATION_THRESHOLD_LOG_PATH, PUBLISHED_MOMENTS_LOG_PATH, SCORING_BREAKDOWN_LOG_PATH, MEDIA_CLEANUP_LOG_PATH, MAX_UPLOAD_FILE_SIZE_BYTES, MAX_UPLOAD_FILE_SIZE_MB, BG_SERVICE_PID_PATH
 from constants import ACTIVE_CAMERA_MODELS, DEVICE_OWNER_MAPPING
 from db.connections import get_connection, get_cursor, commit, close as close_conn
 from db.queries import get_stage_transitions, get_batch_statuses, get_latest_import_and_month
@@ -60,12 +60,14 @@ def read_lock_file():
     except Exception:
         return None
 
-def write_lock_file(status, pid, started_at=None, latest_successful_refresh_utc="—"):
+def write_lock_file(status, pid, started_at_utc=None, latest_successful_refresh_utc="—"):
     try:
+        if started_at_utc and not started_at_utc.endswith(" UTC"):
+            started_at_utc = f"{started_at_utc} UTC"
         lock_data = {
             "status": status,
             "pid": pid,
-            "started_at": started_at,
+            "started_at_utc": started_at_utc,
             "host": socket.gethostname(),
             "latest_successful_refresh_utc": latest_successful_refresh_utc
         }
@@ -83,6 +85,24 @@ def release_planner_lock():
             pid=None,
             latest_successful_refresh_utc=lock.get("latest_successful_refresh_utc", "—")
         )
+
+def stop_bg_service_on_exit():
+    if os.path.exists(BG_SERVICE_PID_PATH):
+        try:
+            with open(BG_SERVICE_PID_PATH, "r") as f:
+                service_pid = int(f.read().strip())
+            if service_pid and is_pid_alive(service_pid):
+                logger.info(f"Stopping background copy service (PID: {service_pid})...")
+                print(f"🛑 Stopping background copy service (PID: {service_pid})...")
+                import signal
+                os.kill(service_pid, signal.SIGTERM)
+                # Wait up to 3 seconds for the service script to exit and remove the PID file
+                for _ in range(30):
+                    time.sleep(0.1)
+                    if not is_pid_alive(service_pid):
+                        break
+        except Exception as e:
+            logger.warning(f"Error stopping background service: {e}")
 
 def acquire_planner_lock():
     while True:
@@ -115,7 +135,7 @@ def acquire_planner_lock():
         write_lock_file(
             status="planner_active",
             pid=os.getpid(),
-            started_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+            started_at_utc=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
             latest_successful_refresh_utc=last_refresh
         )
         atexit.register(release_planner_lock)
@@ -1077,16 +1097,17 @@ def run_memory_publishing_flow(cursor=None, conn=None):
         """)
         published_folders = cursor.fetchall()
 
-        threshold_report.append("==================================================================================================================================")
-        threshold_report.append("🌟 Published Moments / Folders & Stats")
-        threshold_report.append("==================================================================================================================================")
+        published_moments_report = []
+        published_moments_report.append("==================================================================================================================================")
+        published_moments_report.append("🌟 Published Moments / Folders & Stats")
+        published_moments_report.append("==================================================================================================================================")
         if not published_folders:
-            threshold_report.append("ℹ️  No published moments recorded yet in database.\n")
+            published_moments_report.append("ℹ️  No published moments recorded yet in database.\n")
         else:
-            threshold_report.append("The following moments have been curated and published:")
+            published_moments_report.append("The following moments have been curated and published:")
             pub_header = f"{'No.':<4} {'Moment Name':<30} {'Published At (Local)':<22} {'Assets':<8} {'Avg Score':<11} {'Score Range':<17} {'Capture Dates':<24} {'Camera Sources'}"
-            threshold_report.append(pub_header)
-            threshold_report.append("-" * len(pub_header))
+            published_moments_report.append(pub_header)
+            published_moments_report.append("-" * len(pub_header))
             for idx, p_row in enumerate(published_folders, 1):
                 p_name_raw = p_row[0] or "—"
                 p_name = p_name_raw[:26] + "..." if len(p_name_raw) > 29 else p_name_raw
@@ -1119,8 +1140,8 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                 d_max = (p_row[7][:10] if p_row[7] else "—")
                 date_rng = f"{d_min} to {d_max}" if d_min != d_max else d_min
                 c_srcs = (p_row[8] or "Unknown").replace(',', ', ')
-                threshold_report.append(f"{idx:<4} {p_name:<30} {p_date_str:<22} {p_count:<8} {p_avg:<11} {score_rng:<17} {date_rng:<24} {c_srcs}")
-            threshold_report.append("==================================================================================================================================\n")
+                published_moments_report.append(f"{idx:<4} {p_name:<30} {p_date_str:<22} {p_count:<8} {p_avg:<11} {score_rng:<17} {date_rng:<24} {c_srcs}")
+            published_moments_report.append("==================================================================================================================================\n")
 
         # Save to logs/curation_threshold_status.log and print to console
         try:
@@ -1128,6 +1149,13 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                 f.write('\n'.join(threshold_report) + '\n')
         except Exception as e:
             logger.warning(f"Could not write curation threshold log: {e}")
+
+        # Save to logs/published_moments_stats.log
+        try:
+            with open(PUBLISHED_MOMENTS_LOG_PATH, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(published_moments_report) + '\n')
+        except Exception as e:
+            logger.warning(f"Could not write published moments stats log: {e}")
 
         print('\n' + '\n'.join(threshold_report))
 
@@ -2491,6 +2519,7 @@ def display_media_cleanup_recommendations(cursor, verbose=True):
 
 def main(auto_apply, no_sync=False):
     # Set up logger with line number in format
+    atexit.register(stop_bg_service_on_exit)
     if not no_sync:
         ensure_bg_service_running()
     check_if_refresh_needed()

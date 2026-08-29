@@ -1657,6 +1657,9 @@ def run_memory_publishing_flow(cursor=None, conn=None):
             except Exception as e:
                 logger.warning(f"Could not detach Photos.sqlite: {e}")
 
+        # Filter to only show M200 moments in the console table
+        ranked_moments = [m for m in ranked_moments if m['display_stage'] == 'M200']
+
         # Sort by: 
         # 1. Needs update (proposed + curated < total_qualified)
         # 2. If needs update: rank score descending; if up-to-date: average score descending

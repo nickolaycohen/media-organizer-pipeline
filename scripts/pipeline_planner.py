@@ -1475,10 +1475,6 @@ def run_memory_publishing_flow(cursor=None, conn=None):
         }
 
         # 5. Format and display status report
-        print("\n=========================================================================================================")
-        print("🌟 Moments Pending Curation (Need folder created in Curated)")
-        print("=========================================================================================================")
-        
         ranked_moments = []
         for name, data in moments_data.items():
             target_scores = data['unpublished_scores']
@@ -1657,8 +1653,18 @@ def run_memory_publishing_flow(cursor=None, conn=None):
             except Exception as e:
                 logger.warning(f"Could not detach Photos.sqlite: {e}")
 
-        # Filter to only show M200 moments in the console table
-        console_moments = [m for m in ranked_moments if m['display_stage'] == 'M200']
+        # Determine table title and filter console_moments based on presence of M200 moments
+        has_m200 = any(m['display_stage'] == 'M200' for m in ranked_moments)
+        if has_m200:
+            console_moments = [m for m in ranked_moments if m['display_stage'] == 'M200']
+            table_title = "🌟 Moments Pending Curation (Need folder created in Curated)"
+        else:
+            console_moments = list(ranked_moments)
+            table_title = "🌟 Weekly Memory Feature & Publishing (Mode [M])"
+
+        print("\n=========================================================================================================")
+        print(table_title)
+        print("=========================================================================================================")
         
         # Sort console moments by:
         # 1. Needs update (proposed + curated < total_qualified)
@@ -1782,9 +1788,9 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                 return f"💡 Suggest merge with: '{best_candidate}' ({time_rel})"
             return None
 
-        # Display Weekly Memory Publishing Recommendations
+        # Display Weekly Memory Publishing Recommendations (only if all M200 curation moments are complete)
         published_assets_by_moment = {}
-        if not console_moments:
+        if not has_m200:
             cursor.execute("SELECT asset_id, moment_name FROM publications")
             for aid, mom_name in cursor.fetchall():
                 if mom_name not in published_assets_by_moment:
@@ -1792,7 +1798,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                 published_assets_by_moment[mom_name].add(aid)
 
         recommendations = []
-        for m in (ranked_moments if not console_moments else []):
+        for m in (ranked_moments if not has_m200 else []):
             name = m['name']
             p_data = pub_info.get(name, {})
             last_pub_date = p_data.get('last_pub_utc')

@@ -1658,21 +1658,21 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                 logger.warning(f"Could not detach Photos.sqlite: {e}")
 
         # Filter to only show M200 moments in the console table
-        ranked_moments = [m for m in ranked_moments if m['display_stage'] == 'M200']
-
-        # Sort by: 
+        console_moments = [m for m in ranked_moments if m['display_stage'] == 'M200']
+        
+        # Sort console moments by:
         # 1. Needs update (proposed + curated < total_qualified)
         # 2. If needs update: rank score descending; if up-to-date: average score descending
-        ranked_moments.sort(key=lambda x: (
+        console_moments.sort(key=lambda x: (
             (x['proposed_count'] + x['curated_count']) < x['total_qualified'],
             x['rank_score'] if ((x['proposed_count'] + x['curated_count']) < x['total_qualified']) else x['avg_score']
         ), reverse=True)
-
+        
         header_m = f"{'No.':<4} {'Moment Name':<30} {'Status':<8} {'Rank Score':<12} {'Avg Score':<10} {'Min Score':<10} {'Max Score':<10} {'Assets':<8} {'Pub.':<6} {'Pub. Avg':<10} {'Pub. Range':<17} {'ToBeCurated?':<13} {'Curated?':<15} {'Published?':<13} {'Can Publish?':<18} {'Last Published':<18}"
         print(header_m)
         print("-" * len(header_m))
         divider_printed = False
-        for idx, m in enumerate(ranked_moments, 1):
+        for idx, m in enumerate(console_moments, 1):
             displayed_moments_map[idx] = {'name': m['name'], 'type': 'ranked_moment'}
             is_needs_update = (m['proposed_count'] + m['curated_count']) < m['total_qualified']
             if not is_needs_update and not divider_printed:
@@ -1681,11 +1681,11 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                     print(f"--- Up-To-Date Moments " + "-" * (len(header_m) - 23))
                     print("-" * len(header_m))
                 divider_printed = True
-
+                
             to_be_curated_str = "✅ Yes" if m['to_be_curated_exists'] else "❌ No"
             if (m['proposed_count'] + m['curated_count']) < m['total_qualified'] and m['to_be_curated_exists']:
                 to_be_curated_str = "🔄 Update needed"
-            
+                
             curated_str = m['curated_str']
             if m['pub_count'] == 0:
                 published_str = "❌ No"
@@ -1693,10 +1693,10 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                 published_str = "✅ Yes"
             else:
                 published_str = f"🔄 Part ({m['pub_count']})"
-
+                
             m_name_raw = m['name'] or "—"
             m_name = m_name_raw[:26] + "..." if len(m_name_raw) > 29 else m_name_raw
-
+            
             print(f"{idx:<4} {m_name:<30} {m['display_stage']:<8} {m['rank_score']:<12.4f} {m['avg_score']:<10.4f} {m['min_score']:<10.4f} {m['max_score']:<10.4f} {m['assets_display']:<8} {m['pub_display']:<6} {m['pub_avg_str']:<10} {m['pub_range_str']:<17} {to_be_curated_str:<13} {curated_str:<15} {published_str:<13} {m['can_publish_str']:<18} {m['last_pub_str']:<18}")
 
         # Build timeline map of moments to find closest merge suggestions for disjoint moments
@@ -1783,15 +1783,16 @@ def run_memory_publishing_flow(cursor=None, conn=None):
             return None
 
         # Display Weekly Memory Publishing Recommendations
-        cursor.execute("SELECT asset_id, moment_name FROM publications")
         published_assets_by_moment = {}
-        for aid, mom_name in cursor.fetchall():
-            if mom_name not in published_assets_by_moment:
-                published_assets_by_moment[mom_name] = set()
-            published_assets_by_moment[mom_name].add(aid)
+        if not console_moments:
+            cursor.execute("SELECT asset_id, moment_name FROM publications")
+            for aid, mom_name in cursor.fetchall():
+                if mom_name not in published_assets_by_moment:
+                    published_assets_by_moment[mom_name] = set()
+                published_assets_by_moment[mom_name].add(aid)
 
         recommendations = []
-        for m in ranked_moments:
+        for m in (ranked_moments if not console_moments else []):
             name = m['name']
             p_data = pub_info.get(name, {})
             last_pub_date = p_data.get('last_pub_utc')

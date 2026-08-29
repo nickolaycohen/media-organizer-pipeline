@@ -87,7 +87,7 @@ flowchart TD
     
     Start([Start Weekly Curation]) --> Dec_Threshold{"Current Dynamic Threshold<br/>aligned with Historical Target?"}:::decision
     
-    Dec_Threshold -- "Yes (No Mismatch)" --> T2_ShowAll["Show all tables & recommendations<br/>Sync files to Recommendation folder<br/>(Hide Unassigned Assets table)"]:::action
+    Dec_Threshold -- "Yes (No Mismatch)" --> T2_ShowMoments["Show console moments table (only M200 moments)"]:::action
     Dec_Threshold -- "No (Mismatch)" --> T2_Limited["Hide curation/publishing tables<br/>Show Unassigned High-Rank Assets table"]:::action
     
     T2_Limited --> Act_Assign_Moments["👤 User Action:<br/>Assign Moment for Assets"]:::prompt
@@ -95,7 +95,12 @@ flowchart TD
     Prompt_Refresh -- "Yes (Press Enter)" --> Dec_Threshold
     Prompt_Refresh -- "No / Exit" --> Exit_Flow([Exit Memory Flow])
     
-    T2_ShowAll --> Act_Sync["create_apple_moments_albums.py<br/>(Creates ToBeCurated album)"]:::action
+    T2_ShowMoments --> Dec_M200_Exists{"Are there any M200 moments?"}:::decision
+    Dec_M200_Exists -- "Yes" --> T2_HidePublishing["Hide publishing recommendations & skipped videos<br/>Skip copying/syncing files to Recommendation folder"]:::action
+    Dec_M200_Exists -- "No" --> T2_ShowPublishing["Show publishing recommendations & skipped videos<br/>Sync files to Recommendation folder"]:::action
+    
+    T2_HidePublishing --> Act_Sync["create_apple_moments_albums.py<br/>(Creates ToBeCurated album)"]:::action
+    T2_ShowPublishing --> Act_Sync
     
     Act_Sync --> T2_M200["M200: Sync Proposed to Apple Photos"]:::state
     T2_M200 --> Act_Manual["👤 User Action:<br/>Curate photos in Apple Photos<br/>(Copy selection to Curated album)"]:::prompt

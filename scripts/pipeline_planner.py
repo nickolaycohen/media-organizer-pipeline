@@ -2122,7 +2122,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
 
         print("\n--- Actions ---")
         print(" [1] Sync proposed assets to ToBeCurated albums in Apple Photos")
-        print(" [2] Export Curated album from Apple Photos to LaCie filesystem")
+        print(" [2] Export Curated Moment for Publishing")
         print(" [3] Record publication in the database (Mark as Published to Shutterfly/YouTube)")
         print(" [R] Restart the planner")
         print(" [E] Exit")

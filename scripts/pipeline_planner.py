@@ -978,7 +978,204 @@ def run_memory_publishing_flow(cursor=None, conn=None):
             except Exception as e:
                 logger.warning(f"Could not record threshold in history: {e}")
 
-        # Build and write Curation Threshold Status & Unassigned High-Rank Assets report to dedicated log
+        # Check if thresholds are different (using 1e-6 to avoid minor float precision issues)
+        thresholds_different = False
+        if historical_min > 0.0 and cutoff_score > 0.0:
+            thresholds_different = (abs(cutoff_score - historical_min) > 1e-6)
+
+        # Loop until threshold matches the historical minimum target
+        if thresholds_different:
+            while thresholds_different:
+                threshold_report = []
+                threshold_report.append("==================================================")
+                threshold_report.append("📊 Curation Threshold Status")
+                threshold_report.append("==================================================")
+                threshold_report.append(f" - Current dynamic threshold:  {cutoff_score:.4f}")
+                if historical_min > 0.0:
+                    threshold_report.append(f" - Historical minimum target:  {historical_min:.4f}")
+                    threshold_report.append(f"👉 Note: Please assign moments to assets in new batches until the threshold reaches {historical_min:.4f} again.")
+                threshold_report.append("==================================================\n")
+
+                if photos_db_attached:
+                    cursor.execute("""
+                        SELECT 
+                            v.original_filename, 
+                            v.score_normalized, 
+                            v.month, 
+                            v.date_created_utc,
+                            m.ZTITLE,
+                            m.ZSUBTITLE
+                        FROM ranked_assets_view v
+                        JOIN month_batches mb ON v.month = mb.month
+                        LEFT JOIN photos_db.ZASSET a ON a.ZUUID = v.asset_id
+                        LEFT JOIN photos_db.ZMOMENT m ON a.ZMOMENT = m.Z_PK
+                        WHERE mb.status_code >= '600' AND (v.MomentsAlbumName IS NULL OR v.MomentsAlbumName = '')
+                          AND v.score_normalized > 0.50
+                          AND (a.Z_PK IS NULL OR NOT EXISTS (
+                              SELECT 1 FROM photos_db.Z_30ASSETS aa
+                              JOIN photos_db.ZGENERICALBUM ga ON aa.Z_30ALBUMS = ga.Z_PK
+                              WHERE aa.Z_3ASSETS = a.Z_PK
+                                AND LOWER(ga.ZTITLE) IN ('ignore', 'skippublishing')
+                                AND ga.ZTRASHEDSTATE = 0
+                          ))
+                        ORDER BY v.score_normalized DESC
+                        LIMIT 10
+                    """)
+                else:
+                    cursor.execute("""
+                        SELECT v.original_filename, v.score_normalized, v.month, v.date_created_utc, NULL, NULL
+                        FROM ranked_assets_view v
+                        JOIN month_batches mb ON v.month = mb.month
+                        WHERE mb.status_code >= '600' AND (v.MomentsAlbumName IS NULL OR v.MomentsAlbumName = '')
+                          AND v.score_normalized > 0.50
+                        ORDER BY v.score_normalized DESC
+                        LIMIT 10
+                    """)
+
+                unassigned = cursor.fetchall()
+                if unassigned:
+                    threshold_report.append("==================================================")
+                    threshold_report.append("⚠️  Unassigned High-Rank Assets (Need Moment Naming Decision)")
+                    threshold_report.append("==================================================")
+                    threshold_report.append("The following highly-ranked assets are not assigned to any Moment album in Apple Photos:")
+                    for fname, score, month, date_created, moment_title, moment_subtitle in unassigned:
+                        captured_str = "—"
+                        if date_created:
+                            try:
+                                dt_utc = None
+                                for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                                    try:
+                                        dt_utc = datetime.strptime(date_created, fmt)
+                                        break
+                                    except ValueError:
+                                        continue
+                                if dt_utc:
+                                    dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+                                    dt_local = dt_utc.astimezone()
+                                    captured_str = dt_local.strftime("%Y-%m-%d %H:%M:%S")
+                                else:
+                                    captured_str = date_created[:19]
+                            except Exception:
+                                captured_str = date_created[:19]
+
+                        moment_parts = []
+                        if moment_title:
+                            moment_parts.append(moment_title.replace('\xa0', ' ').strip())
+                        if moment_subtitle:
+                            moment_parts.append(moment_subtitle.replace('\xa0', ' ').strip())
+
+                        suggested_info = ""
+                        if moment_parts:
+                            captured_date = captured_str[:10] if captured_str != "—" else (date_created[:10] if date_created else month)
+                            suggested_name = f"{captured_date} - {' - '.join(moment_parts)}"
+                            suggested_info = f", Suggested Album: {suggested_name}"
+
+                        threshold_report.append(f" - {fname:<25} (Score: {score:.4f}, Captured: {captured_str}, Month: {month}{suggested_info})")
+                    threshold_report.append("👉 Please consider creating a corresponding album under 'Media Organizer on LaCie / Moments' in Apple Photos (creating the album is sufficient, no need to place the files inside).\n")
+
+                print('\n' + '\n'.join(threshold_report))
+                try:
+                    with open(CURATION_THRESHOLD_LOG_PATH, 'w', encoding='utf-8') as f:
+                        f.write('\n'.join(threshold_report) + '\n')
+                except Exception as e:
+                    logger.warning(f"Could not write curation threshold log: {e}")
+
+                # Close database connection and release lock before action prompt
+                if photos_db_attached:
+                    try:
+                        cursor.execute("DETACH DATABASE photos_db")
+                    except Exception:
+                        pass
+                close_conn()
+                release_planner_lock()
+
+                print("\n--- Actions (Threshold Mismatch - Curation/Publishing Disabled) ---")
+                print(" [1] Sync proposed assets to ToBeCurated albums in Apple Photos")
+                print(" [Enter] Re-evaluate & Refresh threshold")
+                print(" [E] Exit")
+                
+                choice = input("\nSelect action [Or Press Enter to Refresh]: ").strip().lower()
+                if choice == 'e':
+                    logger.info("Exiting memory publishing flow.")
+                    return
+                elif choice == '1':
+                    acquire_planner_lock()
+                    script_dir = os.path.dirname(os.path.abspath(__file__))
+                    logger.info("Syncing proposed assets to Apple Photos...")
+                    try:
+                        subprocess.run([sys.executable, os.path.join(script_dir, "create_apple_moments_albums.py")], check=True)
+                        logger.info("Sync complete.")
+                    except subprocess.CalledProcessError as e:
+                        logger.error(f"Sync failed: {e}")
+                    release_planner_lock()
+                elif choice in ('2', '3'):
+                    print("⚠️ Curation/publishing actions are disabled because threshold is not aligned with historical minimum target.")
+                elif choice == '' or choice == 'r':
+                    # Refresh: re-acquire lock and connection
+                    acquire_planner_lock()
+                    conn = get_connection()
+                    conn.execute("PRAGMA busy_timeout = 30000")
+                    cursor = get_cursor()
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                        
+                    photos_db_attached = False
+                    try:
+                        cursor.execute(f"ATTACH DATABASE 'file:{APPLE_PHOTOS_DB_PATH}?mode=ro' AS photos_db;")
+                        photos_db_attached = True
+                    except Exception as e:
+                        logger.warning(f"Could not attach Photos.sqlite for Apple moment lookup: {e}")
+                    
+                    # Query cutoff_score again
+                    cutoff_score = 0.0
+                    if photos_db_attached:
+                        try:
+                            cursor.execute("""
+                                SELECT v.score_normalized 
+                                FROM ranked_assets_view v
+                                JOIN month_batches mb ON v.month = mb.month
+                                LEFT JOIN photos_db.ZASSET a ON a.ZUUID = v.asset_id
+                                WHERE mb.status_code >= '600' AND (v.MomentsAlbumName IS NULL OR v.MomentsAlbumName = '') 
+                                ORDER BY v.score_normalized DESC LIMIT 1
+                            """)
+                            row = cursor.fetchone()
+                            cutoff_score = row[0] if row and row[0] is not None else 0.0
+                        except Exception:
+                            pass
+                    logger.info(f"Re-evaluated Cutoff threshold score: {cutoff_score:.4f}")
+                    
+                    # Re-evaluate thresholds_different
+                    if historical_min > 0.0 and cutoff_score > 0.0:
+                        thresholds_different = (abs(cutoff_score - historical_min) > 1e-6)
+                    else:
+                        thresholds_different = False
+
+            # If the loop finished (threshold is now aligned), we restore/acquire the database lock/connection
+            # so the rest of the function can run cleanly
+            acquire_planner_lock()
+            conn = get_connection()
+            conn.execute("PRAGMA busy_timeout = 30000")
+            cursor = get_cursor()
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            photos_db_attached = False
+            try:
+                cursor.execute(f"ATTACH DATABASE 'file:{APPLE_PHOTOS_DB_PATH}?mode=ro' AS photos_db;")
+                photos_db_attached = True
+            except Exception as e:
+                logger.warning(f"Could not attach Photos.sqlite for Apple moment lookup: {e}")
+
+        # Determine effective cutoff threshold to use for selecting qualified moments in the table
+        effective_threshold = cutoff_score
+        if historical_min > 0.0:
+            effective_threshold = min(cutoff_score, historical_min) if cutoff_score > 0.0 else historical_min
+
+        # Normal Flow (Threshold Aligned)
+        # Build and write Curation Threshold Status report for aligned state
         threshold_report = []
         threshold_report.append("==================================================")
         threshold_report.append("📊 Curation Threshold Status")
@@ -986,100 +1183,20 @@ def run_memory_publishing_flow(cursor=None, conn=None):
         threshold_report.append(f" - Current dynamic threshold:  {cutoff_score:.4f}")
         if historical_min > 0.0:
             threshold_report.append(f" - Historical minimum target:  {historical_min:.4f}")
-            if cutoff_score > historical_min:
-                threshold_report.append(f"👉 Note: Please assign moments to assets in new batches until the threshold reaches {historical_min:.4f} again.")
-            else:
-                threshold_report.append("🎉 Threshold aligned! Current threshold matches or is below historical minimum.")
+            threshold_report.append("🎉 Threshold aligned! Current threshold matches or is below historical minimum.")
         else:
             threshold_report.append(" - Historical minimum target:  None (No history recorded yet)")
-            threshold_report.append("👉 Note: Once you begin assigning moments, the lowest dynamic threshold reached will be tracked.")
         threshold_report.append("==================================================\n")
+        
+        print('\n' + '\n'.join(threshold_report))
+        try:
+            with open(CURATION_THRESHOLD_LOG_PATH, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(threshold_report) + '\n')
+        except Exception as e:
+            logger.warning(f"Could not write curation threshold log: {e}")
 
-        # Determine effective cutoff threshold to use for selecting qualified moments in the table
-        effective_threshold = cutoff_score
-        if historical_min > 0.0:
-            effective_threshold = min(cutoff_score, historical_min) if cutoff_score > 0.0 else historical_min
-
-        # Check for highly ranked assets that do not belong to any Moment in Apple Photos (excluding Ignore items)
-        if photos_db_attached:
-            cursor.execute("""
-                SELECT 
-                    v.original_filename, 
-                    v.score_normalized, 
-                    v.month, 
-                    v.date_created_utc,
-                    m.ZTITLE,
-                    m.ZSUBTITLE
-                FROM ranked_assets_view v
-                JOIN month_batches mb ON v.month = mb.month
-                LEFT JOIN photos_db.ZASSET a ON a.ZUUID = v.asset_id
-                LEFT JOIN photos_db.ZMOMENT m ON a.ZMOMENT = m.Z_PK
-                WHERE mb.status_code >= '600' AND (v.MomentsAlbumName IS NULL OR v.MomentsAlbumName = '')
-                  AND v.score_normalized > 0.50
-                  AND (a.Z_PK IS NULL OR NOT EXISTS (
-                      SELECT 1 FROM photos_db.Z_30ASSETS aa
-                      JOIN photos_db.ZGENERICALBUM ga ON aa.Z_30ALBUMS = ga.Z_PK
-                      WHERE aa.Z_3ASSETS = a.Z_PK
-                        AND LOWER(ga.ZTITLE) IN ('ignore', 'skippublishing')
-                        AND ga.ZTRASHEDSTATE = 0
-                  ))
-                ORDER BY v.score_normalized DESC
-                LIMIT 10
-            """)
-        else:
-            cursor.execute("""
-                SELECT v.original_filename, v.score_normalized, v.month, v.date_created_utc, NULL, NULL
-                FROM ranked_assets_view v
-                JOIN month_batches mb ON v.month = mb.month
-                WHERE mb.status_code >= '600' AND (v.MomentsAlbumName IS NULL OR v.MomentsAlbumName = '')
-                  AND v.score_normalized > 0.50
-                ORDER BY v.score_normalized DESC
-                LIMIT 10
-            """)
-
-        unassigned = cursor.fetchall()
-
-        if unassigned:
-            threshold_report.append("==================================================")
-            threshold_report.append("⚠️  Unassigned High-Rank Assets (Need Moment Naming Decision)")
-            threshold_report.append("==================================================")
-            threshold_report.append("The following highly-ranked assets are not assigned to any Moment album in Apple Photos:")
-            for fname, score, month, date_created, moment_title, moment_subtitle in unassigned:
-                captured_str = "—"
-                if date_created:
-                    try:
-                        dt_utc = None
-                        for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
-                            try:
-                                dt_utc = datetime.strptime(date_created, fmt)
-                                break
-                            except ValueError:
-                                continue
-                        if dt_utc:
-                            dt_utc = dt_utc.replace(tzinfo=timezone.utc)
-                            dt_local = dt_utc.astimezone()
-                            captured_str = dt_local.strftime("%Y-%m-%d %H:%M:%S")
-                        else:
-                            captured_str = date_created[:19]
-                    except Exception:
-                        captured_str = date_created[:19]
-
-                moment_parts = []
-                if moment_title:
-                    moment_parts.append(moment_title.replace('\xa0', ' ').strip())
-                if moment_subtitle:
-                    moment_parts.append(moment_subtitle.replace('\xa0', ' ').strip())
-
-                suggested_info = ""
-                if moment_parts:
-                    captured_date = captured_str[:10] if captured_str != "—" else (date_created[:10] if date_created else month)
-                    suggested_name = f"{captured_date} - {' - '.join(moment_parts)}"
-                    suggested_info = f", Suggested Album: {suggested_name}"
-
-                threshold_report.append(f" - {fname:<25} (Score: {score:.4f}, Captured: {captured_str}, Month: {month}{suggested_info})")
-            threshold_report.append("👉 Please consider creating a corresponding album under 'Media Organizer on LaCie / Moments' in Apple Photos (creating the album is sufficient, no need to place the files inside).\n")
-
-        # Query published moments / folders with stats
+        # Query published moments / folders with stats (only when aligned)
+        published_moments_report = []
         cursor.execute("""
             SELECT 
                 p.moment_name,
@@ -1103,10 +1220,9 @@ def run_memory_publishing_flow(cursor=None, conn=None):
         """)
         published_folders = cursor.fetchall()
 
-        published_moments_report = []
-        published_moments_report.append("==================================================================================================================================")
+        published_moments_report.append("================================================--------------------------------------------------------------------------------")
         published_moments_report.append("🌟 Published Moments / Folders & Stats")
-        published_moments_report.append("==================================================================================================================================")
+        published_moments_report.append("================================================--------------------------------------------------------------------------------")
         if not published_folders:
             published_moments_report.append("ℹ️  No published moments recorded yet in database.\n")
         else:
@@ -1147,23 +1263,13 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                 date_rng = f"{d_min} to {d_max}" if d_min != d_max else d_min
                 c_srcs = (p_row[8] or "Unknown").replace(',', ', ')
                 published_moments_report.append(f"{idx:<4} {p_name:<30} {p_date_str:<22} {p_count:<8} {p_avg:<11} {score_rng:<17} {date_rng:<24} {c_srcs}")
-            published_moments_report.append("==================================================================================================================================\n")
+            published_moments_report.append("================================================--------------------------------------------------------------------------------\n")
 
-        # Save to logs/curation_threshold_status.log and print to console
-        try:
-            with open(CURATION_THRESHOLD_LOG_PATH, 'w', encoding='utf-8') as f:
-                f.write('\n'.join(threshold_report) + '\n')
-        except Exception as e:
-            logger.warning(f"Could not write curation threshold log: {e}")
-
-        # Save to logs/published_moments_stats.log
         try:
             with open(PUBLISHED_MOMENTS_LOG_PATH, 'w', encoding='utf-8') as f:
                 f.write('\n'.join(published_moments_report) + '\n')
         except Exception as e:
             logger.warning(f"Could not write published moments stats log: {e}")
-
-        print('\n' + '\n'.join(threshold_report))
 
         # 2. Query assets that have Moments and are in status >= 600
         if photos_db_attached:
@@ -1380,11 +1486,15 @@ def run_memory_publishing_flow(cursor=None, conn=None):
             stage = stages.get(name, 'M100')
             
             # Check Apple Photos existence
-            to_be_curated_exists = (name in to_be_curated_albums)
-            curated_exists = (name in curated_albums)
+            name_stripped = name.strip()
+            to_be_curated_exists = (name_stripped in to_be_curated_albums)
+            curated_exists = (name_stripped in curated_albums)
             
             # Check filesystem curated directory existence
-            fs_curated_exists = os.path.exists(os.path.join(CURATED_LACIE_DIR, name))
+            fs_curated_path_orig = os.path.join(CURATED_LACIE_DIR, name)
+            fs_curated_path_strip = os.path.join(CURATED_LACIE_DIR, name_stripped)
+            fs_curated_exists = os.path.exists(fs_curated_path_orig) or os.path.exists(fs_curated_path_strip)
+            fs_curated_path = fs_curated_path_orig if os.path.exists(fs_curated_path_orig) else fs_curated_path_strip
             
             # Count-weighted rank score to prevent small/single-asset moments from dominating
             rank_score = avg_score * math.log(data['total_qualified'] + 1)
@@ -1441,7 +1551,6 @@ def run_memory_publishing_flow(cursor=None, conn=None):
             
             # Determine asset count to display (use filesystem count if curated folder exists,
             # fallback to database curated count if present, otherwise total qualified proposed assets)
-            fs_curated_path = os.path.join(CURATED_LACIE_DIR, name)
             fs_count = 0
             fs_bases = set()
             if os.path.exists(fs_curated_path):
@@ -1457,9 +1566,9 @@ def run_memory_publishing_flow(cursor=None, conn=None):
 
             if fs_count > 0:
                 assets_display = str(fs_count)
-            elif name in curated_albums:
+            elif name_stripped in curated_albums:
                 # Use count from Apple Photos Curated album if available (before filesystem export)
-                assets_display = str(curated_albums[name])
+                assets_display = str(curated_albums[name_stripped])
             elif data['curated_count'] > 0:
                 assets_display = str(data['curated_count'])
             else:
@@ -1479,9 +1588,10 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                             JOIN photos_db.ZASSET a ON aa.Z_3ASSETS = a.Z_PK
                             JOIN photos_db.ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK
                             LEFT JOIN photos_db.ZGENERICALBUM p ON ga.ZPARENTFOLDER = p.Z_PK
-                            WHERE ga.ZTITLE = ? AND ga.ZTRASHEDSTATE = 0 AND ga.ZKIND <> 1507
+                            WHERE (ga.ZTITLE = ? OR ga.ZTITLE = ?) AND ga.ZTRASHEDSTATE = 0 AND ga.ZKIND <> 1507
                               AND p.ZTITLE = 'Curated'
-                        """, (name,))
+                              AND a.ZTRASHEDSTATE = 0
+                        """, (name, name_stripped))
                         photos_bases = set(os.path.splitext(row[0])[0].lower() for row in cursor.fetchall() if row[0])
                     except Exception as e:
                         logger.warning(f"Error querying Photos curated album assets for {name}: {e}")
@@ -1498,6 +1608,20 @@ def run_memory_publishing_flow(cursor=None, conn=None):
             elif not curated_exists and fs_curated_exists:
                 curated_str = "📁 Local Only"
 
+            # Calculate display stage based on current status
+            if stage == 'M500' or (pub_count >= data['total_qualified'] and data['total_qualified'] > 0):
+                display_stage = 'M500'
+            elif stage == 'M450' or pub_count > 0:
+                display_stage = 'M450'
+            elif stage == 'M400' or fs_curated_exists:
+                display_stage = 'M400'
+            elif curated_exists:
+                display_stage = 'M300'
+            elif to_be_curated_exists:
+                display_stage = 'M200'
+            else:
+                display_stage = 'M100'
+
             pub_display = str(pub_count) if pub_count > 0 else "—"
             pub_avg_str = f"{pub_avg:.4f}" if pub_avg is not None else "—"
             pub_range_str = f"{pub_min:.4f} - {pub_max:.4f}" if pub_min is not None else "—"
@@ -1512,6 +1636,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                 'max_score': max(target_scores) if target_scores else 0.0,
                 'rank_score': rank_score,
                 'stage': stage,
+                'display_stage': display_stage,
                 'to_be_curated_exists': to_be_curated_exists,
                 'curated_exists': curated_exists,
                 'fs_curated_exists': fs_curated_exists,
@@ -1540,7 +1665,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
             x['rank_score'] if ((x['proposed_count'] + x['curated_count']) < x['total_qualified']) else x['avg_score']
         ), reverse=True)
 
-        header_m = f"{'No.':<4} {'Moment Name':<30} {'Rank Score':<12} {'Avg Score':<10} {'Min Score':<10} {'Max Score':<10} {'Assets':<8} {'Pub.':<6} {'Pub. Avg':<10} {'Pub. Range':<17} {'ToBeCurated?':<13} {'Curated?':<15} {'Published?':<13} {'Can Publish?':<18} {'Last Published':<18}"
+        header_m = f"{'No.':<4} {'Moment Name':<30} {'Status':<8} {'Rank Score':<12} {'Avg Score':<10} {'Min Score':<10} {'Max Score':<10} {'Assets':<8} {'Pub.':<6} {'Pub. Avg':<10} {'Pub. Range':<17} {'ToBeCurated?':<13} {'Curated?':<15} {'Published?':<13} {'Can Publish?':<18} {'Last Published':<18}"
         print(header_m)
         print("-" * len(header_m))
         divider_printed = False
@@ -1569,7 +1694,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
             m_name_raw = m['name'] or "—"
             m_name = m_name_raw[:26] + "..." if len(m_name_raw) > 29 else m_name_raw
 
-            print(f"{idx:<4} {m_name:<30} {m['rank_score']:<12.4f} {m['avg_score']:<10.4f} {m['min_score']:<10.4f} {m['max_score']:<10.4f} {m['assets_display']:<8} {m['pub_display']:<6} {m['pub_avg_str']:<10} {m['pub_range_str']:<17} {to_be_curated_str:<13} {curated_str:<15} {published_str:<13} {m['can_publish_str']:<18} {m['last_pub_str']:<18}")
+            print(f"{idx:<4} {m_name:<30} {m['display_stage']:<8} {m['rank_score']:<12.4f} {m['avg_score']:<10.4f} {m['min_score']:<10.4f} {m['max_score']:<10.4f} {m['assets_display']:<8} {m['pub_display']:<6} {m['pub_avg_str']:<10} {m['pub_range_str']:<17} {to_be_curated_str:<13} {curated_str:<15} {published_str:<13} {m['can_publish_str']:<18} {m['last_pub_str']:<18}")
 
         # Build timeline map of moments to find closest merge suggestions for disjoint moments
         cursor.execute("""
@@ -1864,6 +1989,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                         LEFT JOIN ranked_assets_view v ON v.asset_id = a.asset_id
                         WHERE ga.ZTITLE = 'Google Upload Skipped Videos'
                           AND ga.ZTRASHEDSTATE = 0
+                          AND za.ZTRASHEDSTATE = 0
                         ORDER BY v.score_normalized DESC NULLS LAST
                         LIMIT 15
                     """)
@@ -2110,7 +2236,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                     
                     # Calculate new stage
                     total_pub_after = len(already_published) + len(target_assets)
-                    new_stage = 'M500' if total_pub_after >= len(curated_assets_info) else 'M400'
+                    new_stage = 'M500' if total_pub_after >= len(curated_assets_info) else ('M450' if total_pub_after > 0 else 'M400')
 
                     cursor.execute("""
                         INSERT INTO curated_moments (moment_name, memory_stage)

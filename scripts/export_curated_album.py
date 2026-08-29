@@ -192,7 +192,7 @@ def main():
                 curated_count = excluded.curated_count,
                 photos_curated_exists = 1,
                 last_curated_sync = excluded.last_curated_sync,
-                memory_stage = CASE WHEN memory_stage = 'M500' THEN 'M500' ELSE 'M400' END
+                memory_stage = CASE WHEN memory_stage IN ('M500', 'M450') THEN memory_stage ELSE 'M400' END
         """, (moment_name, len(asset_ids)))
 
         conn.commit()

@@ -251,6 +251,7 @@ This is an independent workflow focused on curating and publishing specific even
 - **M200 - Sync Proposed**: Pipeline runs AppleScript to sync proposed ranked assets from Apple Photos to the `ToBeCurated/[MomentName]` folder.
 - **M300 - Curating**: User manually selects assets inside Apple Photos and copies them to the `Curated/[MomentName]` folder.
 - **M400 - Exported**: Pipeline runs `export_curated_album.py` to copy Apple Photos `Curated` assets to the filesystem curated directory `/Volumes/LaCie/Media Organizer/Curated/[MomentName]`.
-- **M500 - Published**: User uploads the curated assets to Shutterfly, and the publication is tracked in the database.
+- **M450 - Partially Published**: Some curated assets have been successfully published/uploaded to Shutterfly/YouTube and recorded in the database, but others remain unpublished.
+- **M500 - Published**: User uploads all the curated assets to Shutterfly, and the publication is tracked in the database.
 
 To manage memories, run `python3 scripts/pipeline_planner.py` and select `[M]`.

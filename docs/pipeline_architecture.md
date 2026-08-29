@@ -68,25 +68,48 @@ flowchart TD
 ### Track 2: Memory Feature & Publishing (Weekly Moments Workflow)
 This track operates independently and uses the ranked/scored assets from Track 1 to suggest, curate, and publish event-based memories.
 
+#### Dynamic Threshold Alignment Split:
+* **Threshold Mismatch (Different)**: If the current dynamic threshold differs from the historical minimum target:
+  * The system hides curation/publishing recommendations, the ranked moments table, skipped videos, and filesystem syncing.
+  * The **⚠️ Unassigned High-Rank Assets** table is shown to suggest moment names for unassigned assets.
+  * The user is only allowed to perform action `[1] Sync proposed assets to ToBeCurated albums` (along with `[R]` and `[E]`). Curation export `[2]` and publishing `[3]` actions are blocked.
+* **Threshold Aligned (Equal)**: If the current dynamic threshold matches the historical minimum target:
+  * The system displays all tables, recommendations, skipped videos, and runs recommendation syncing.
+  * The **⚠️ Unassigned High-Rank Assets** table is hidden to keep the display clean.
+  * The user has full access to curation export `[2]` and publishing `[3]` actions.
+
 ```mermaid
 flowchart TD
     classDef state fill:#1e1e2e,stroke:#cdd6f4,stroke-width:1px,color:#cdd6f4;
     classDef action fill:#313244,stroke:#a6adc8,stroke-width:1px,color:#cdd6f4;
     classDef prompt fill:#f9e2af,stroke:#fab387,stroke-width:1.5px,color:#11111b;
+    classDef decision fill:#45475a,stroke:#f9e2af,stroke-width:1px,color:#f9e2af;
     
-    Start([Start Weekly Curation]) --> T2_M100["M100: Candidate Moment Identified\n(Suggested by rank score)"]:::state
+    Start([Start Weekly Curation]) --> Dec_Threshold{"Current Dynamic Threshold<br/>aligned with Historical Target?"}:::decision
     
-    T2_M100 --> Act_Sync["create_apple_moments_albums.py\n(Creates ToBeCurated album)"]:::action
+    Dec_Threshold -- "Yes (No Mismatch)" --> T2_ShowAll["Show all tables & recommendations<br/>Sync files to Recommendation folder<br/>(Hide Unassigned Assets table)"]:::action
+    Dec_Threshold -- "No (Mismatch)" --> T2_Limited["Hide curation/publishing tables<br/>Show Unassigned High-Rank Assets table"]:::action
+    
+    T2_Limited --> Act_Limited_Actions["👤 User Actions:<br/>Sync Proposed OR Name Moments in Apple Photos"]:::prompt
+    Act_Limited_Actions --> Prompt_Refresh{"Refresh / Re-evaluate?"}:::decision
+    Prompt_Refresh -- "Yes (Press Enter)" --> Dec_Threshold
+    Prompt_Refresh -- "No / Exit" --> Exit_Flow([Exit Memory Flow])
+    
+    T2_ShowAll --> Act_Sync["create_apple_moments_albums.py<br/>(Creates ToBeCurated album)"]:::action
+    
     Act_Sync --> T2_M200["M200: Sync Proposed to Apple Photos"]:::state
-    
     T2_M200 --> Act_Manual["👤 User Action:<br/>Curate photos in Apple Photos<br/>(Copy selection to Curated album)"]:::prompt
     Act_Manual --> T2_M300["M300: Manual Curation Completed"]:::state
     
-    T2_M300 --> Act_Export["export_curated_album.py\n(Exports to LaCie folder)"]:::action
-    Act_Export --> T2_M400["M400: Curated folder exported locally"]:::state
+    T2_M300 --> Dec_Threshold_Curated{"Threshold aligned?"}:::decision
+    Dec_Threshold_Curated -- "Yes" --> Act_Export["export_curated_album.py<br/>(Exports to LaCie folder)"]:::action
+    Dec_Threshold_Curated -- "No" --> Block_Curation["⚠️ Curation/Export & Publishing Blocked"]:::state
     
+    Act_Export --> T2_M400["M400: Curated folder exported locally"]:::state
     T2_M400 --> Prompt_Publish["👤 User Prompt:<br/>Published to Shutterfly/YouTube?"]:::prompt
-    Prompt_Publish -- "Yes" --> T2_M500["M500: Curated Moment Published"]:::state
+    Prompt_Publish -- "Partially" --> T2_M450["M450: Partially Published"]:::state
+    Prompt_Publish -- "Fully" --> T2_M500["M500: Curated Moment Published"]:::state
+    T2_M450 --> Prompt_Publish
     Prompt_Publish -- "No" --> T2_M400
 ```
 

@@ -1475,9 +1475,9 @@ def run_memory_publishing_flow(cursor=None, conn=None):
         }
 
         # 5. Format and display status report
-        print("\n==================================================")
-        print("🌟 Weekly Memory Feature & Publishing (Mode [M])")
-        print("==================================================")
+        print("\n=========================================================================================================")
+        print("🌟 Moments Pending Curation (Need folder created in Curated)")
+        print("=========================================================================================================")
         
         ranked_moments = []
         for name, data in moments_data.items():

@@ -71,7 +71,7 @@ This track operates independently and uses the ranked/scored assets from Track 1
 #### Dynamic Threshold Alignment Split:
 * **Threshold Mismatch (Different)**: If the current dynamic threshold differs from the historical minimum target:
   * The system hides curation/publishing recommendations, the ranked moments table, skipped videos, and filesystem syncing.
-  * The **⚠️ Unassigned High-Rank Assets** table is shown to suggest moment names for unassigned assets.
+  * The **⚠️ Unassigned High-Rank Assets** table is shown to guide the user to **Assign Moment for Assets**.
   * The user is only allowed to perform action `[1] Sync proposed assets to ToBeCurated albums` (along with `[R]` and `[E]`). Curation export `[2]` and publishing `[3]` actions are blocked.
 * **Threshold Aligned (Equal)**: If the current dynamic threshold matches the historical minimum target:
   * The system displays all tables, recommendations, skipped videos, and runs recommendation syncing.
@@ -90,8 +90,8 @@ flowchart TD
     Dec_Threshold -- "Yes (No Mismatch)" --> T2_ShowAll["Show all tables & recommendations<br/>Sync files to Recommendation folder<br/>(Hide Unassigned Assets table)"]:::action
     Dec_Threshold -- "No (Mismatch)" --> T2_Limited["Hide curation/publishing tables<br/>Show Unassigned High-Rank Assets table"]:::action
     
-    T2_Limited --> Act_Limited_Actions["👤 User Actions:<br/>Sync Proposed OR Name Moments in Apple Photos"]:::prompt
-    Act_Limited_Actions --> Prompt_Refresh{"Refresh / Re-evaluate?"}:::decision
+    T2_Limited --> Act_Assign_Moments["👤 User Action:<br/>Assign Moment for Assets"]:::prompt
+    Act_Assign_Moments --> Prompt_Refresh{"Refresh / Re-evaluate?"}:::decision
     Prompt_Refresh -- "Yes (Press Enter)" --> Dec_Threshold
     Prompt_Refresh -- "No / Exit" --> Exit_Flow([Exit Memory Flow])
     
@@ -103,7 +103,8 @@ flowchart TD
     
     T2_M300 --> Dec_Threshold_Curated{"Threshold aligned?"}:::decision
     Dec_Threshold_Curated -- "Yes" --> Act_Export["export_curated_album.py<br/>(Exports to LaCie folder)"]:::action
-    Dec_Threshold_Curated -- "No" --> Block_Curation["⚠️ Curation/Export & Publishing Blocked"]:::state
+    Dec_Threshold_Curated -- "No" --> Act_Assign_Moments_Curated["👤 User Action:<br/>Assign Moment for Assets"]:::prompt
+    Act_Assign_Moments_Curated --> T2_M300
     
     Act_Export --> T2_M400["M400: Curated folder exported locally"]:::state
     T2_M400 --> Prompt_Publish["👤 User Prompt:<br/>Published to Shutterfly/YouTube?"]:::prompt

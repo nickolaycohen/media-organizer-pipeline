@@ -1989,8 +1989,48 @@ def run_memory_publishing_flow(cursor=None, conn=None):
             print("==================================================================================================================================================================\n")
 
             # Display Curated Moments Pending Publishing Table
-            pending_publishing_moments = [m for m in ranked_moments if m['display_stage'] in ('M400', 'M450')]
-            pending_publishing_moments.sort(key=lambda x: x['avg_score'], reverse=True)
+            pending_publishing_moments = []
+            raw_pending_moments = [m for m in ranked_moments if m['display_stage'] in ('M400', 'M450')]
+            
+            for m in raw_pending_moments:
+                curated = m['curated_count']
+                published = m['pub_count']
+                pending = curated - published
+                if pending < 9:
+                    propose = pending
+                else:
+                    propose = min(9, math.ceil(pending / 4))
+                
+                # Fetch scores of curated assets pending publishing
+                cursor.execute("""
+                    SELECT v.score_normalized 
+                    FROM moment_exports me
+                    JOIN ranked_assets_view v ON me.asset_id = v.asset_id 
+                    WHERE (me.album_name = ? OR me.album_name = ?)
+                      AND me.curation_stage = 'curated'
+                      AND me.asset_id NOT IN (SELECT asset_id FROM publications)
+                    ORDER BY v.score_normalized DESC
+                    LIMIT ?
+                """, (m['name'], m['name'].strip(), propose))
+                pending_scores = [r[0] for r in cursor.fetchall() if r[0] is not None]
+                avg_proposed = sum(pending_scores) / len(pending_scores) if pending_scores else 0.0
+                min_proposed = min(pending_scores) if pending_scores else 0.0
+                max_proposed = max(pending_scores) if pending_scores else 0.0
+                
+                pending_publishing_moments.append({
+                    'moment': m,
+                    'curated': curated,
+                    'published': published,
+                    'pending': pending,
+                    'propose': propose,
+                    'pending_scores': pending_scores,
+                    'avg_proposed': avg_proposed,
+                    'min_proposed': min_proposed,
+                    'max_proposed': max_proposed
+                })
+                
+            # Sort by avg_proposed descending
+            pending_publishing_moments.sort(key=lambda x: x['avg_proposed'], reverse=True)
 
             if pending_publishing_moments:
                 start_idx_pp = len(console_moments) + 1
@@ -2000,22 +2040,30 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                 print("==================================================================================================================================================================")
                 print("🌟 Curated Moments Pending Publishing")
                 print("==================================================================================================================================================================")
-                print(f"{'No.':<4} {'Moment Name':<30} {'Status':<8} {'Avg Score':<10} {'Min Score':<10} {'Max Score':<10} {'Curated':<8} {'Published':<10} {'Pending':<8} {'Propose Next Publishing'}")
+                print(f"{'No.':<4} {'Moment Name':<30} {'Status':<8} {'Avg Score':<10} {'Min Score':<10} {'Max Score':<10} {'Curated':<8} {'Published':<10} {'Pending':<8} {'Propose Next Publishing':<24} {'Proposed Asset Scores'}")
                 print("-" * 168)
-                for p_idx, m in enumerate(pending_publishing_moments, start_idx_pp):
+                for p_idx, entry in enumerate(pending_publishing_moments, start_idx_pp):
+                    m = entry['moment']
                     displayed_moments_map[p_idx] = {'name': m['name'], 'type': 'pending_publishing'}
-                    curated = m['curated_count']
-                    published = m['pub_count']
-                    pending = curated - published
+                    curated = entry['curated']
+                    published = entry['published']
+                    pending = entry['pending']
+                    propose = entry['propose']
+                    pending_scores = entry['pending_scores']
+                    avg_proposed = entry['avg_proposed']
+                    min_proposed = entry['min_proposed']
+                    max_proposed = entry['max_proposed']
+                    
                     if pending < 9:
                         propose_str = f"All ({pending})"
                     else:
-                        propose = min(9, math.ceil(pending / 4))
                         propose_str = f"{propose} (1/4 of {pending})"
+                    
+                    scores_str = ", ".join(f"{s:.4f}" for s in pending_scores) if pending_scores else "—"
                     
                     m_name_raw = m['name'] or "—"
                     m_name = m_name_raw[:26] + "..." if len(m_name_raw) > 29 else m_name_raw
-                    print(f"{p_idx:<4} {m_name:<30} {m['display_stage']:<8} {m['avg_score']:<10.4f} {m['min_score']:<10.4f} {m['max_score']:<10.4f} {curated:<8} {published:<10} {pending:<8} {propose_str}")
+                    print(f"{p_idx:<4} {m_name:<30} {m['display_stage']:<8} {avg_proposed:<10.4f} {min_proposed:<10.4f} {max_proposed:<10.4f} {curated:<8} {published:<10} {pending:<8} {propose_str:<24} {scores_str}")
                 print("==================================================================================================================================================================\n")
 
             # Display Skipped Videos Table

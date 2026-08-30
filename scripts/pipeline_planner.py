@@ -2025,22 +2025,44 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                     'avg_proposed': avg_proposed
                 })
                 
-            # Sort by avg_proposed descending
-            pending_publishing_moments.sort(key=lambda x: x['avg_proposed'], reverse=True)
+            # Separate into Actionable and Disjoint groups
+            actionable_pending = [x for x in pending_publishing_moments if x['moment']['total_qualified'] >= 2]
+            disjoint_pending = [x for x in pending_publishing_moments if x['moment']['total_qualified'] < 2]
 
-            if pending_publishing_moments:
+            # Sort both lists by avg_proposed descending
+            actionable_pending.sort(key=lambda x: x['avg_proposed'], reverse=True)
+            disjoint_pending.sort(key=lambda x: x['avg_proposed'], reverse=True)
+
+            # Limit to top 20 of each
+            top_actionable_pending = actionable_pending[:20]
+            top_disjoint_pending = disjoint_pending[:20]
+
+            # Combine them for the print iteration
+            combined_pending_display = top_actionable_pending + top_disjoint_pending
+
+            if combined_pending_display:
                 start_idx_pp = len(console_moments) + 1
                 if top_recommendations:
                     start_idx_pp += len(top_recommendations)
 
                 print("==================================================================================================================================================================")
-                print("🌟 Curated Moments Pending Publishing")
+                print("🌟 Curated Moments Pending Publishing (Top 20 Actionable & Top 20 Disjoint Candidates)")
                 print("==================================================================================================================================================================")
                 print(f"{'No.':<4} {'Moment Name':<30} {'Status':<8} {'Avg Score':<10} {'Curated':<8} {'Published':<10} {'Pending':<8} {'Can Publish?':<15} {'Propose Next Publishing':<24} {'Proposed Asset Scores'}")
                 print("-" * 168)
-                for p_idx, entry in enumerate(pending_publishing_moments, start_idx_pp):
+                
+                divider_printed = False
+                for p_idx, entry in enumerate(combined_pending_display, start_idx_pp):
                     m = entry['moment']
                     displayed_moments_map[p_idx] = {'name': m['name'], 'type': 'pending_publishing'}
+                    
+                    # Print divider if we hit disjoint moments
+                    if m['total_qualified'] < 2 and not divider_printed:
+                        print("-" * 168)
+                        print(f"--- Disjoint Moments (Need Merge) " + "-" * 134)
+                        print("-" * 168)
+                        divider_printed = True
+                        
                     curated = entry['curated']
                     published = entry['published']
                     pending = entry['pending']

@@ -58,9 +58,21 @@ def get_stage_transitions(cursor):
 
 def get_batch_statuses(cursor):
     cursor.execute("""
-        SELECT month, status_code
-        FROM month_batches
-        ORDER BY month DESC
+        SELECT 
+            mb.month, 
+            mb.status_code,
+            COALESCE(a.total_assets, 0) as total_assets,
+            COALESCE(a.fav_assets, 0) as fav_assets
+        FROM month_batches mb
+        LEFT JOIN (
+            SELECT 
+                month, 
+                COUNT(*) as total_assets,
+                SUM(CASE WHEN google_favorite = 1 THEN 1 ELSE 0 END) as fav_assets
+            FROM assets
+            GROUP BY month
+        ) a ON mb.month = a.month
+        ORDER BY mb.month DESC
     """)
     return cursor.fetchall()
 

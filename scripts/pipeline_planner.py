@@ -841,8 +841,18 @@ def display_summary(transitions, batches, cursor, remote_favs_cache=None):
         print(f"{prev} ➜ {code}: {desc} (Type: {ttype})")
 
     print("\n=== 📦 Batch Statuses ===")
-    for month, status in batches:
-        print(f"Month: {month}, Status: {status}")
+    header_b = f"{'Month':<10} {'Status':<8} {'Assets':<8} {'Favorites':<10}"
+    print(header_b)
+    print("-" * len(header_b))
+    for row in batches:
+        if len(row) == 4:
+            month, status, total_assets, fav_assets = row
+            assets_str = str(total_assets) if total_assets > 0 else "—"
+            fav_str = str(fav_assets) if fav_assets > 0 else "—"
+            print(f"{month:<10} {status:<8} {assets_str:<8} {fav_str:<10}")
+        else:
+            month, status = row[:2]
+            print(f"{month:<10} {status:<8}")
 
     if remote_favs_cache:
         # Build a lookup of (filename, timestamp) -> local batch month
@@ -2821,7 +2831,7 @@ def main(auto_apply, no_sync=False):
 
     # Proactive check for new month readiness
     if batches:
-        latest_month_str, latest_status = batches[0]  # Ordered DESC
+        latest_month_str, latest_status = batches[0][:2]  # Ordered DESC
         if str(latest_status) >= '600':
             now = datetime.now()
             current_month_str = now.strftime('%Y-%m')
@@ -2851,7 +2861,7 @@ def main(auto_apply, no_sync=False):
 
     for month in months_descending:
         month_status = None
-        for m, s in batches:
+        for m, s in [b[:2] for b in batches]:
             if m == month:
                 month_status = s
                 break
@@ -3052,7 +3062,7 @@ def main(auto_apply, no_sync=False):
                 logger.warning(f"⚠️ Insufficient space for {month}. Free: {human_readable_size(free_space)}, Need: {human_readable_size(remaining_to_upload)}.")
                 
                 # Branch and suggest cleanup for months at stage 600
-                cleanup_candidates = [m for m, s in batches if str(s) == '600']
+                cleanup_candidates = [m for m, s in [b[:2] for b in batches] if str(s) == '600']
                 if cleanup_candidates:
                     logger.info(f"💡 Suggestion: Drive cleanup available for processed months: {', '.join(cleanup_candidates)}")
                     for m_c, t_c in pipeline_candidates:

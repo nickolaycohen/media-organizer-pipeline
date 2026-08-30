@@ -841,15 +841,17 @@ def display_summary(transitions, batches, cursor, remote_favs_cache=None):
         print(f"{prev} ➜ {code}: {desc} (Type: {ttype})")
 
     print("\n=== 📦 Batch Statuses ===")
-    header_b = f"{'Month':<10} {'Status':<8} {'Assets':<8} {'Favorites':<10}"
+    header_b = f"{'Month':<10} {'Status':<8} {'Assets':<8} {'Favorites':<10} {'Fav. Synced':<12}"
     print(header_b)
     print("-" * len(header_b))
     for row in batches:
-        if len(row) == 4:
-            month, status, total_assets, fav_assets = row
+        if len(row) >= 4:
+            month, status, total_assets, fav_assets = row[:4]
+            fav_synced = row[4] if len(row) > 4 else None
             assets_str = str(total_assets) if total_assets > 0 else "—"
             fav_str = str(fav_assets) if fav_assets > 0 else "—"
-            print(f"{month:<10} {status:<8} {assets_str:<8} {fav_str:<10}")
+            synced_str = fav_synced[:10] if fav_synced else "—"
+            print(f"{month:<10} {status:<8} {assets_str:<8} {fav_str:<10} {synced_str:<12}")
         else:
             month, status = row[:2]
             print(f"{month:<10} {status:<8}")

@@ -62,13 +62,15 @@ def get_batch_statuses(cursor):
             mb.month, 
             mb.status_code,
             COALESCE(a.total_assets, 0) as total_assets,
-            COALESCE(a.fav_assets, 0) as fav_assets
+            COALESCE(a.fav_assets, 0) as fav_assets,
+            a.max_updated as fav_synced
         FROM month_batches mb
         LEFT JOIN (
             SELECT 
                 month, 
                 COUNT(*) as total_assets,
-                SUM(CASE WHEN google_favorite = 1 THEN 1 ELSE 0 END) as fav_assets
+                SUM(CASE WHEN google_favorite = 1 THEN 1 ELSE 0 END) as fav_assets,
+                MAX(CASE WHEN google_favorite = 1 THEN updated_at_utc END) as max_updated
             FROM assets
             GROUP BY month
         ) a ON mb.month = a.month

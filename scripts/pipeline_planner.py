@@ -2000,7 +2000,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                 print("==================================================================================================================================================================")
                 print("🌟 Curated Moments Pending Publishing")
                 print("==================================================================================================================================================================")
-                print(f"{'No.':<4} {'Moment Name':<30} {'Status':<8} {'Avg Score':<10} {'Curated':<8} {'Published':<10} {'Pending':<8} {'Propose Next Publishing'}")
+                print(f"{'No.':<4} {'Moment Name':<30} {'Status':<8} {'Avg Score':<10} {'Min Score':<10} {'Max Score':<10} {'Curated':<8} {'Published':<10} {'Pending':<8} {'Propose Next Publishing'}")
                 print("-" * 168)
                 for p_idx, m in enumerate(pending_publishing_moments, start_idx_pp):
                     displayed_moments_map[p_idx] = {'name': m['name'], 'type': 'pending_publishing'}
@@ -2015,7 +2015,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                     
                     m_name_raw = m['name'] or "—"
                     m_name = m_name_raw[:26] + "..." if len(m_name_raw) > 29 else m_name_raw
-                    print(f"{p_idx:<4} {m_name:<30} {m['display_stage']:<8} {m['avg_score']:<10.4f} {curated:<8} {published:<10} {pending:<8} {propose_str}")
+                    print(f"{p_idx:<4} {m_name:<30} {m['display_stage']:<8} {m['avg_score']:<10.4f} {m['min_score']:<10.4f} {m['max_score']:<10.4f} {curated:<8} {published:<10} {pending:<8} {propose_str}")
                 print("==================================================================================================================================================================\n")
 
             # Display Skipped Videos Table

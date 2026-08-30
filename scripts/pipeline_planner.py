@@ -2003,7 +2003,8 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                             a.month,
                             COALESCE(v.score_normalized, 0.0) as score,
                             a.date_created_utc,
-                            za.Z_PK
+                            za.Z_PK,
+                            a.uploaded_to_google
                         FROM assets a
                         JOIN photos_db.ZASSET za ON za.ZUUID = a.asset_id
                         JOIN photos_db.Z_30ASSETS aa ON aa.Z_3ASSETS = za.Z_PK
@@ -2020,9 +2021,9 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                         print("==================================================================================================================================================================")
                         print("🎥 Skipped Videos - Curation & Score Ranking (Google Upload Skipped Videos - Top 15)")
                         print("==================================================================================================================================================================")
-                        print(f"{'No.':<4} {'Video Filename':<30} {'Month':<10} {'Avg Score':<11} {'Capture Date & Time':<24} {'Suggested Moment'}")
+                        print(f"{'No.':<4} {'Video Filename':<30} {'Month':<10} {'Avg Score':<11} {'Capture Date & Time':<24} {'Uploaded?':<11} {'Suggested Moment'}")
                         print("-" * 168)
-                        for s_idx, (fname, smonth, sscore, sdate, z_pk) in enumerate(skipped_rows, 1):
+                        for s_idx, (fname, smonth, sscore, sdate, z_pk, sup) in enumerate(skipped_rows, 1):
                             # Query all other albums this asset is in
                             cursor.execute("""
                                 SELECT ga.ZTITLE 
@@ -2049,7 +2050,8 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                                 valid_albums.sort(key=lambda x: (-prefix_specificity(x), -len(x)))
                                 suggested_moment = valid_albums[0]
                                 
-                            print(f"{s_idx:<4} {fname:<30} {smonth:<10} {sscore:<11.4f} {sdate:<24} {suggested_moment}")
+                            uploaded_str = "✅ Yes" if sup == 1 else "❌ No"
+                            print(f"{s_idx:<4} {fname:<30} {smonth:<10} {sscore:<11.4f} {sdate:<24} {uploaded_str:<11} {suggested_moment}")
                         print("==================================================================================================================================================================\n")
                 except Exception as e:
                     logger.warning(f"Error querying skipped videos: {e}")

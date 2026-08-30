@@ -21,6 +21,7 @@ from constants import ACTIVE_CAMERA_MODELS, DEVICE_OWNER_MAPPING
 from db.connections import get_connection, get_cursor, commit, close as close_conn
 from db.queries import get_stage_transitions, get_batch_statuses, get_latest_import_and_month
 import requests
+import math
 from datetime import timezone, datetime, timedelta
  
 
@@ -1986,6 +1987,36 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                     assets_str = "—"
                 print(f"{idx:<4} {rec['name']:<30} {rec['avg_score']:<10.4f} {rec['total_unique']:<6} {rec['pub_count']:<5} {rec['rec_count']:<5} {rec['action']:<40} {assets_str}")
             print("==================================================================================================================================================================\n")
+
+            # Display Curated Moments Pending Publishing Table
+            pending_publishing_moments = [m for m in ranked_moments if m['display_stage'] in ('M400', 'M450')]
+            pending_publishing_moments.sort(key=lambda x: x['avg_score'], reverse=True)
+
+            if pending_publishing_moments:
+                start_idx_pp = len(console_moments) + 1
+                if top_recommendations:
+                    start_idx_pp += len(top_recommendations)
+
+                print("==================================================================================================================================================================")
+                print("🌟 Curated Moments Pending Publishing")
+                print("==================================================================================================================================================================")
+                print(f"{'No.':<4} {'Moment Name':<30} {'Status':<8} {'Avg Score':<10} {'Curated':<8} {'Published':<10} {'Pending':<8} {'Propose Next Publishing'}")
+                print("-" * 168)
+                for p_idx, m in enumerate(pending_publishing_moments, start_idx_pp):
+                    displayed_moments_map[p_idx] = {'name': m['name'], 'type': 'pending_publishing'}
+                    curated = m['curated_count']
+                    published = m['pub_count']
+                    pending = curated - published
+                    if pending < 9:
+                        propose_str = f"All ({pending})"
+                    else:
+                        propose = min(9, math.ceil(pending / 4))
+                        propose_str = f"{propose} (1/4 of {pending})"
+                    
+                    m_name_raw = m['name'] or "—"
+                    m_name = m_name_raw[:26] + "..." if len(m_name_raw) > 29 else m_name_raw
+                    print(f"{p_idx:<4} {m_name:<30} {m['display_stage']:<8} {m['avg_score']:<10.4f} {curated:<8} {published:<10} {pending:<8} {propose_str}")
+                print("==================================================================================================================================================================\n")
 
             # Display Skipped Videos Table
             skipped_db_attached = False

@@ -2040,7 +2040,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                 print("==================================================================================================================================================================")
                 print("🌟 Curated Moments Pending Publishing")
                 print("==================================================================================================================================================================")
-                print(f"{'No.':<4} {'Moment Name':<30} {'Status':<8} {'Avg Score':<10} {'Min Score':<10} {'Max Score':<10} {'Curated':<8} {'Published':<10} {'Pending':<8} {'Propose Next Publishing':<24} {'Proposed Asset Scores'}")
+                print(f"{'No.':<4} {'Moment Name':<30} {'Status':<8} {'Avg Score':<10} {'Min Score':<10} {'Max Score':<10} {'Curated':<8} {'Published':<10} {'Pending':<8} {'Can Publish?':<15} {'Propose Next Publishing':<24} {'Proposed Asset Scores'}")
                 print("-" * 168)
                 for p_idx, entry in enumerate(pending_publishing_moments, start_idx_pp):
                     m = entry['moment']
@@ -2063,7 +2063,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                     
                     m_name_raw = m['name'] or "—"
                     m_name = m_name_raw[:26] + "..." if len(m_name_raw) > 29 else m_name_raw
-                    print(f"{p_idx:<4} {m_name:<30} {m['display_stage']:<8} {avg_proposed:<10.4f} {min_proposed:<10.4f} {max_proposed:<10.4f} {curated:<8} {published:<10} {pending:<8} {propose_str:<24} {scores_str}")
+                    print(f"{p_idx:<4} {m_name:<30} {m['display_stage']:<8} {avg_proposed:<10.4f} {min_proposed:<10.4f} {max_proposed:<10.4f} {curated:<8} {published:<10} {pending:<8} {m['can_publish_str']:<15} {propose_str:<24} {scores_str}")
                 print("==================================================================================================================================================================\n")
 
             # Display Skipped Videos Table

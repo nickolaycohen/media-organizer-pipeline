@@ -2190,79 +2190,80 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                 print("==================================================================================================================================================================\n")
 
             # Display Skipped Videos Table
-            skipped_db_attached = False
-            try:
-                cursor.execute(f"ATTACH DATABASE 'file:{APPLE_PHOTOS_DB_PATH}?mode=ro' AS photos_db;")
-                skipped_db_attached = True
-            except Exception as e:
-                logger.warning(f"Could not attach Photos.sqlite for skipped videos check: {e}")
-
-            if skipped_db_attached:
+            if generate_weekly_memory_report:
+                skipped_db_attached = False
                 try:
-                    cursor.execute("""
-                        SELECT 
-                            a.original_filename,
-                            a.month,
-                            COALESCE(v.score_normalized, 0.0) as score,
-                            a.date_created_utc,
-                            za.Z_PK,
-                            a.uploaded_to_google
-                        FROM assets a
-                        JOIN photos_db.ZASSET za ON za.ZUUID = a.asset_id
-                        JOIN photos_db.Z_30ASSETS aa ON aa.Z_3ASSETS = za.Z_PK
-                        JOIN photos_db.ZGENERICALBUM ga ON ga.Z_PK = aa.Z_30ALBUMS
-                        LEFT JOIN ranked_assets_view v ON v.asset_id = a.asset_id
-                        WHERE ga.ZTITLE = 'Google Upload Skipped Videos'
-                          AND ga.ZTRASHEDSTATE = 0
-                          AND za.ZTRASHEDSTATE = 0
-                        ORDER BY v.score_normalized DESC NULLS LAST
-                        LIMIT 15
-                    """)
-                    skipped_rows = cursor.fetchall()
-                    if skipped_rows:
-                        print("==================================================================================================================================================================")
-                        print("🎥 Skipped Videos - Curation & Score Ranking (Google Upload Skipped Videos - Top 15)")
-                        print("==================================================================================================================================================================")
-                        print(f"{'No.':<4} {'Video Filename':<30} {'Month':<10} {'Avg Score':<11} {'Capture Date & Time':<24} {'Uploaded?':<11} {'Suggested Moment'}")
-                        print("-" * 168)
-                        for s_idx, (fname, smonth, sscore, sdate, z_pk, sup) in enumerate(skipped_rows, 1):
-                            # Query all other albums this asset is in
-                            cursor.execute("""
-                                SELECT ga.ZTITLE 
-                                FROM photos_db.Z_30ASSETS aa 
-                                JOIN photos_db.ZGENERICALBUM ga ON ga.Z_PK = aa.Z_30ALBUMS 
-                                WHERE aa.Z_3ASSETS = ? 
-                                  AND ga.ZTRASHEDSTATE = 0
-                            """, (z_pk,))
-                            albums = [r[0] for r in cursor.fetchall() if r[0] != 'Google Upload Skipped Videos']
-                            
-                            suggested_moment = "—"
-                            valid_albums = []
-                            for name in albums:
-                                if name and re.match(r'^\d{4}(?:-\d{2})?(?:-\d{2})?(?:\b|\s|-)', name):
-                                    valid_albums.append(name.strip())
-                            if valid_albums:
-                                # Sort by date specificity: YYYY-MM-DD > YYYY-MM > YYYY, then length
-                                def prefix_specificity(name):
-                                    if re.match(r'^\d{4}-\d{2}-\d{2}', name):
-                                        return 3
-                                    if re.match(r'^\d{4}-\d{2}', name):
-                                        return 2
-                                    return 1
-                                valid_albums.sort(key=lambda x: (-prefix_specificity(x), -len(x)))
-                                suggested_moment = valid_albums[0]
-                                
-                            uploaded_str = "✅ Yes" if sup == 1 else "❌ No"
-                            print(f"{s_idx:<4} {fname:<30} {smonth:<10} {sscore:<11.4f} {sdate:<24} {uploaded_str:<11} {suggested_moment}")
-                        print("==================================================================================================================================================================\n")
+                    cursor.execute(f"ATTACH DATABASE 'file:{APPLE_PHOTOS_DB_PATH}?mode=ro' AS photos_db;")
+                    skipped_db_attached = True
                 except Exception as e:
-                    logger.warning(f"Error querying skipped videos: {e}")
-                finally:
+                    logger.warning(f"Could not attach Photos.sqlite for skipped videos check: {e}")
+    
+                if skipped_db_attached:
                     try:
-                        cursor.execute("DETACH DATABASE photos_db;")
-                    except Exception:
-                        pass
-
+                        cursor.execute("""
+                            SELECT 
+                                a.original_filename,
+                                a.month,
+                                COALESCE(v.score_normalized, 0.0) as score,
+                                a.date_created_utc,
+                                za.Z_PK,
+                                a.uploaded_to_google
+                            FROM assets a
+                            JOIN photos_db.ZASSET za ON za.ZUUID = a.asset_id
+                            JOIN photos_db.Z_30ASSETS aa ON aa.Z_3ASSETS = za.Z_PK
+                            JOIN photos_db.ZGENERICALBUM ga ON ga.Z_PK = aa.Z_30ALBUMS
+                            LEFT JOIN ranked_assets_view v ON v.asset_id = a.asset_id
+                            WHERE ga.ZTITLE = 'Google Upload Skipped Videos'
+                              AND ga.ZTRASHEDSTATE = 0
+                              AND za.ZTRASHEDSTATE = 0
+                            ORDER BY v.score_normalized DESC NULLS LAST
+                            LIMIT 15
+                        """)
+                        skipped_rows = cursor.fetchall()
+                        if skipped_rows:
+                            print("==================================================================================================================================================================")
+                            print("🎥 Skipped Videos - Curation & Score Ranking (Google Upload Skipped Videos - Top 15)")
+                            print("==================================================================================================================================================================")
+                            print(f"{'No.':<4} {'Video Filename':<30} {'Month':<10} {'Avg Score':<11} {'Capture Date & Time':<24} {'Uploaded?':<11} {'Suggested Moment'}")
+                            print("-" * 168)
+                            for s_idx, (fname, smonth, sscore, sdate, z_pk, sup) in enumerate(skipped_rows, 1):
+                                # Query all other albums this asset is in
+                                cursor.execute("""
+                                    SELECT ga.ZTITLE 
+                                    FROM photos_db.Z_30ASSETS aa 
+                                    JOIN photos_db.ZGENERICALBUM ga ON ga.Z_PK = aa.Z_30ALBUMS 
+                                    WHERE aa.Z_3ASSETS = ? 
+                                      AND ga.ZTRASHEDSTATE = 0
+                                """, (z_pk,))
+                                albums = [r[0] for r in cursor.fetchall() if r[0] != 'Google Upload Skipped Videos']
+                                
+                                suggested_moment = "—"
+                                valid_albums = []
+                                for name in albums:
+                                    if name and re.match(r'^\d{4}(?:-\d{2})?(?:-\d{2})?(?:\b|\s|-)', name):
+                                        valid_albums.append(name.strip())
+                                if valid_albums:
+                                    # Sort by date specificity: YYYY-MM-DD > YYYY-MM > YYYY, then length
+                                    def prefix_specificity(name):
+                                        if re.match(r'^\d{4}-\d{2}-\d{2}', name):
+                                            return 3
+                                        if re.match(r'^\d{4}-\d{2}', name):
+                                            return 2
+                                        return 1
+                                    valid_albums.sort(key=lambda x: (-prefix_specificity(x), -len(x)))
+                                    suggested_moment = valid_albums[0]
+                                    
+                                uploaded_str = "✅ Yes" if sup == 1 else "❌ No"
+                                print(f"{s_idx:<4} {fname:<30} {smonth:<10} {sscore:<11.4f} {sdate:<24} {uploaded_str:<11} {suggested_moment}")
+                            print("==================================================================================================================================================================\n")
+                    except Exception as e:
+                        logger.warning(f"Error querying skipped videos: {e}")
+                    finally:
+                        try:
+                            cursor.execute("DETACH DATABASE photos_db;")
+                        except Exception:
+                            pass
+    
             # Sync folders and files to 'Publishing Recommendation' directory
             PUBLISHING_RECOMMENDATION_DIR = "/Volumes/LaCie/Media Organizer/Publishing Recommendation"
             os.makedirs(PUBLISHING_RECOMMENDATION_DIR, exist_ok=True)

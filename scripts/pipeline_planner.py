@@ -2087,8 +2087,22 @@ def run_memory_publishing_flow(cursor=None, conn=None):
             actionable_pending.sort(key=lambda x: x['avg_proposed'], reverse=True)
             disjoint_pending.sort(key=lambda x: x['avg_proposed'], reverse=True)
 
-            # Limit to top 20 of each
-            top_actionable_pending = actionable_pending[:20]
+            # Limit to top 20 candidates, ensuring we select at least 10 publishable moments if available
+            publishable_actionable = [x for x in actionable_pending if x['moment']['can_publish_str'] == "✅ Yes"]
+            unpublishable_actionable = [x for x in actionable_pending if x['moment']['can_publish_str'] != "✅ Yes"]
+            
+            selected_publishable = publishable_actionable[:10]
+            remaining_publishable = publishable_actionable[10:]
+            
+            remaining_candidates = remaining_publishable + unpublishable_actionable
+            remaining_candidates.sort(key=lambda x: x['avg_proposed'], reverse=True)
+            
+            needed = max(0, 20 - len(selected_publishable))
+            selected_remaining = remaining_candidates[:needed]
+            
+            top_actionable_pending = selected_publishable + selected_remaining
+            top_actionable_pending.sort(key=lambda x: x['avg_proposed'], reverse=True)
+            
             top_disjoint_pending = disjoint_pending[:20]
 
             # Combine them for the print iteration

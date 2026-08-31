@@ -917,9 +917,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
     except Exception as e:
         logger.warning(f"Could not fetch historical minimum threshold: {e}")
 
-    # Release for the first menu listing/user input wait
-    close_conn()
-    release_planner_lock()
+    generate_weekly_memory_report = False
     
     while True:
         acquire_planner_lock()
@@ -1402,64 +1400,65 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                 moments_data[moment_name]['unpublished_scores'].append(score)
 
         # 3. Query Apple Photos albums and folders inside Curated and ToBeCurated (to match existence and get counts)
-        applescript_code = """
-        tell application "Photos"
-            set results to {}
-            set parentFolderNames to {"Curated", "ToBeCurated"}
-            repeat with fName in parentFolderNames
-                if exists folder fName of folder "Media Organizer on LaCie" then
-                    set subFolder to folder fName of folder "Media Organizer on LaCie"
-                    set subAlbums to albums of subFolder
-                    repeat with anAlbum in subAlbums
-                        set aName to name of anAlbum
-                        try
-                            set aCount to count of media items of anAlbum
-                        on error
-                            set aCount to 0
-                        end try
-                        copy (fName & "|" & aName & "|" & (aCount as string)) to end of results
-                    end repeat
-                    set subFolders to folders of subFolder
-                    repeat with aFolder in subFolders
-                        set aName to name of aFolder
-                        copy (fName & "|" & aName & "|0") to end of results
-                    end repeat
-                end if
-            end repeat
-            
-            set oldDelims to AppleScript's text item delimiters
-            set AppleScript's text item delimiters to "\\n"
-            set resultsString to results as string
-            set AppleScript's text item delimiters to oldDelims
-            return resultsString
-        end tell
-        """
         to_be_curated_albums = {}
         curated_albums = {}
-        try:
-            process = subprocess.Popen(['osascript', '-e', applescript_code], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            stdout, stderr = process.communicate()
-            if stdout:
-                parts = [p.strip() for p in stdout.strip().split('\n')]
-                for p in parts:
-                    if '|' in p:
-                        subparts = p.split('|')
-                        if len(subparts) >= 2:
-                            folder_name_clean = subparts[0].strip()
-                            album_name_clean = subparts[1].strip()
-                            item_count = 0
-                            if len(subparts) >= 3:
-                                try:
-                                    item_count = int(subparts[2].strip())
-                                except ValueError:
-                                    pass
-                            
-                            if folder_name_clean == 'ToBeCurated':
-                                to_be_curated_albums[album_name_clean] = item_count
-                            elif folder_name_clean == 'Curated':
-                                curated_albums[album_name_clean] = item_count
-        except Exception as e:
-            logger.warning(f"Could not list Apple Photos albums: {e}")
+        if generate_weekly_memory_report:
+            applescript_code = """
+            tell application "Photos"
+                set results to {}
+                set parentFolderNames to {"Curated", "ToBeCurated"}
+                repeat with fName in parentFolderNames
+                    if exists folder fName of folder "Media Organizer on LaCie" then
+                        set subFolder to folder fName of folder "Media Organizer on LaCie"
+                        set subAlbums to albums of subFolder
+                        repeat with anAlbum in subAlbums
+                            set aName to name of anAlbum
+                            try
+                                set aCount to count of media items of anAlbum
+                            on error
+                                set aCount to 0
+                            end try
+                            copy (fName & "|" & aName & "|" & (aCount as string)) to end of results
+                        end repeat
+                        set subFolders to folders of subFolder
+                        repeat with aFolder in subFolders
+                            set aName to name of aFolder
+                            copy (fName & "|" & aName & "|0") to end of results
+                        end repeat
+                    end if
+                end repeat
+                
+                set oldDelims to AppleScript's text item delimiters
+                set AppleScript's text item delimiters to "\\n"
+                set resultsString to results as string
+                set AppleScript's text item delimiters to oldDelims
+                return resultsString
+            end tell
+            """
+            try:
+                process = subprocess.Popen(['osascript', '-e', applescript_code], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                stdout, stderr = process.communicate()
+                if stdout:
+                    parts = [p.strip() for p in stdout.strip().split('\n')]
+                    for p in parts:
+                        if '|' in p:
+                            subparts = p.split('|')
+                            if len(subparts) >= 2:
+                                folder_name_clean = subparts[0].strip()
+                                album_name_clean = subparts[1].strip()
+                                item_count = 0
+                                if len(subparts) >= 3:
+                                    try:
+                                        item_count = int(subparts[2].strip())
+                                    except ValueError:
+                                        pass
+                                
+                                if folder_name_clean == 'ToBeCurated':
+                                    to_be_curated_albums[album_name_clean] = item_count
+                                elif folder_name_clean == 'Curated':
+                                    curated_albums[album_name_clean] = item_count
+            except Exception as e:
+                logger.warning(f"Could not list Apple Photos albums: {e}")
 
         # 4. Fetch memory_stage from curated_moments table
         cursor.execute("SELECT moment_name, memory_stage FROM curated_moments")
@@ -1600,7 +1599,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
 
             # Compare Apple Photos Curated album assets with local filesystem folder contents
             curated_str = "❌ No"
-            if curated_exists and fs_curated_exists:
+            if generate_weekly_memory_report and curated_exists and fs_curated_exists:
                 # Retrieve Apple Photos Curated album asset base names from Photos DB
                 photos_bases = set()
                 if photos_db_attached:
@@ -1766,13 +1765,14 @@ def run_memory_publishing_flow(cursor=None, conn=None):
 
         duration_weekly = time.time() - start_time_weekly
         if table_title == "🌟 Weekly Memory Feature & Publishing (Mode [M])":
-            try:
-                os.makedirs(os.path.dirname(WEEKLY_MEMORY_LOG_PATH), exist_ok=True)
-                with open(WEEKLY_MEMORY_LOG_PATH, 'w', encoding='utf-8') as f:
-                    f.write("\n".join(table_lines) + "\n")
-                print(f"📄 Weekly Memory Feature & Publishing report saved to: {WEEKLY_MEMORY_LOG_PATH} (took {duration_weekly:.2f}s)\n")
-            except Exception as e:
-                logger.warning(f"Could not write weekly memory log: {e}")
+            if generate_weekly_memory_report:
+                try:
+                    os.makedirs(os.path.dirname(WEEKLY_MEMORY_LOG_PATH), exist_ok=True)
+                    with open(WEEKLY_MEMORY_LOG_PATH, 'w', encoding='utf-8') as f:
+                        f.write("\n".join(table_lines) + "\n")
+                    print(f"📄 Weekly Memory Feature & Publishing report saved to: {WEEKLY_MEMORY_LOG_PATH} (took {duration_weekly:.2f}s)\n")
+                except Exception as e:
+                    logger.warning(f"Could not write weekly memory log: {e}")
         else:
             print("\n".join(table_lines))
 
@@ -2321,6 +2321,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                 logger.warning(f"Error cleaning up outdated recommendation folders: {e}")
                 
             print("✅ 'Publishing Recommendation' folder is up to date!")
+            generate_weekly_memory_report = False
 
         # Close database connection and release lock before action prompt
         if photos_db_attached:
@@ -2335,6 +2336,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
         print(" [1] Sync proposed assets to ToBeCurated albums in Apple Photos")
         print(" [2] Export Curated Moment for Publishing")
         print(" [3] Record publication in the database (Mark as Published to Shutterfly/YouTube)")
+        print(" [4] Generate Weekly Memory report (on demand)")
         print(" [R] Restart the planner")
         print(" [E] Exit")
         
@@ -2348,6 +2350,9 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                     pass
             release_planner_lock()
             os.execv(sys.executable, [sys.executable] + sys.argv)
+        elif choice == '4':
+            generate_weekly_memory_report = True
+            continue
         elif choice == '1':
             acquire_planner_lock()
             script_dir = os.path.dirname(os.path.abspath(__file__))

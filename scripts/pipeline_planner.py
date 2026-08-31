@@ -2162,7 +2162,13 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                 divider_printed = False
                 for p_idx, entry in enumerate(combined_pending_display, start_idx_pp):
                     m = entry['moment']
-                    displayed_moments_map[p_idx] = {'name': m['name'], 'type': 'pending_publishing'}
+                    rec_bases = [os.path.splitext(f)[0].lower() for f in entry['proposed_files'] if f]
+                    displayed_moments_map[p_idx] = {
+                        'name': m['name'],
+                        'type': 'pending_publishing',
+                        'rec_bases': rec_bases,
+                        'action': 'Publishing'
+                    }
                     
                     # Print divider if we hit disjoint moments
                     if m['total_qualified'] < 2 and not divider_printed:
@@ -2405,7 +2411,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                 if idx in displayed_moments_map:
                     item_info = displayed_moments_map[idx]
                     moment_name = item_info['name']
-                    if item_info['type'] == 'recommendation':
+                    if item_info['type'] in ('recommendation', 'pending_publishing'):
                         selected_rec = item_info
             
             if not moment_name:

@@ -918,6 +918,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
         logger.warning(f"Could not fetch historical minimum threshold: {e}")
 
     generate_weekly_memory_report = False
+    generate_skipped_videos = False
     
     while True:
         acquire_planner_lock()
@@ -2190,7 +2191,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                 print("==================================================================================================================================================================\n")
 
             # Display Skipped Videos Table
-            if generate_weekly_memory_report:
+            if generate_skipped_videos:
                 skipped_db_attached = False
                 try:
                     cursor.execute(f"ATTACH DATABASE 'file:{APPLE_PHOTOS_DB_PATH}?mode=ro' AS photos_db;")
@@ -2323,6 +2324,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                 
             print("✅ 'Publishing Recommendation' folder is up to date!")
             generate_weekly_memory_report = False
+            generate_skipped_videos = False
 
         # Close database connection and release lock before action prompt
         if photos_db_attached:
@@ -2338,6 +2340,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
         print(" [2] Export Curated Moment for Publishing")
         print(" [3] Record publication in the database (Mark as Published to Shutterfly/YouTube)")
         print(" [4] Generate Weekly Memory report (on demand)")
+        print(" [5] Display Skipped Videos Table (on demand)")
         print(" [R] Restart the planner")
         print(" [E] Exit")
         
@@ -2353,6 +2356,9 @@ def run_memory_publishing_flow(cursor=None, conn=None):
             os.execv(sys.executable, [sys.executable] + sys.argv)
         elif choice == '4':
             generate_weekly_memory_report = True
+            continue
+        elif choice == '5':
+            generate_skipped_videos = True
             continue
         elif choice == '1':
             acquire_planner_lock()

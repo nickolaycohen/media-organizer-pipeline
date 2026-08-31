@@ -1327,6 +1327,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                   AND v.score_normalized > ?
                 ORDER BY v.score_normalized DESC
             """
+        start_time_scoring = time.time()
         cursor.execute(query, (effective_threshold,))
         rows = cursor.fetchall()
 
@@ -1368,13 +1369,15 @@ def run_memory_publishing_flow(cursor=None, conn=None):
             scoring_report.append(f"{idx:<4} {filename:<25} {assigned_album:<30} {score_normalized_str:<12} {aesthetic_score_str:<12} {google_fav:<12} {apple_feat:<12} {monthly_sel:<12}")
         scoring_report.append("=========================================================================================================================\n")
 
+        duration_scoring = time.time() - start_time_scoring
         try:
             with open(SCORING_BREAKDOWN_LOG_PATH, 'w', encoding='utf-8') as f:
                 f.write('\n'.join(scoring_report) + '\n')
-            print(f"📄 Qualified Assets Scoring Breakdown ({len(processed_rows)} assets) saved to: {SCORING_BREAKDOWN_LOG_PATH}\n")
+            print(f"📄 Qualified Assets Scoring Breakdown ({len(processed_rows)} assets) saved to: {SCORING_BREAKDOWN_LOG_PATH} (took {duration_scoring:.2f}s)\n")
         except Exception as e:
             logger.warning(f"Could not write scoring breakdown log: {e}")
         
+        start_time_weekly = time.time()
         # Group by moment name
         moments_data = {}
         for row in rows:
@@ -1749,12 +1752,13 @@ def run_memory_publishing_flow(cursor=None, conn=None):
             
             table_lines.append(f"{idx:<4} {m_name:<30} {m['display_stage']:<8} {m['rank_score']:<12.4f} {m['avg_score']:<10.4f} {m['min_score']:<10.4f} {m['max_score']:<10.4f} {m['assets_display']:<8} {m['pub_display']:<6} {m['pub_avg_str']:<10} {m['pub_range_str']:<17} {to_be_curated_str:<13} {curated_str:<15} {published_str:<13} {m['can_publish_str']:<18} {m['last_pub_str']:<18}")
 
+        duration_weekly = time.time() - start_time_weekly
         if table_title == "🌟 Weekly Memory Feature & Publishing (Mode [M])":
             try:
                 os.makedirs(os.path.dirname(WEEKLY_MEMORY_LOG_PATH), exist_ok=True)
                 with open(WEEKLY_MEMORY_LOG_PATH, 'w', encoding='utf-8') as f:
                     f.write("\n".join(table_lines) + "\n")
-                print(f"📄 Weekly Memory Feature & Publishing report saved to: {WEEKLY_MEMORY_LOG_PATH}\n")
+                print(f"📄 Weekly Memory Feature & Publishing report saved to: {WEEKLY_MEMORY_LOG_PATH} (took {duration_weekly:.2f}s)\n")
             except Exception as e:
                 logger.warning(f"Could not write weekly memory log: {e}")
         else:
@@ -1843,6 +1847,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                 return f"💡 Suggest merge with: '{best_candidate}' ({time_rel})"
             return None
 
+        start_time_recommendations = time.time()
         # Display Weekly Memory Publishing Recommendations (only if all M200 curation moments are complete)
         published_assets_by_moment = {}
         if not has_m200:
@@ -2031,11 +2036,12 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                 rec_lines.append(f"{idx:<4} {rec['name']:<30} {rec['avg_score']:<10.4f} {rec['total_unique']:<6} {rec['pub_count']:<5} {rec['rec_count']:<5} {rec['action']:<40} {assets_str}")
             rec_lines.append("==================================================================================================================================================================\n")
 
+            duration_recommendations = time.time() - start_time_recommendations
             try:
                 os.makedirs(os.path.dirname(PUBLISHING_RECOMMENDATIONS_LOG_PATH), exist_ok=True)
                 with open(PUBLISHING_RECOMMENDATIONS_LOG_PATH, 'w', encoding='utf-8') as f:
                     f.write("\n".join(rec_lines) + "\n")
-                print(f"📄 Publishing Recommendations report saved to: {PUBLISHING_RECOMMENDATIONS_LOG_PATH}\n")
+                print(f"📄 Publishing Recommendations report saved to: {PUBLISHING_RECOMMENDATIONS_LOG_PATH} (took {duration_recommendations:.2f}s)\n")
             except Exception as e:
                 logger.warning(f"Could not write publishing recommendations log: {e}")
 

@@ -1518,6 +1518,18 @@ def run_memory_publishing_flow(cursor=None, conn=None):
             pub_min = p_data.get('pub_min')
             pub_max = p_data.get('pub_max')
 
+            # If moment is marked as M500 (fully published) in database, but new curated assets were added
+            # (curated_count > pub_count), demote it back to M450 (or M400 if nothing published yet).
+            if stage == 'M500' and data['curated_count'] > pub_count:
+                new_stage = 'M450' if pub_count > 0 else 'M400'
+                logger.info(f"🔄 Demoting moment '{name}' from M500 to {new_stage} in database because new curated assets were added (Curated: {data['curated_count']}, Published: {pub_count})")
+                try:
+                    cursor.execute("UPDATE curated_moments SET memory_stage = ? WHERE moment_name = ?", (new_stage, name))
+                    conn.commit()
+                    stage = new_stage
+                except Exception as e:
+                    logger.error(f"Failed to update stage for moment '{name}': {e}")
+
             last_pub_str = "—"
             if last_pub_raw:
                 try:

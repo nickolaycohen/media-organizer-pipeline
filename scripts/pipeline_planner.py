@@ -2001,9 +2001,9 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                 else:
                     propose = min(9, math.ceil(pending / 4))
                 
-                # Fetch scores of curated assets pending publishing
+                # Fetch scores and original filenames of curated assets pending publishing
                 cursor.execute("""
-                    SELECT v.score_normalized 
+                    SELECT v.score_normalized, v.original_filename
                     FROM moment_exports me
                     JOIN ranked_assets_view v ON me.asset_id = v.asset_id 
                     WHERE (me.album_name = ? OR me.album_name = ?)
@@ -2012,8 +2012,31 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                     ORDER BY v.score_normalized DESC
                     LIMIT ?
                 """, (m['name'], m['name'].strip(), propose))
-                pending_scores = [r[0] for r in cursor.fetchall() if r[0] is not None]
+                rows = cursor.fetchall()
+                pending_scores = [r[0] for r in rows if r[0] is not None]
+                proposed_filenames = [r[1] for r in rows if r[1] is not None]
                 avg_proposed = sum(pending_scores) / len(pending_scores) if pending_scores else 0.0
+                
+                # Gather files in source folder to map base names (to copy Live Photos, etc)
+                fs_curated_path = os.path.join(CURATED_LACIE_DIR, m['name'])
+                base_to_files = {}
+                if m['fs_curated_exists']:
+                    try:
+                        for f in os.listdir(fs_curated_path):
+                            if os.path.isfile(os.path.join(fs_curated_path, f)) and not f.startswith('.'):
+                                base, ext = os.path.splitext(f)
+                                base_lower = base.lower()
+                                if base_lower not in base_to_files:
+                                    base_to_files[base_lower] = []
+                                base_to_files[base_lower].append(f)
+                    except Exception:
+                        pass
+                
+                proposed_files = []
+                for fname in proposed_filenames:
+                    if fname:
+                        base = os.path.splitext(fname)[0].lower()
+                        proposed_files.extend(base_to_files.get(base, []))
                 
                 pending_publishing_moments.append({
                     'moment': m,
@@ -2022,7 +2045,8 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                     'pending': pending,
                     'propose': propose,
                     'pending_scores': pending_scores,
-                    'avg_proposed': avg_proposed
+                    'avg_proposed': avg_proposed,
+                    'proposed_files': proposed_files
                 })
                 
             # Separate into Actionable and Disjoint groups
@@ -2164,23 +2188,18 @@ def run_memory_publishing_flow(cursor=None, conn=None):
             print("📂 Syncing files to 'Publishing Recommendation' folder...")
             import shutil
             
-            for rec in top_recommendations:
-                if not rec['rec_bases'] or rec['rec_count'] == 0:
+            for entry in combined_pending_display:
+                if not entry['proposed_files']:
                     continue
                     
-                moment_name = rec['name']
+                moment_name = entry['moment']['name']
                 active_rec_names.add(moment_name)
                 
                 src_folder = os.path.join(CURATED_LACIE_DIR, moment_name)
                 dest_folder = os.path.join(PUBLISHING_RECOMMENDATION_DIR, moment_name)
                 os.makedirs(dest_folder, exist_ok=True)
                 
-                # Gather all files that should be in the destination
-                expected_files = []
-                for base in rec['rec_bases']:
-                    expected_files.extend(rec['base_to_files'].get(base, []))
-                    
-                expected_files_set = set(expected_files)
+                expected_files_set = set(entry['proposed_files'])
                 
                 # Delete extra/stale files in dest_folder
                 try:
@@ -2197,7 +2216,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                     logger.warning(f"Error cleaning folder {dest_folder}: {e}")
                     
                 # Copy missing files from src_folder to dest_folder
-                for f in expected_files:
+                for f in entry['proposed_files']:
                     src_file = os.path.join(src_folder, f)
                     dest_file = os.path.join(dest_folder, f)
                     if os.path.exists(src_file) and not os.path.exists(dest_file):

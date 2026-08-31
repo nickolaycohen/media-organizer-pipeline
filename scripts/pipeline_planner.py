@@ -16,7 +16,7 @@ from utils.utils import get_full_transition_path, human_readable_size
 from google_photos import check_google_quota, authenticate, get_all_favorites
 import argparse
 import sqlite3
-from constants import MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_LOCK_PATH, APPLE_PHOTOS_DB_PATH, LOG_PATH, GOOGLE_PHOTOS_READONLY_SCOPES, GOOGLE_DRIVE_READ_ONLY_SCOPES, PLANNER_REQUIRED_SCOPES, CURATION_THRESHOLD_LOG_PATH, PUBLISHED_MOMENTS_LOG_PATH, SCORING_BREAKDOWN_LOG_PATH, MEDIA_CLEANUP_LOG_PATH, MAX_UPLOAD_FILE_SIZE_BYTES, MAX_UPLOAD_FILE_SIZE_MB, BG_SERVICE_PID_PATH
+from constants import MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_LOCK_PATH, APPLE_PHOTOS_DB_PATH, LOG_PATH, GOOGLE_PHOTOS_READONLY_SCOPES, GOOGLE_DRIVE_READ_ONLY_SCOPES, PLANNER_REQUIRED_SCOPES, CURATION_THRESHOLD_LOG_PATH, PUBLISHED_MOMENTS_LOG_PATH, SCORING_BREAKDOWN_LOG_PATH, MEDIA_CLEANUP_LOG_PATH, WEEKLY_MEMORY_LOG_PATH, MAX_UPLOAD_FILE_SIZE_BYTES, MAX_UPLOAD_FILE_SIZE_MB, BG_SERVICE_PID_PATH
 from constants import ACTIVE_CAMERA_MODELS, DEVICE_OWNER_MAPPING
 from db.connections import get_connection, get_cursor, commit, close as close_conn
 from db.queries import get_stage_transitions, get_batch_statuses, get_latest_import_and_month
@@ -1705,9 +1705,10 @@ def run_memory_publishing_flow(cursor=None, conn=None):
             console_moments = list(ranked_moments)
             table_title = "🌟 Weekly Memory Feature & Publishing (Mode [M])"
 
-        print("\n=========================================================================================================")
-        print(table_title)
-        print("=========================================================================================================")
+        table_lines = []
+        table_lines.append("\n=========================================================================================================")
+        table_lines.append(table_title)
+        table_lines.append("=========================================================================================================")
         
         # Sort console moments by:
         # 1. Needs update (proposed + curated < total_qualified)
@@ -1718,17 +1719,17 @@ def run_memory_publishing_flow(cursor=None, conn=None):
         ), reverse=True)
         
         header_m = f"{'No.':<4} {'Moment Name':<30} {'Status':<8} {'Rank Score':<12} {'Avg Score':<10} {'Min Score':<10} {'Max Score':<10} {'Assets':<8} {'Pub.':<6} {'Pub. Avg':<10} {'Pub. Range':<17} {'ToBeCurated?':<13} {'Curated?':<15} {'Published?':<13} {'Can Publish?':<18} {'Last Published':<18}"
-        print(header_m)
-        print("-" * len(header_m))
+        table_lines.append(header_m)
+        table_lines.append("-" * len(header_m))
         divider_printed = False
         for idx, m in enumerate(console_moments, 1):
             displayed_moments_map[idx] = {'name': m['name'], 'type': 'ranked_moment'}
             is_needs_update = (m['proposed_count'] + m['curated_count']) < m['total_qualified']
             if not is_needs_update and not divider_printed:
                 if idx > 1:
-                    print("-" * len(header_m))
-                    print(f"--- Up-To-Date Moments " + "-" * (len(header_m) - 23))
-                    print("-" * len(header_m))
+                    table_lines.append("-" * len(header_m))
+                    table_lines.append(f"--- Up-To-Date Moments " + "-" * (len(header_m) - 23))
+                    table_lines.append("-" * len(header_m))
                 divider_printed = True
                 
             to_be_curated_str = "✅ Yes" if m['to_be_curated_exists'] else "❌ No"
@@ -1746,7 +1747,18 @@ def run_memory_publishing_flow(cursor=None, conn=None):
             m_name_raw = m['name'] or "—"
             m_name = m_name_raw[:26] + "..." if len(m_name_raw) > 29 else m_name_raw
             
-            print(f"{idx:<4} {m_name:<30} {m['display_stage']:<8} {m['rank_score']:<12.4f} {m['avg_score']:<10.4f} {m['min_score']:<10.4f} {m['max_score']:<10.4f} {m['assets_display']:<8} {m['pub_display']:<6} {m['pub_avg_str']:<10} {m['pub_range_str']:<17} {to_be_curated_str:<13} {curated_str:<15} {published_str:<13} {m['can_publish_str']:<18} {m['last_pub_str']:<18}")
+            table_lines.append(f"{idx:<4} {m_name:<30} {m['display_stage']:<8} {m['rank_score']:<12.4f} {m['avg_score']:<10.4f} {m['min_score']:<10.4f} {m['max_score']:<10.4f} {m['assets_display']:<8} {m['pub_display']:<6} {m['pub_avg_str']:<10} {m['pub_range_str']:<17} {to_be_curated_str:<13} {curated_str:<15} {published_str:<13} {m['can_publish_str']:<18} {m['last_pub_str']:<18}")
+
+        if table_title == "🌟 Weekly Memory Feature & Publishing (Mode [M])":
+            try:
+                os.makedirs(os.path.dirname(WEEKLY_MEMORY_LOG_PATH), exist_ok=True)
+                with open(WEEKLY_MEMORY_LOG_PATH, 'w', encoding='utf-8') as f:
+                    f.write("\n".join(table_lines) + "\n")
+                print(f"📄 Weekly Memory Feature & Publishing report saved to: {WEEKLY_MEMORY_LOG_PATH}\n")
+            except Exception as e:
+                logger.warning(f"Could not write weekly memory log: {e}")
+        else:
+            print("\n".join(table_lines))
 
         # Build timeline map of moments to find closest merge suggestions for disjoint moments
         cursor.execute("""

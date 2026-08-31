@@ -26,79 +26,130 @@ def run_applescript(script_content):
     as_logger.info("--- FINISHED EXECUTION ---\n")
     return stdout
 
-def get_moment_photos_assets(album_name):
-    safe_album_name = album_name.replace('"', '\\"')
+def get_all_moment_photos_assets(album_names):
+    logger.info(f"Querying Apple Photos for curated and to-be-curated asset counts for {len(album_names)} albums in a single AppleScript call...")
+    escaped_names = []
+    for name in album_names:
+        escaped_names.append('"' + name.replace('"', '\\"') + '"')
+    target_albums_str = "{" + ",".join(escaped_names) + "}"
+    
     script = f'''
     tell application "Photos"
         set topFolderName to "Media Organizer on LaCie"
-        set resultsCurated to {{}}
-        set resultsToBeCurated to {{}}
+        set output to ""
+        set targetAlbums to {target_albums_str}
         
         if exists folder topFolderName then
             set topFolder to folder topFolderName
             
-            -- Check Curated folder
+            -- Curated
             if exists folder "Curated" of topFolder then
-                set midFolder to folder "Curated" of topFolder
-                if exists album "{safe_album_name}" of midFolder then
-                    set curatedAlbum to album "{safe_album_name}" of midFolder
-                    set curatedItems to media items of curatedAlbum
-                    repeat with cItem in curatedItems
-                        copy id of cItem to end of resultsCurated
-                    end repeat
-                else if exists folder "{safe_album_name}" of midFolder then
-                    set nestedFolder to folder "{safe_album_name}" of midFolder
-                    set nestedAlbums to albums of nestedFolder
-                    repeat with nAlb in nestedAlbums
-                        set curatedItems to media items of nAlb
-                        repeat with cItem in curatedItems
-                            copy id of cItem to end of resultsCurated
+                set curatedFolder to folder "Curated" of topFolder
+                set albs to albums of curatedFolder
+                repeat with alb in albs
+                    set albName to name of alb
+                    if targetAlbums contains albName then
+                        set itemIds to {{}}
+                        set itemsList to media items of alb
+                        repeat with mItem in itemsList
+                            copy id of mItem to end of itemIds
                         end repeat
-                    end repeat
-                end if
+                        set oldDelims to AppleScript's text item delimiters
+                        set AppleScript's text item delimiters to ","
+                        set idsStr to itemIds as string
+                        set AppleScript's text item delimiters to oldDelims
+                        set output to output & "Curated|" & albName & "|" & idsStr & "\\n"
+                    end if
+                end repeat
+                
+                set subFlds to folders of curatedFolder
+                repeat with subFld in subFlds
+                    set subFldName to name of subFld
+                    if targetAlbums contains subFldName then
+                        set albs to albums of subFld
+                        repeat with alb in albs
+                            set albName to name of alb
+                            set itemIds to {{}}
+                            set itemsList to media items of alb
+                            repeat with mItem in itemsList
+                                copy id of mItem to end of itemIds
+                            end repeat
+                            set oldDelims to AppleScript's text item delimiters
+                            set AppleScript's text item delimiters to ","
+                            set idsStr to itemIds as string
+                            set AppleScript's text item delimiters to oldDelims
+                            set output to output & "Curated|" & subFldName & "|" & idsStr & "\\n"
+                        end repeat
+                    end if
+                end repeat
             end if
             
-            -- Check ToBeCurated folder
+            -- ToBeCurated
             if exists folder "ToBeCurated" of topFolder then
-                set midFolder to folder "ToBeCurated" of topFolder
-                if exists album "{safe_album_name}" of midFolder then
-                    set curatedAlbum to album "{safe_album_name}" of midFolder
-                    set curatedItems to media items of curatedAlbum
-                    repeat with cItem in curatedItems
-                        copy id of cItem to end of resultsToBeCurated
-                    end repeat
-                else if exists folder "{safe_album_name}" of midFolder then
-                    set nestedFolder to folder "{safe_album_name}" of midFolder
-                    set nestedAlbums to albums of nestedFolder
-                    repeat with nAlb in nestedAlbums
-                        set curatedItems to media items of nAlb
-                        repeat with cItem in curatedItems
-                            copy id of cItem to end of resultsToBeCurated
+                set tbcFolder to folder "ToBeCurated" of topFolder
+                set albs to albums of tbcFolder
+                repeat with alb in albs
+                    set albName to name of alb
+                    if targetAlbums contains albName then
+                        set itemIds to {{}}
+                        set itemsList to media items of alb
+                        repeat with mItem in itemsList
+                            copy id of mItem to end of itemIds
                         end repeat
-                    end repeat
-                end if
+                        set oldDelims to AppleScript's text item delimiters
+                        set AppleScript's text item delimiters to ","
+                        set idsStr to itemIds as string
+                        set AppleScript's text item delimiters to oldDelims
+                        set output to output & "ToBeCurated|" & albName & "|" & idsStr & "\\n"
+                    end if
+                end repeat
+                
+                set subFlds to folders of tbcFolder
+                repeat with subFld in subFlds
+                    set subFldName to name of subFld
+                    if targetAlbums contains subFldName then
+                        set albs to albums of subFld
+                        repeat with alb in albs
+                            set albName to name of alb
+                            set itemIds to {{}}
+                            set itemsList to media items of alb
+                            repeat with mItem in itemsList
+                                copy id of mItem to end of itemIds
+                            end repeat
+                            set oldDelims to AppleScript's text item delimiters
+                            set AppleScript's text item delimiters to ","
+                            set idsStr to itemIds as string
+                            set AppleScript's text item delimiters to oldDelims
+                            set output to output & "ToBeCurated|" & subFldName & "|" & idsStr & "\\n"
+                        end repeat
+                    end if
+                end repeat
             end if
         end if
-        
-        set oldDelims to AppleScript's text item delimiters
-        set AppleScript's text item delimiters to "\\n"
-        set curatedStr to resultsCurated as string
-        set toBeCuratedStr to resultsToBeCurated as string
-        set AppleScript's text item delimiters to oldDelims
-        
-        return curatedStr & "===SEPARATOR===" & toBeCuratedStr
+        return output
     end tell
     '''
     stdout = run_applescript(script)
-    curated_uuids = set()
-    to_be_curated_uuids = set()
+    curated_map = {}
+    to_be_curated_map = {}
     if stdout:
-        parts = stdout.split("===SEPARATOR===")
-        if len(parts) >= 1 and parts[0].strip():
-            curated_uuids = {line.strip().split('/')[0] for line in parts[0].strip().split('\n') if line.strip()}
-        if len(parts) >= 2 and parts[1].strip():
-            to_be_curated_uuids = {line.strip().split('/')[0] for line in parts[1].strip().split('\n') if line.strip()}
-    return curated_uuids, to_be_curated_uuids
+        for line in stdout.strip().split('\n'):
+            if not line.strip():
+                continue
+            parts = line.strip().split('|')
+            if len(parts) < 3:
+                continue
+            category, album_name, ids_str = parts[0], parts[1], parts[2]
+            uuids = {uid.split('/')[0] for uid in ids_str.split(',') if uid.strip()}
+            if category == 'Curated':
+                if album_name not in curated_map:
+                    curated_map[album_name] = set()
+                curated_map[album_name].update(uuids)
+            elif category == 'ToBeCurated':
+                if album_name not in to_be_curated_map:
+                    to_be_curated_map[album_name] = set()
+                to_be_curated_map[album_name].update(uuids)
+    return curated_map, to_be_curated_map
 
 def get_skip_publishing_asset_ids():
     script = '''
@@ -385,14 +436,17 @@ def main():
         return
 
     logger.info(f"Analyzing {len(album_candidates)} potential albums for synchronization...")
+    
+    # Query Apple Photos for all album contents in a single fast call
+    curated_map, to_be_curated_map = get_all_moment_photos_assets(list(album_candidates.keys()))
 
     albums_to_sync = []
     # Dict to cache computed expected assets and curated UUIDs so we don't have to re-evaluate them
     sync_jobs = {}
 
     for album_name, candidates in sorted(album_candidates.items()):
-        # Query Photos for Curated and ToBeCurated contents in one AppleScript call
-        curated_uuids, to_be_curated_uuids = get_moment_photos_assets(album_name)
+        curated_uuids = curated_map.get(album_name, set())
+        to_be_curated_uuids = to_be_curated_map.get(album_name, set())
 
         # Fetch previously exported curated assets from the database to identify explicitly rejected/skipped items
         cursor.execute("SELECT asset_id FROM moment_exports WHERE album_name = ? AND curation_stage = 'curated'", (album_name,))
@@ -429,6 +483,10 @@ def main():
         is_being_curated = album_name in curated_moments
         content_mismatch = (expected_uuids != to_be_curated_uuids)
         missing_db_exports = any(db_exported_id is None for asset_id, moment_name, score, db_exported_id in candidates if asset_id in expected_uuids)
+
+        # Optimization: Do not sync empty albums if they are already empty in Apple Photos
+        if len(expected_uuids) == 0 and len(to_be_curated_uuids) == 0:
+            continue
 
         if not folder_exists or is_being_curated or content_mismatch or missing_db_exports:
             albums_to_sync.append(album_name)

@@ -1609,7 +1609,37 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                     if photos_bases == fs_bases:
                         curated_str = "✅ Yes"
                     else:
-                        curated_str = "⚠️  Mismatch"
+                        logger.info(f"🔄 Auto-fixing mismatch for moment '{name}' by running Option [2] (Export)...")
+                        script_dir = os.path.dirname(os.path.abspath(__file__))
+                        
+                        # Ensure CURATED_LACIE_DIR destination folder exists
+                        dest_folder = os.path.join(CURATED_LACIE_DIR, name)
+                        os.makedirs(dest_folder, exist_ok=True)
+                        
+                        try:
+                            # Run export_curated_album.py synchronously to export Curated album to local folder
+                            subprocess.run([sys.executable, os.path.join(script_dir, "export_curated_album.py"), name], check=True)
+                            logger.info(f"✅ Auto-export complete for '{name}'. Re-evaluating folder contents...")
+                            
+                            # Re-read the filesystem folder contents
+                            all_files = []
+                            if os.path.exists(fs_curated_path):
+                                all_files = [f for f in os.listdir(fs_curated_path) 
+                                             if os.path.isfile(os.path.join(fs_curated_path, f)) 
+                                             and not f.startswith('.')]
+                            fs_bases = set(os.path.splitext(f)[0].lower() for f in all_files)
+                            fs_count = len(fs_bases)
+                            assets_display = str(fs_count)
+                            data['curated_count'] = fs_count
+                            
+                            # Compare again
+                            if photos_bases == fs_bases:
+                                curated_str = "✅ Yes"
+                            else:
+                                curated_str = "⚠️  Mismatch (Auto-fix failed)"
+                        except Exception as e:
+                            logger.error(f"Auto-export failed for '{name}': {e}")
+                            curated_str = "⚠️  Mismatch"
                 else:
                     curated_str = "✅ Yes"
             elif curated_exists and not fs_curated_exists:

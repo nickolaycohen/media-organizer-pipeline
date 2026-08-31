@@ -16,7 +16,7 @@ from utils.utils import get_full_transition_path, human_readable_size
 from google_photos import check_google_quota, authenticate, get_all_favorites
 import argparse
 import sqlite3
-from constants import MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_LOCK_PATH, APPLE_PHOTOS_DB_PATH, LOG_PATH, GOOGLE_PHOTOS_READONLY_SCOPES, GOOGLE_DRIVE_READ_ONLY_SCOPES, PLANNER_REQUIRED_SCOPES, CURATION_THRESHOLD_LOG_PATH, PUBLISHED_MOMENTS_LOG_PATH, SCORING_BREAKDOWN_LOG_PATH, MEDIA_CLEANUP_LOG_PATH, WEEKLY_MEMORY_LOG_PATH, MAX_UPLOAD_FILE_SIZE_BYTES, MAX_UPLOAD_FILE_SIZE_MB, BG_SERVICE_PID_PATH
+from constants import MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_LOCK_PATH, APPLE_PHOTOS_DB_PATH, LOG_PATH, GOOGLE_PHOTOS_READONLY_SCOPES, GOOGLE_DRIVE_READ_ONLY_SCOPES, PLANNER_REQUIRED_SCOPES, CURATION_THRESHOLD_LOG_PATH, PUBLISHED_MOMENTS_LOG_PATH, SCORING_BREAKDOWN_LOG_PATH, MEDIA_CLEANUP_LOG_PATH, WEEKLY_MEMORY_LOG_PATH, PUBLISHING_RECOMMENDATIONS_LOG_PATH, MAX_UPLOAD_FILE_SIZE_BYTES, MAX_UPLOAD_FILE_SIZE_MB, BG_SERVICE_PID_PATH
 from constants import ACTIVE_CAMERA_MODELS, DEVICE_OWNER_MAPPING
 from db.connections import get_connection, get_cursor, commit, close as close_conn
 from db.queries import get_stage_transitions, get_batch_statuses, get_latest_import_and_month
@@ -2003,19 +2003,20 @@ def run_memory_publishing_flow(cursor=None, conn=None):
         top_recommendations = actionable_recs[:12] + disjoint_recs[:10]
         
         if top_recommendations:
-            print("\n==================================================================================================================================================================")
-            print("📢 Publishing Recommendations (Top 12 Actionable & Top 10 Disjoint Candidates)")
-            print("==================================================================================================================================================================")
-            print(f"{'No.':<4} {'Moment Name':<30} {'Avg Score':<10} {'Files':<6} {'Pub.':<5} {'Rec.':<5} {'Recommendation/Action':<40} {'Recommended Assets / Suggested Merge'}")
-            print("-" * 168)
+            rec_lines = []
+            rec_lines.append("\n==================================================================================================================================================================")
+            rec_lines.append("📢 Publishing Recommendations (Top 12 Actionable & Top 10 Disjoint Candidates)")
+            rec_lines.append("==================================================================================================================================================================")
+            rec_lines.append(f"{'No.':<4} {'Moment Name':<30} {'Avg Score':<10} {'Files':<6} {'Pub.':<5} {'Rec.':<5} {'Recommendation/Action':<40} {'Recommended Assets / Suggested Merge'}")
+            rec_lines.append("-" * 168)
             divider_printed = False
             start_idx = len(ranked_moments) + 1
             for idx, rec in enumerate(top_recommendations, start_idx):
                 displayed_moments_map[idx] = {'name': rec['name'], 'type': 'recommendation', 'rec_bases': rec['rec_bases'], 'action': rec['action']}
                 if rec['action'].startswith("Disjoint") and not divider_printed:
-                    print("-" * 168)
-                    print(f"--- Disjoint Moments (Need Merge) " + "-" * 134)
-                    print("-" * 168)
+                    rec_lines.append("-" * 168)
+                    rec_lines.append(f"--- Disjoint Moments (Need Merge) " + "-" * 134)
+                    rec_lines.append("-" * 168)
                     divider_printed = True
                 
                 if rec['action'].startswith("Disjoint"):
@@ -2027,8 +2028,16 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                         assets_str = ", ".join(rec['rec_bases'][:4]) + f" (+{len(rec['rec_bases'])-4} more)"
                 else:
                     assets_str = "—"
-                print(f"{idx:<4} {rec['name']:<30} {rec['avg_score']:<10.4f} {rec['total_unique']:<6} {rec['pub_count']:<5} {rec['rec_count']:<5} {rec['action']:<40} {assets_str}")
-            print("==================================================================================================================================================================\n")
+                rec_lines.append(f"{idx:<4} {rec['name']:<30} {rec['avg_score']:<10.4f} {rec['total_unique']:<6} {rec['pub_count']:<5} {rec['rec_count']:<5} {rec['action']:<40} {assets_str}")
+            rec_lines.append("==================================================================================================================================================================\n")
+
+            try:
+                os.makedirs(os.path.dirname(PUBLISHING_RECOMMENDATIONS_LOG_PATH), exist_ok=True)
+                with open(PUBLISHING_RECOMMENDATIONS_LOG_PATH, 'w', encoding='utf-8') as f:
+                    f.write("\n".join(rec_lines) + "\n")
+                print(f"📄 Publishing Recommendations report saved to: {PUBLISHING_RECOMMENDATIONS_LOG_PATH}\n")
+            except Exception as e:
+                logger.warning(f"Could not write publishing recommendations log: {e}")
 
             # Display Curated Moments Pending Publishing Table
             pending_publishing_moments = []

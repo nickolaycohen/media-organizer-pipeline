@@ -12,7 +12,7 @@ from constants import MEDIA_ORGANIZER_DB_PATH, LOG_PATH, APPLE_SCRIPT_LOG_PATH, 
 
 MODULE_TAG = "apple_moments_sync"
 logger = setup_logger(LOG_PATH, MODULE_TAG)
-as_logger = setup_logger(APPLE_SCRIPT_LOG_PATH, "applescript_worker")
+as_logger = setup_logger(APPLE_SCRIPT_LOG_PATH, "applescript_worker", include_console=False)
 
 def run_applescript(script_content):
     as_logger.info(f"--- START APPLESCRIPT EXECUTION ---\n{script_content}\n--- END SCRIPT CONTENT ---")

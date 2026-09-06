@@ -1,3 +1,194 @@
+-- 1. Attach the Photos.sqlite database as 'photos_db'
+ATTACH DATABASE '/Volumes/Extreme Pro/Photos Library/All-Media.photoslibrary/database/Photos.sqlite' AS photos_db;
+
+-- (If using your local DB copy instead, use this line instead:)
+-- ATTACH DATABASE '/Users/nickolaycohen/Photos Library DB/All-Media-Extreme/database/Photos.sqlite' AS photos_db;
+
+-- 2. Run the Skipped Videos Query
+-- 1. Attach Apple Photos database
+ATTACH DATABASE '/Volumes/Extreme Pro/Photos Library/All-Media.photoslibrary/database/Photos.sqlite' AS photos_db;
+-- (Or local copy:)
+-- ATTACH DATABASE '/Users/nickolaycohen/Photos Library DB/All-Media-Extreme/database/Photos.sqlite' AS photos_db;
+
+-- 2. Query Skipped Videos with Removal Status, Source & Owner
+SELECT 
+    a.original_filename,
+    a.month,
+    COALESCE(v.score_normalized, 0.0) AS score,
+    a.date_created_utc,
+    COALESCE(zea.ZCAMERAMODEL, zea.ZCAMERAMAKE, 'Unknown') AS source_name,
+    COALESCE(
+        do.owner_name,
+        CASE 
+            WHEN zea.ZCAMERAMODEL IN ('iPhone 16 Pro', 'iPhone 13 Pro Max', 'iPhone 11 Pro', 'iPhone 8 Plus', 'iPhone 6s', 'iPhone 5s', 'iPhone 4') THEN 'Nickolay'
+            WHEN zea.ZCAMERAMODEL IN ('iPhone 17 Pro Max', 'iPhone 12 Pro Max', 'iPhone 14 Pro Max', 'iPhone 11 Pro Max', 'iPhone XS Max') THEN 'Wife'
+            WHEN zea.ZCAMERAMODEL IN ('iPhone 12', 'iPhone 13 Pro') THEN 'Kid'
+            WHEN zea.ZCAMERAMODEL IN ('Canon EOS Rebel T7', 'Canon EOS 5D Mark IV', 'Canon EOS 5D', 'HERO12 Black', 'HERO7 Silver') THEN 'Shared'
+            ELSE 'Shared/Other'
+        END
+    ) AS owner,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 
+            FROM photos_db.Z_30ASSETS aa_rem 
+            JOIN photos_db.ZGENERICALBUM ga_rem ON ga_rem.Z_PK = aa_rem.Z_30ALBUMS
+            WHERE aa_rem.Z_3ASSETS = za.Z_PK 
+              AND ga_rem.ZTITLE = 'Removed from Source'
+              AND ga_rem.ZTRASHEDSTATE = 0
+        ) THEN '✅ Yes' 
+        ELSE '❌ No' 
+    END AS is_removed_from_source,
+    CASE WHEN a.uploaded_to_google = 1 THEN '✅ Yes' ELSE '❌ No' END AS uploaded_to_google,
+    za.Z_PK
+FROM assets a
+JOIN photos_db.ZASSET za ON za.ZUUID = a.asset_id
+JOIN photos_db.Z_30ASSETS aa ON aa.Z_3ASSETS = za.Z_PK
+JOIN photos_db.ZGENERICALBUM ga ON ga.Z_PK = aa.Z_30ALBUMS
+LEFT JOIN photos_db.ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
+LEFT JOIN device_owners do ON do.camera_model = zea.ZCAMERAMODEL
+LEFT JOIN ranked_assets_view v ON v.asset_id = a.asset_id
+WHERE ga.ZTITLE = 'Google Upload Skipped Videos'
+  AND ga.ZTRASHEDSTATE = 0
+  AND za.ZTRASHEDSTATE = 0
+ORDER BY v.score_normalized DESC NULLS LAST
+-- LIMIT 15;
+
+
+-- ============================================================================
+-- Device Cleanup Summary with Featured Photos & Published Moments
+-- ============================================================================
+SELECT 
+    a.month AS asset_month,
+    COALESCE(do.owner_name, 'Shared/Other') AS primary_owner,
+    COALESCE(zea.ZCAMERAMODEL, 'Unknown') AS device_camera_model,
+    COUNT(a.asset_id) AS total_assets_on_device,
+    SUM(CASE WHEN a.mobile_apple_photos_featured_photos = 1 THEN 1 ELSE 0 END) AS featured_count,
+    GROUP_CONCAT(CASE WHEN a.mobile_apple_photos_featured_photos = 1 THEN a.original_filename END, ', ') AS featured_filenames,
+    SUM(CASE WHEN a.google_favorite = 1 THEN 1 ELSE 0 END) AS google_fav_count,
+    COUNT(DISTINCT p.asset_id) AS published_count,
+    GROUP_CONCAT(DISTINCT p.moment_name) AS published_moments_or_albums  -- 👈 Placed right after published_count
+FROM assets a
+LEFT JOIN ZASSET za ON za.ZUUID = a.asset_id
+LEFT JOIN ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
+LEFT JOIN device_owners do ON do.camera_model = zea.ZCAMERAMODEL
+LEFT JOIN publications p ON p.asset_id = a.asset_id
+-- WHERE a.month = '2026-07'  -- 👈 Change month here (or remove to view all months)
+GROUP BY a.month, primary_owner, device_camera_model
+HAVING featured_count > 0 OR published_count > 0
+ORDER BY primary_owner ASC, asset_month desc;
+
+-- ============================================================================
+-- Summary of Featured Assets Grouped by Device & Month
+-- ============================================================================
+SELECT 
+    a.month AS asset_month,
+    COALESCE(do.owner_name, 'Shared/Other') AS primary_owner,
+    COALESCE(zea.ZCAMERAMODEL, 'Unknown') AS device_camera_model,
+    COUNT(a.asset_id) AS total_assets_on_device,
+    SUM(CASE WHEN a.mobile_apple_photos_featured_photos = 1 THEN 1 ELSE 0 END) AS featured_count,
+    GROUP_CONCAT(CASE WHEN a.mobile_apple_photos_featured_photos = 1 THEN a.original_filename END, ', ') AS featured_filenames,
+    SUM(CASE WHEN a.google_favorite = 1 THEN 1 ELSE 0 END) AS google_fav_count,
+    COUNT(DISTINCT p.asset_id) AS published_count
+FROM assets a
+LEFT JOIN ZASSET za ON za.ZUUID = a.asset_id
+LEFT JOIN ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
+LEFT JOIN device_owners do ON do.camera_model = zea.ZCAMERAMODEL
+LEFT JOIN publications p ON p.asset_id = a.asset_id
+-- WHERE a.month = '2026-07'  -- 👈 Change month here
+GROUP BY a.month, primary_owner, device_camera_model
+HAVING featured_count > 0
+ORDER BY primary_owner ASC, asset_month desc, device_camera_model ASC;
+
+
+-- save assets to clean from source
+-- ============================================================================
+-- Media Cleanup Recommendation Overview for DBeaver
+-- Shows which months and devices are imported, Google-rated, and published.
+-- ============================================================================
+WITH device_month_stats AS (
+    SELECT 
+        COALESCE(zea.ZCAMERAMODEL, 'Unknown') AS camera_model,
+        zea.ZCAMERAMAKE AS camera_make,
+        a.month,
+        COUNT(DISTINCT a.asset_id) AS total_imported_assets,
+        SUM(CASE WHEN a.google_favorite = 1 THEN 1 ELSE 0 END) AS google_fav_count,
+        SUM(CASE WHEN a.aesthetic_score IS NOT NULL AND a.aesthetic_score > 0 THEN 1 ELSE 0 END) AS aesthetic_scored_count,
+        MIN(a.original_filename) AS earliest_imported_file,
+        MAX(a.original_filename) AS latest_imported_file,
+        MIN(a.date_created_utc) AS min_date_created,
+        MAX(a.date_created_utc) AS max_date_created
+    FROM assets a
+    LEFT JOIN ZASSET za ON za.ZUUID = a.asset_id
+    LEFT JOIN ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
+    GROUP BY COALESCE(zea.ZCAMERAMODEL, 'Unknown'), zea.ZCAMERAMAKE, a.month
+),
+published_stats AS (
+    SELECT 
+        COALESCE(zea.ZCAMERAMODEL, 'Unknown') AS camera_model,
+        a.month,
+        COUNT(DISTINCT p.asset_id) AS published_count,
+        GROUP_CONCAT(DISTINCT p.moment_name) AS published_moments,
+        GROUP_CONCAT(DISTINCT p.platform) AS platforms
+    FROM publications p
+    JOIN assets a ON p.asset_id = a.asset_id
+    LEFT JOIN ZASSET za ON za.ZUUID = a.asset_id
+    LEFT JOIN ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
+    GROUP BY COALESCE(zea.ZCAMERAMODEL, 'Unknown'), a.month
+)
+SELECT 
+    COALESCE(do.owner_name, 'Shared/Other') AS primary_owner,
+    dms.camera_model AS device_camera_model,
+    dms.month AS asset_month,
+    mb.status_code AS batch_status_code,
+    bs.short_label AS batch_stage,
+    dms.total_imported_assets,
+    dms.google_fav_count AS google_favorites,
+    COALESCE(ps.published_count, 0) AS published_assets_count,
+    ps.published_moments,
+    dms.earliest_imported_file || ' -> ' || dms.latest_imported_file AS source_filename_range,
+    dms.min_date_created || ' to ' || dms.max_date_created AS capture_date_range,
+    CASE 
+        WHEN mb.status_code >= '650' AND COALESCE(ps.published_count, 0) > 0 
+            THEN '✅ SAFE TO REMOVE: Curated, Ranked & Published'
+        WHEN mb.status_code >= '600' AND COALESCE(ps.published_count, 0) > 0 
+            THEN '✅ SAFE TO REMOVE: Ranked & Published'
+        WHEN mb.status_code >= '550' AND COALESCE(ps.published_count, 0) > 0 
+            THEN '⚠️ Google rated & Published (Pipeline in progress)'
+        WHEN mb.status_code >= '550' 
+            THEN '⏳ Rated with Google (Not yet published)'
+        WHEN mb.status_code >= '400' 
+            THEN '⏳ In Google Pipeline (Awaiting curation)'
+        ELSE '❌ NOT SAFE: Pipeline pending'
+    END AS recommendation_status
+FROM device_month_stats dms
+LEFT JOIN published_stats ps ON ps.camera_model = dms.camera_model AND ps.month = dms.month
+LEFT JOIN device_owners do ON do.camera_model = dms.camera_model
+LEFT JOIN month_batches mb ON mb.month = dms.month
+LEFT JOIN batch_status bs ON mb.status_code = bs.code
+WHERE COALESCE(ps.published_count, 0) > 0 OR mb.status_code >= '600'
+ORDER BY primary_owner ASC, 
+-- ============================================================================
+-- Summary of Featured Assets Grouped by Device & Month
+-- ============================================================================
+SELECT 
+    a.month AS asset_month,
+    COALESCE(do.owner_name, 'Shared/Other') AS primary_owner,
+    COALESCE(zea.ZCAMERAMODEL, 'Unknown') AS device_camera_model,
+    COUNT(a.asset_id) AS total_assets_on_device,
+    SUM(CASE WHEN a.mobile_apple_photos_featured_photos = 1 THEN 1 ELSE 0 END) AS featured_count,
+    GROUP_CONCAT(CASE WHEN a.mobile_apple_photos_featured_photos = 1 THEN a.original_filename END, ', ') AS featured_filenames,
+    SUM(CASE WHEN a.google_favorite = 1 THEN 1 ELSE 0 END) AS google_fav_count,
+    COUNT(DISTINCT p.asset_id) AS published_count
+FROM assets a
+LEFT JOIN ZASSET za ON za.ZUUID = a.asset_id
+LEFT JOIN ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
+LEFT JOIN device_owners do ON do.camera_model = zea.ZCAMERAMODEL
+LEFT JOIN publications p ON p.asset_id = a.asset_id
+WHERE a.month = '2026-07'  -- 👈 Change month here
+GROUP BY a.month, primary_owner, device_camera_model
+HAVING featured_count > 0
+ORDER BY primary_owner ASC, device_camera_model ASC; ;
+
 -- get count of favorites for month batches
 select mb.*, 
 	(select count() from assets a WHERE a.google_favorite = 1 and a."month" = mb."month")

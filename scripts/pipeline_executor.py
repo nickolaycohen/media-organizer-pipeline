@@ -6,10 +6,11 @@ import platform
 import shutil
 import argparse
 import logging
+import threading
 from db.queries import get_next_code
 from utils.utils import set_batch_status
 from utils.logger import setup_logger
-from constants import LOG_PATH, APPLE_PHOTOS_DB_COPY_PATH, APPLE_PHOTOS_DB_LOCK_PATH
+from constants import LOG_PATH, APPLE_PHOTOS_DB_COPY_PATH, APPLE_PHOTOS_DB_LOCK_PATH, MEDIA_ORGANIZER_DB_PATH, STAGING_ROOT
 import json
 import socket
 import errno
@@ -25,6 +26,137 @@ import atexit
 from db.connections import get_connection, get_cursor, commit, close as close_conn
 
 LOCK_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), "../db/executor.lock"))
+
+class ExecutorState:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.current_month = None
+        self.current_plan_id = None
+        self.current_step_label = None
+        self.current_step_start_time = None
+        self.batch_start_time = None
+        self.executed_count = 0
+        self.running = True
+
+executor_state = ExecutorState()
+
+def format_duration(seconds):
+    if seconds is None or seconds < 0:
+        return "0s"
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"{h}h {m}m {s}s"
+    elif m > 0:
+        return f"{m}m {s}s"
+    else:
+        return f"{s}s"
+
+def report_status(c_month, c_plan_id, c_step, step_start, b_start, executed_count):
+    active_plans = []
+    total_assets = 0
+    uploaded_assets = 0
+    batch_status_code = "—"
+    batch_status_desc = "—"
+    staged_count = 0
+
+    try:
+        conn = sqlite3.connect(f"file:{MEDIA_ORGANIZER_DB_PATH}?mode=ro", uri=True, timeout=5.0)
+        cursor = conn.cursor()
+        
+        # Query active queue
+        cursor.execute("SELECT id, planned_month FROM planned_execution WHERE active = 1 ORDER BY id ASC")
+        active_plans = cursor.fetchall()
+
+        if c_month:
+            # Query batch status
+            cursor.execute("SELECT status_code FROM month_batches WHERE month = ?", (c_month,))
+            s_row = cursor.fetchone()
+            if s_row and s_row[0]:
+                batch_status_code = s_row[0]
+                cursor.execute("SELECT pipeline_stage, full_description FROM batch_status WHERE code = ?", (batch_status_code,))
+                desc_row = cursor.fetchone()
+                if desc_row:
+                    batch_status_desc = f"{desc_row[0]} {desc_row[1]}"
+
+            # Query asset progress
+            cursor.execute("SELECT COUNT(*) FROM assets WHERE month = ? AND (ignore_continuity_check = 0 OR ignore_continuity_check IS NULL)", (c_month,))
+            tot_row = cursor.fetchone()
+            total_assets = tot_row[0] if tot_row else 0
+
+            cursor.execute("SELECT COUNT(*) FROM assets WHERE month = ? AND uploaded_to_google = 1", (c_month,))
+            up_row = cursor.fetchone()
+            uploaded_assets = up_row[0] if up_row else 0
+
+        conn.close()
+    except Exception as e:
+        logger.warning(f"Status heartbeat database read warning: {e}")
+
+    if c_month:
+        staging_dir = os.path.join(STAGING_ROOT, c_month)
+        if os.path.isdir(staging_dir):
+            try:
+                staged_count = len([f for f in os.listdir(staging_dir) if os.path.isfile(os.path.join(staging_dir, f)) and not f.startswith('.')])
+            except Exception:
+                pass
+
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = []
+    lines.append("\n" + "=" * 90)
+    lines.append(f"⏱️  [Status Heartbeat] Pipeline Executor Progress ({now_str})")
+    lines.append("-" * 90)
+    if c_month:
+        b_elapsed = format_duration(time.time() - b_start) if b_start else "0s"
+        s_elapsed = format_duration(time.time() - step_start) if step_start else "0s"
+        lines.append(f" • Active Batch:      {c_month} (Queue ID: {c_plan_id}, batch elapsed: {b_elapsed})")
+        if c_step:
+            lines.append(f" • Current Step:      {c_step} (step elapsed: {s_elapsed})")
+        lines.append(f" • Batch Status:      {batch_status_code} ({batch_status_desc})")
+        if total_assets > 0:
+            pct = (uploaded_assets / total_assets) * 100.0
+            lines.append(f" • Asset Progress:    {uploaded_assets} / {total_assets} uploaded ({pct:.1f}%) | {staged_count} staged export file(s)")
+        else:
+            lines.append(f" • Asset Progress:    {staged_count} staged export file(s)")
+    else:
+        lines.append(" • Active Batch:      None (Waiting / Idle)")
+
+    pending_queue_count = len(active_plans)
+    if active_plans:
+        queue_str = ", ".join([r[1] for r in active_plans])
+        lines.append(f" • Remaining Queue:   {pending_queue_count} batch(es) pending [{queue_str}] (Completed so far: {executed_count})")
+    else:
+        lines.append(f" • Remaining Queue:   0 batches pending (Completed so far: {executed_count})")
+    lines.append("=" * 90 + "\n")
+
+    report_text = "\n".join(lines)
+    print(report_text, flush=True)
+    logger.info(f"⏱️ Heartbeat: Batch {c_month or 'None'} | Step: {c_step or 'None'} | Assets: {uploaded_assets}/{total_assets} | Queue pending: {pending_queue_count}")
+
+def status_reporter_worker(interval_sec=180):
+    while True:
+        elapsed = 0
+        while elapsed < interval_sec:
+            time.sleep(5)
+            elapsed += 5
+            with executor_state.lock:
+                if not executor_state.running:
+                    return
+
+        with executor_state.lock:
+            if not executor_state.running:
+                return
+            c_month = executor_state.current_month
+            c_plan_id = executor_state.current_plan_id
+            c_step = executor_state.current_step_label
+            step_start = executor_state.current_step_start_time
+            b_start = executor_state.batch_start_time
+            ex_count = executor_state.executed_count
+
+        try:
+            report_status(c_month, c_plan_id, c_step, step_start, b_start, ex_count)
+        except Exception as e:
+            logger.warning(f"Error in status reporter heartbeat: {e}")
+
 
 def acquire_lock():
     if os.path.exists(LOCK_FILE):
@@ -255,6 +387,9 @@ def log_execution(conn, label, status, batch_month_id=None):
 
 def run_step(step: PipelineStep, dry_run=False, month=None, command=None):
     logger.info(f"▶️ Starting: {step.label}")
+    with executor_state.lock:
+        executor_state.current_step_label = step.label
+        executor_state.current_step_start_time = time.time()
     batch_month_id = None
     if month is not None:
         acquire_db_lock()
@@ -471,30 +606,50 @@ def main(args):
     all_steps = bootstrap_steps.copy()
     all_steps.extend(steps)
 
-    # Check for active planned executions in queue
-    acquire_db_lock()
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, planned_month FROM planned_execution WHERE active = 1 ORDER BY id ASC")
-    planned_rows = cursor.fetchall()
-    close_conn()
-    release_db_lock()
-
-    if not planned_rows:
-        if args.cron:
-            logger.info("No active planned execution found in queue. Exiting silently.")
-            sys.exit(0)
-        else:
-            logger.error("🚫 No active planned execution found in queue. Please run pipeline_planner first.")
-            sys.exit(1)
-
-    total_plans = len(planned_rows)
-    logger.info(f"📋 Found {total_plans} active planned execution(s) in queue: {[r[1] for r in planned_rows]}")
-
     from_index, to_index = 0, len(all_steps)
+    executed_count = 0
+    processed_dry_run_ids = set()
 
-    for idx, (plan_id, month) in enumerate(planned_rows, 1):
-        logger.info(f"\n{'='*60}\n🚀 [{idx}/{total_plans}] Starting execution for planned batch: {month} (Queue ID: {plan_id})\n{'='*60}")
+    # Start background status heartbeat thread (reports every 180 seconds / 3 minutes)
+    status_thread = threading.Thread(target=status_reporter_worker, args=(180,), daemon=True)
+    status_thread.start()
+
+    while True:
+        # Check for active planned executions in queue
+        acquire_db_lock()
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, planned_month FROM planned_execution WHERE active = 1 ORDER BY id ASC")
+        planned_rows = cursor.fetchall()
+        close_conn()
+        release_db_lock()
+
+        if args.dry_run:
+            planned_rows = [r for r in planned_rows if r[0] not in processed_dry_run_ids]
+
+        if not planned_rows:
+            if executed_count == 0:
+                if args.cron:
+                    logger.info("No active planned execution found in queue. Exiting silently.")
+                    sys.exit(0)
+                else:
+                    logger.error("🚫 No active planned execution found in queue. Please run pipeline_planner first.")
+                    sys.exit(1)
+            else:
+                logger.info(f"🎉 Completed all queued planned execution(s) (Total executed: {executed_count}).")
+                break
+
+        total_pending = len(planned_rows)
+        plan_id, month = planned_rows[0]
+        executed_count += 1
+
+        with executor_state.lock:
+            executor_state.current_month = month
+            executor_state.current_plan_id = plan_id
+            executor_state.batch_start_time = time.time()
+            executor_state.executed_count = executed_count
+
+        logger.info(f"\n{'='*60}\n🚀 [Batch #{executed_count} | {total_pending} pending in queue] Starting execution for planned batch: {month} (Queue ID: {plan_id})\n{'='*60}")
         
         run_bootstrap_steps(bootstrap_steps, from_index, to_index, args.dry_run, None, month)
         run_regular_steps(bootstrap_steps, steps, from_index, to_index, args.dry_run, month)
@@ -509,8 +664,18 @@ def main(args):
             close_conn()
             release_db_lock()
             logger.info(f"✅ Planned execution for {month} (Queue ID: {plan_id}) completed and marked as inactive.")
+        else:
+            processed_dry_run_ids.add(plan_id)
+            logger.info(f"[Dry Run] Simulated completion for planned batch {month} (Queue ID: {plan_id}).")
 
-    logger.info(f"🎉 Completed all {total_plans} queued planned execution(s).")
+        with executor_state.lock:
+            executor_state.current_month = None
+            executor_state.current_step_label = None
+
+        logger.info("🔍 Checking execution queue for remaining or newly scheduled batches...")
+
+    with executor_state.lock:
+        executor_state.running = False
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Execute the media organizer pipeline.")

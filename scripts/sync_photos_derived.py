@@ -17,11 +17,6 @@ def sync_assets(media_cursor, logger):
     media_cursor.execute(f"ATTACH DATABASE 'file:{APPLE_PHOTOS_DB_PATH}?mode=ro' AS photos_db;")
     logger.info("Attached Photos.sqlite database read-only.")
 
-    # Drop the broken view immediately if it exists to clear schema errors
-    # that prevent subsequent queries from running.
-    media_cursor.execute("DROP VIEW IF EXISTS main.ranked_assets_view;")
-    media_cursor.execute("DROP VIEW IF EXISTS main.photos_assets_view;")
-
     media_cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='imports'")
     i_row = media_cursor.fetchone()
 
@@ -92,11 +87,11 @@ def sync_assets(media_cursor, logger):
             LEFT JOIN ZGENERICALBUM p ON ga.ZPARENTFOLDER = p.Z_PK 
             LEFT JOIN ZGENERICALBUM gp ON p.ZPARENTFOLDER = gp.Z_PK 
             WHERE aa.Z_3ASSETS = a.Z_PK 
-            AND (p.ZTITLE IN ('Moments' ) )
+            AND (p.ZTITLE IN ('Moments', 'Curated', 'ToBeCurated'))
             AND ga.ZTRASHEDSTATE = 0
             AND ga.ZKIND <> 1507
             AND ga.ZTITLE NOT IN ('SkipPublishing', 'Ignore')
-            ORDER BY (CASE WHEN p.ZTITLE = 'Moments' THEN 0 ELSE 1 END) ASC LIMIT 1) as MomentsAlbumName,
+            ORDER BY (CASE WHEN p.ZTITLE = 'Curated' THEN 0 WHEN p.ZTITLE = 'ToBeCurated' THEN 1 ELSE 2 END) ASC LIMIT 1) as MomentsAlbumName,
             (SELECT 1 FROM Z_30ASSETS aa 
             JOIN ZGENERICALBUM ga ON ga.Z_PK = aa.Z_30ALBUMS 
             LEFT JOIN ZGENERICALBUM p ON ga.ZPARENTFOLDER = p.Z_PK
@@ -115,8 +110,7 @@ def sync_assets(media_cursor, logger):
             AND ga.ZKIND <> 1507 LIMIT 1) as mobile_apple_photos_featured_photos
         FROM ZASSET a
         JOIN ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK
-        WHERE a.ZIMPORTSESSION IS NOT NULL
-          AND a.ZTRASHEDSTATE = 0
+        WHERE a.ZTRASHEDSTATE = 0
     """)
     results = media_cursor.fetchall()
 
@@ -266,7 +260,7 @@ def sync_assets(media_cursor, logger):
         LEFT JOIN photos_db.ZGENERICALBUM p ON a.ZPARENTFOLDER = p.Z_PK
         WHERE a.ZKIND <> 1507
         and a.ZTITLE is NOT NULL
-        and p.ZTITLE = 'Moments' 
+        and p.ZTITLE IN ('Moments', 'Curated', 'ToBeCurated')
         and a.ZTRASHEDSTATE = 0
         ORDER BY a.ZTITLE;
     ''')

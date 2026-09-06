@@ -8,10 +8,11 @@ import argparse
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from utils.logger import setup_logger
-from constants import MEDIA_ORGANIZER_DB_PATH, LOG_PATH, CURATED_LACIE_DIR
+from constants import MEDIA_ORGANIZER_DB_PATH, LOG_PATH, CURATED_LACIE_DIR, APPLE_SCRIPT_LOG_PATH
 
 MODULE_TAG = "export_curated_album"
 logger = setup_logger(LOG_PATH, MODULE_TAG)
+as_logger = setup_logger(APPLE_SCRIPT_LOG_PATH, "applescript_worker", include_console=False)
 
 def run_applescript(moment_name, dest_dir):
     applescript_code = f'''
@@ -102,13 +103,37 @@ def run_applescript(moment_name, dest_dir):
     end run
     '''
     
-    logger.info(f"Running AppleScript to export curated album '{moment_name}' to {dest_dir}...")
+    as_logger.info(f"--- START APPLESCRIPT EXECUTION ({moment_name}) ---\n{applescript_code}\n--- END SCRIPT CONTENT ---")
     process = subprocess.Popen(['osascript', '-e', applescript_code, moment_name, dest_dir], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     stdout, stderr = process.communicate()
     
     if stderr:
-        logger.warning(f"AppleScript Warning/Stderr: {stderr.strip()}")
+        as_logger.error(f"AppleScript Error ({moment_name}):\n{stderr}")
+    if stdout:
+        as_logger.info(f"AppleScript Output ({moment_name}):\n{stdout}")
+    as_logger.info("--- FINISHED EXECUTION ---\n")
     return stdout.strip()
+
+def get_skipped_publishing_uuids():
+    from constants import APPLE_PHOTOS_DB_PATH
+    skipped_uuids = set()
+    if os.path.exists(APPLE_PHOTOS_DB_PATH):
+        try:
+            conn_photos = sqlite3.connect(f"file:{APPLE_PHOTOS_DB_PATH}?mode=ro", uri=True)
+            c = conn_photos.cursor()
+            c.execute("""
+                SELECT DISTINCT z.ZUUID
+                FROM ZASSET z
+                JOIN Z_30ASSETS aa ON aa.Z_3ASSETS = z.Z_PK
+                JOIN ZGENERICALBUM ga ON ga.Z_PK = aa.Z_30ALBUMS
+                WHERE LOWER(ga.ZTITLE) IN ('skippublishing', 'ignore')
+                  AND ga.ZTRASHEDSTATE = 0 AND z.ZTRASHEDSTATE = 0
+            """)
+            skipped_uuids = set(r[0] for r in c.fetchall() if r[0])
+            conn_photos.close()
+        except Exception as e:
+            logger.warning(f"Could not load skipped assets from Photos DB: {e}")
+    return skipped_uuids
 
 def main():
     parser = argparse.ArgumentParser(description="Export curated photos from Apple Photos to LaCie and record them in the database.")
@@ -130,19 +155,28 @@ def main():
 
     # Parse exported asset IDs and filenames
     lines = [line.strip() for line in result.split("\n") if line.strip()]
-    asset_ids = []
-    expected_filenames = []
+    raw_asset_ids = []
+    raw_expected_filenames = []
     for line in lines:
         if '|' in line:
             rid, fname = line.split('|', 1)
             # Extract UUID (part before first slash, e.g. "8E0CE138-0096-4A73-A338-709B5AD8A758/L0/001")
             uuid = rid.split("/")[0]
-            asset_ids.append(uuid)
-            expected_filenames.append(fname)
+            raw_asset_ids.append(uuid)
+            raw_expected_filenames.append(fname)
+
+    # Filter out assets in SkipPublishing or Ignore albums
+    skipped_uuids = get_skipped_publishing_uuids()
+    valid_items = [(aid, fname) for aid, fname in zip(raw_asset_ids, raw_expected_filenames) if aid not in skipped_uuids]
+    asset_ids = [item[0] for item in valid_items]
+    expected_filenames = [item[1] for item in valid_items]
+
+    if len(raw_asset_ids) != len(asset_ids):
+        logger.info(f"🚫 Excluded {len(raw_asset_ids) - len(asset_ids)} assets that are in SkipPublishing / Ignore.")
 
     logger.info(f"✅ Successfully verified/exported {len(asset_ids)} items to {dest_dir}")
 
-    # Prune extra files in dest_dir that do not correspond to the curated album assets
+    # Prune extra files in dest_dir that do not correspond to the curated album assets (or are skipped)
     expected_bases = set(os.path.splitext(f)[0].lower() for f in expected_filenames)
     if os.path.exists(dest_dir):
         try:
@@ -153,10 +187,10 @@ def main():
                     f_base = os.path.splitext(f)[0].lower()
                     if f_base not in expected_bases:
                         os.remove(file_path)
-                        logger.info(f"🗑️ Pruned extra file from curated directory: {f}")
+                        logger.info(f"🗑️ Pruned extra/skipped file from curated directory: {f}")
                         pruned_count += 1
             if pruned_count > 0:
-                logger.info(f"✅ Pruned {pruned_count} extra/stale files from {dest_dir}")
+                logger.info(f"✅ Pruned {pruned_count} extra/stale/skipped files from {dest_dir}")
         except Exception as e:
             logger.warning(f"Failed to prune extra files in {dest_dir}: {e}")
 
@@ -169,14 +203,21 @@ def main():
     cursor = conn.cursor()
 
     try:
-        # 1. Update moment_exports with curation_stage = 'curated'
+        # 1. Clean up any previous moment_exports for this album that are skipped
+        if skipped_uuids:
+            cursor.executemany("""
+                DELETE FROM moment_exports
+                WHERE (album_name = ? OR album_name = ?) AND asset_id = ?
+            """, [(moment_name, moment_name.strip(), sid) for sid in skipped_uuids])
+
+        # 2. Update moment_exports with curation_stage = 'curated' for valid items
         export_data = [(aid, moment_name, 'curated') for aid in asset_ids]
         cursor.executemany("""
             INSERT OR REPLACE INTO moment_exports (asset_id, album_name, curation_stage, exported_at_utc)
             VALUES (?, ?, ?, datetime('now'))
         """, export_data)
 
-        # 2. Update assets table with curated_album name
+        # 3. Update assets table with curated_album name
         for aid in asset_ids:
             cursor.execute("""
                 UPDATE assets 
@@ -184,7 +225,15 @@ def main():
                 WHERE asset_id = ?
             """, (moment_name, aid))
 
-        # 3. Update curated_moments tracking
+        # 4. Clear curated_album for any skipped assets
+        if skipped_uuids:
+            cursor.executemany("""
+                UPDATE assets
+                SET curated_album = NULL
+                WHERE curated_album = ? AND asset_id = ?
+            """, [(moment_name, sid) for sid in skipped_uuids])
+
+        # 5. Update curated_moments tracking
         cursor.execute("""
             INSERT INTO curated_moments (moment_name, curated_count, photos_curated_exists, last_curated_sync, memory_stage)
             VALUES (?, ?, 1, datetime('now'), 'M400')

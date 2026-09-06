@@ -3,7 +3,7 @@ import os
 import logging
 from logging.handlers import TimedRotatingFileHandler
 
-def setup_logger(log_file, module_tag, extra_fields=None):
+def setup_logger(log_file, module_tag, extra_fields=None, include_console=True):
     # Ensure the log directory exists
     log_dir = os.path.dirname(log_file)
     if log_dir and not os.path.exists(log_dir):
@@ -18,8 +18,10 @@ def setup_logger(log_file, module_tag, extra_fields=None):
         else:
             formatter = logging.Formatter(f'%(asctime)s [{module_tag}] - %(message)s')
 
-        console_handler = logging.StreamHandler()
-        console_handler.setFormatter(formatter)
+        if include_console:
+            console_handler = logging.StreamHandler()
+            console_handler.setFormatter(formatter)
+            logger.addHandler(console_handler)
 
         # Use TimedRotatingFileHandler to rotate logs at midnight and keep 5 days of history.
         file_handler = TimedRotatingFileHandler(
@@ -30,7 +32,6 @@ def setup_logger(log_file, module_tag, extra_fields=None):
         )
         file_handler.setFormatter(formatter)
 
-        logger.addHandler(console_handler)
         logger.addHandler(file_handler)
 
     # Attach extra fields to the logger

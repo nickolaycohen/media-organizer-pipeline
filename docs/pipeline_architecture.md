@@ -87,7 +87,7 @@ flowchart TD
     
     Start([Start Weekly Curation]) --> Dec_Threshold{"Current Dynamic Threshold<br/>aligned with Historical Target?"}:::decision
     
-    Dec_Threshold -- "Yes (No Mismatch)" --> T2_ShowMoments["Show console moments table (only M200 moments)"]:::action
+    Dec_Threshold -- "Yes (No Mismatch)" --> T2_ShowMoments["Show console moments table (M200 & M300 moments)"]:::action
     Dec_Threshold -- "No (Mismatch)" --> T2_Limited["Hide curation/publishing tables<br/>Show Unassigned High-Rank Assets table"]:::action
     
     T2_Limited --> Act_Assign_Moments["👤 User Action:<br/>Assign Moment for Assets"]:::prompt
@@ -95,7 +95,7 @@ flowchart TD
     Prompt_Refresh -- "Yes (Press Enter)" --> Dec_Threshold
     Prompt_Refresh -- "No / Exit" --> Exit_Flow([Exit Memory Flow])
     
-    T2_ShowMoments --> Dec_M200_Exists{"Are there any M200 moments?"}:::decision
+    T2_ShowMoments --> Dec_M200_Exists{"Are there any M200 or M300 moments?"}:::decision
     Dec_M200_Exists -- "Yes" --> T2_HidePublishing["Hide publishing recommendations & skipped videos<br/>Skip copying/syncing files to Recommendation folder"]:::action
     Dec_M200_Exists -- "No" --> T2_ShowPublishing["Show publishing recommendations & skipped videos<br/>Sync files to Recommendation folder"]:::action
     

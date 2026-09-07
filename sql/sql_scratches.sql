@@ -46,7 +46,16 @@ WITH all_assets_with_moments AS (
         NTILE(4) OVER (
             PARTITION BY COALESCE(zea.ZCAMERAMODEL, 'Unknown')
             ORDER BY COALESCE(v.score_normalized, 0.0) ASC
-        ) AS score_quartile
+        ) AS score_quartile,
+        CASE 
+            WHEN COALESCE(za_ext.ZKIND, za.ZKIND, 0) = 1 
+                 OR lower(a.original_filename) LIKE '%.mov' 
+                 OR lower(a.original_filename) LIKE '%.mp4' 
+                 OR lower(a.original_filename) LIKE '%.m4v' 
+                 OR lower(a.original_filename) LIKE '%.avi' 
+            THEN 'video' 
+            ELSE 'photo' 
+        END AS media_type
     FROM assets a
     LEFT JOIN photos_db.ZASSET za_ext ON za_ext.ZUUID = a.asset_id
     LEFT JOIN photos_db.ZMOMENT m ON za_ext.ZMOMENT = m.Z_PK
@@ -73,26 +82,41 @@ moment_pub_stats AS (
     FROM publications
     GROUP BY moment_name
 ),
-moment_top_siblings AS (
+ranked_siblings AS (
     SELECT 
         assigned_moment,
-        COUNT(*) AS total_moment_assets,
-        ROUND(MAX(score_normalized), 4) AS max_moment_score,
+        media_type,
+        original_filename,
+        score_normalized,
+        file_size_mb,
+        ROW_NUMBER() OVER (PARTITION BY assigned_moment, media_type ORDER BY score_normalized DESC) as rn
+    FROM all_assets_with_moments
+    WHERE assigned_moment != '—'
+),
+moment_photos AS (
+    SELECT 
+        assigned_moment,
+        COUNT(*) AS photo_count,
+        ROUND(MAX(score_normalized), 4) AS max_photo_score,
         GROUP_CONCAT(
-            original_filename || ' (score: ' || ROUND(score_normalized, 3) || ', ' || file_size_mb || 'MB)',
+            original_filename || ' (' || ROUND(score_normalized, 3) || ', ' || file_size_mb || 'MB)',
             ' | '
-        ) AS other_moment_assets_sample
-    FROM (
-        SELECT 
-            assigned_moment,
-            original_filename,
-            score_normalized,
-            file_size_mb,
-            ROW_NUMBER() OVER (PARTITION BY assigned_moment ORDER BY score_normalized DESC) as rn
-        FROM all_assets_with_moments
-        WHERE assigned_moment != '—'
-    )
-    WHERE rn <= 5  -- Top 5 highest scoring assets in the same moment
+        ) AS top_photos
+    FROM ranked_siblings
+    WHERE media_type = 'photo' AND rn <= 3
+    GROUP BY assigned_moment
+),
+moment_videos AS (
+    SELECT 
+        assigned_moment,
+        COUNT(*) AS video_count,
+        ROUND(MAX(score_normalized), 4) AS max_video_score,
+        GROUP_CONCAT(
+            original_filename || ' (' || ROUND(score_normalized, 3) || ', ' || file_size_mb || 'MB)',
+            ' | '
+        ) AS top_videos
+    FROM ranked_siblings
+    WHERE media_type = 'video' AND rn <= 3
     GROUP BY assigned_moment
 )
 SELECT 
@@ -107,15 +131,24 @@ SELECT
         WHEN c.last_asset_pub IS NOT NULL THEN '✅ ' || substr(c.last_asset_pub, 1, 10)
         ELSE '—'
     END AS moment_published_date,
-    COALESCE(s.total_moment_assets, 1) AS total_assets_in_moment,
-    s.max_moment_score AS best_score_in_moment,
-    COALESCE(s.other_moment_assets_sample, '— (Standalone / No other assets)') AS moment_top_assets_with_scores,
+    COALESCE(p.photo_count, 0) + COALESCE(v.video_count, 0) AS total_assets_in_moment,
+    MAX(COALESCE(p.max_photo_score, 0), COALESCE(v.max_video_score, 0)) AS best_score_in_moment,
+    CASE 
+        WHEN p.top_photos IS NOT NULL AND v.top_videos IS NOT NULL 
+        THEN '📷 Photos: ' || p.top_photos || '  ||  🎥 Videos: ' || v.top_videos
+        WHEN p.top_photos IS NOT NULL 
+        THEN '📷 Photos: ' || p.top_photos
+        WHEN v.top_videos IS NOT NULL 
+        THEN '🎥 Videos: ' || v.top_videos
+        ELSE '— (Standalone / No other assets)'
+    END AS moment_top_assets_with_scores,
     c.date_created_utc,
     c.primary_owner,
     c.camera_model
 FROM all_assets_with_moments c
 LEFT JOIN moment_pub_stats mp ON mp.moment_name = c.assigned_moment AND c.assigned_moment != '—'
-LEFT JOIN moment_top_siblings s ON s.assigned_moment = c.assigned_moment AND c.assigned_moment != '—'
+LEFT JOIN moment_photos p ON p.assigned_moment = c.assigned_moment AND c.assigned_moment != '—'
+LEFT JOIN moment_videos v ON v.assigned_moment = c.assigned_moment AND c.assigned_moment != '—'
 WHERE c.camera_model = 'iPhone 16 Pro'  -- 👈 Filter by device
   AND c.score_quartile IN (1, 2)         -- 👈 Bottom 50% lowest quality assets (Q1 and Q2)
   -- Optional Safety Guards (uncomment if desired):

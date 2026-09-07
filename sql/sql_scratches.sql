@@ -38,6 +38,7 @@ WITH all_assets_with_moments AS (
             END,
             '—'
         ) AS assigned_moment,
+        ps.last_asset_pub,
         aaa.ZORIGINALFILESIZE AS file_size_bytes,
         ROUND(COALESCE(aaa.ZORIGINALFILESIZE, 0) / 1048576.0, 2) AS file_size_mb,
         ROUND(COALESCE(aaa.ZORIGINALFILESIZE, 0) / 1073741824.0, 3) AS file_size_gb,
@@ -56,12 +57,19 @@ WITH all_assets_with_moments AS (
         AND (do.start_date IS NULL OR do.start_date <= date(za.ZDATECREATED + 978307200, 'unixepoch'))
         AND (do.end_date IS NULL OR do.end_date >= date(za.ZDATECREATED + 978307200, 'unixepoch'))
     LEFT JOIN (
-        SELECT asset_id, GROUP_CONCAT(DISTINCT moment_name) AS published_moments 
+        SELECT asset_id, GROUP_CONCAT(DISTINCT moment_name) AS published_moments, MAX(published_at_utc) AS last_asset_pub 
         FROM publications 
         GROUP BY asset_id
     ) ps ON ps.asset_id = a.asset_id
     LEFT JOIN ranked_assets_view v ON v.asset_id = a.asset_id
     WHERE zea.ZCAMERAMODEL IS NOT NULL AND zea.ZCAMERAMODEL != ''
+),
+moment_pub_stats AS (
+    SELECT 
+        moment_name,
+        MAX(published_at_utc) AS last_published_at
+    FROM publications
+    GROUP BY moment_name
 ),
 moment_top_siblings AS (
     SELECT 
@@ -92,6 +100,11 @@ SELECT
     c.file_size_mb,
     ROUND(c.score_normalized, 4) AS candidate_score,
     c.assigned_moment,
+    CASE 
+        WHEN mp.last_published_at IS NOT NULL THEN '✅ ' || substr(mp.last_published_at, 1, 10)
+        WHEN c.last_asset_pub IS NOT NULL THEN '✅ ' || substr(c.last_asset_pub, 1, 10)
+        ELSE '—'
+    END AS moment_published_date,
     COALESCE(s.total_moment_assets, 1) AS total_assets_in_moment,
     s.max_moment_score AS best_score_in_moment,
     COALESCE(s.other_moment_assets_sample, '— (Standalone / No other assets)') AS moment_top_assets_with_scores,
@@ -99,6 +112,7 @@ SELECT
     c.primary_owner,
     c.camera_model
 FROM all_assets_with_moments c
+LEFT JOIN moment_pub_stats mp ON mp.moment_name = c.assigned_moment AND c.assigned_moment != '—'
 LEFT JOIN moment_top_siblings s ON s.assigned_moment = c.assigned_moment AND c.assigned_moment != '—'
 WHERE c.camera_model = 'iPhone 16 Pro'  -- 👈 Filter by device
   AND c.score_quartile IN (1, 2)         -- 👈 Bottom 50% lowest quality assets (Q1 and Q2)

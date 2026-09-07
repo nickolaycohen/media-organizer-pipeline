@@ -3529,7 +3529,7 @@ def display_quartile_cleanup_flow(cursor=None, conn=None):
         selected_owner = selected_item['owner']
         print(f"\n🔍 Querying bottom 2 quartiles for {selected_owner} - {selected_model} (ordered largest-to-smallest)...")
 
-        # Query candidate files with moment siblings
+        # Query candidate files with moment siblings & publication status
         if photos_db_attached:
             cand_query = """
                 WITH all_assets_with_moments AS (
@@ -3558,6 +3558,7 @@ def display_quartile_cleanup_flow(cursor=None, conn=None):
                             END,
                             '—'
                         ) AS assigned_moment,
+                        ps.last_asset_pub,
                         aaa.ZORIGINALFILESIZE AS file_size_bytes,
                         ROUND(COALESCE(aaa.ZORIGINALFILESIZE, 0) / 1048576.0, 2) AS file_size_mb,
                         ROUND(COALESCE(aaa.ZORIGINALFILESIZE, 0) / 1073741824.0, 3) AS file_size_gb,
@@ -3575,12 +3576,19 @@ def display_quartile_cleanup_flow(cursor=None, conn=None):
                         AND (do.start_date IS NULL OR do.start_date <= date(za.ZDATECREATED + 978307200, 'unixepoch'))
                         AND (do.end_date IS NULL OR do.end_date >= date(za.ZDATECREATED + 978307200, 'unixepoch'))
                     LEFT JOIN (
-                        SELECT asset_id, GROUP_CONCAT(DISTINCT moment_name) AS published_moments 
+                        SELECT asset_id, GROUP_CONCAT(DISTINCT moment_name) AS published_moments, MAX(published_at_utc) AS last_asset_pub 
                         FROM publications 
                         GROUP BY asset_id
                     ) ps ON ps.asset_id = a.asset_id
                     LEFT JOIN ranked_assets_view v ON v.asset_id = a.asset_id
                     WHERE zea.ZCAMERAMODEL = ?
+                ),
+                moment_pub_stats AS (
+                    SELECT 
+                        moment_name,
+                        MAX(published_at_utc) AS last_published_at
+                    FROM publications
+                    GROUP BY moment_name
                 ),
                 moment_top_siblings AS (
                     SELECT 
@@ -3611,6 +3619,11 @@ def display_quartile_cleanup_flow(cursor=None, conn=None):
                     c.file_size_mb,
                     ROUND(c.score_normalized, 4) AS candidate_score,
                     c.assigned_moment,
+                    CASE 
+                        WHEN mp.last_published_at IS NOT NULL THEN '✅ ' || substr(mp.last_published_at, 1, 10)
+                        WHEN c.last_asset_pub IS NOT NULL THEN '✅ ' || substr(c.last_asset_pub, 1, 10)
+                        ELSE '—'
+                    END AS moment_published_date,
                     COALESCE(s.total_moment_assets, 1) AS total_assets_in_moment,
                     s.max_moment_score AS best_score_in_moment,
                     COALESCE(s.other_moment_assets_sample, '— (Standalone / No other assets)') AS moment_top_assets_with_scores,
@@ -3618,6 +3631,7 @@ def display_quartile_cleanup_flow(cursor=None, conn=None):
                     c.primary_owner,
                     c.camera_model
                 FROM all_assets_with_moments c
+                LEFT JOIN moment_pub_stats mp ON mp.moment_name = c.assigned_moment AND c.assigned_moment != '—'
                 LEFT JOIN moment_top_siblings s ON s.assigned_moment = c.assigned_moment AND c.assigned_moment != '—'
                 WHERE c.score_quartile IN (1, 2)
                 ORDER BY c.file_size_bytes DESC;
@@ -3646,6 +3660,7 @@ def display_quartile_cleanup_flow(cursor=None, conn=None):
                             ps.published_moments,
                             '—'
                         ) AS assigned_moment,
+                        ps.last_asset_pub,
                         aaa.ZORIGINALFILESIZE AS file_size_bytes,
                         ROUND(COALESCE(aaa.ZORIGINALFILESIZE, 0) / 1048576.0, 2) AS file_size_mb,
                         ROUND(COALESCE(aaa.ZORIGINALFILESIZE, 0) / 1073741824.0, 3) AS file_size_gb,
@@ -3661,12 +3676,19 @@ def display_quartile_cleanup_flow(cursor=None, conn=None):
                         AND (do.start_date IS NULL OR do.start_date <= date(za.ZDATECREATED + 978307200, 'unixepoch'))
                         AND (do.end_date IS NULL OR do.end_date >= date(za.ZDATECREATED + 978307200, 'unixepoch'))
                     LEFT JOIN (
-                        SELECT asset_id, GROUP_CONCAT(DISTINCT moment_name) AS published_moments 
+                        SELECT asset_id, GROUP_CONCAT(DISTINCT moment_name) AS published_moments, MAX(published_at_utc) AS last_asset_pub 
                         FROM publications 
                         GROUP BY asset_id
                     ) ps ON ps.asset_id = a.asset_id
                     LEFT JOIN ranked_assets_view v ON v.asset_id = a.asset_id
                     WHERE zea.ZCAMERAMODEL = ?
+                ),
+                moment_pub_stats AS (
+                    SELECT 
+                        moment_name,
+                        MAX(published_at_utc) AS last_published_at
+                    FROM publications
+                    GROUP BY moment_name
                 ),
                 moment_top_siblings AS (
                     SELECT 
@@ -3697,6 +3719,11 @@ def display_quartile_cleanup_flow(cursor=None, conn=None):
                     c.file_size_mb,
                     ROUND(c.score_normalized, 4) AS candidate_score,
                     c.assigned_moment,
+                    CASE 
+                        WHEN mp.last_published_at IS NOT NULL THEN '✅ ' || substr(mp.last_published_at, 1, 10)
+                        WHEN c.last_asset_pub IS NOT NULL THEN '✅ ' || substr(c.last_asset_pub, 1, 10)
+                        ELSE '—'
+                    END AS moment_published_date,
                     COALESCE(s.total_moment_assets, 1) AS total_assets_in_moment,
                     s.max_moment_score AS best_score_in_moment,
                     COALESCE(s.other_moment_assets_sample, '— (Standalone / No other assets)') AS moment_top_assets_with_scores,
@@ -3704,6 +3731,7 @@ def display_quartile_cleanup_flow(cursor=None, conn=None):
                     c.primary_owner,
                     c.camera_model
                 FROM all_assets_with_moments c
+                LEFT JOIN moment_pub_stats mp ON mp.moment_name = c.assigned_moment AND c.assigned_moment != '—'
                 LEFT JOIN moment_top_siblings s ON s.assigned_moment = c.assigned_moment AND c.assigned_moment != '—'
                 WHERE c.score_quartile IN (1, 2)
                 ORDER BY c.file_size_bytes DESC;
@@ -3718,12 +3746,12 @@ def display_quartile_cleanup_flow(cursor=None, conn=None):
         # Write candidate report to log file
         try:
             log_lines = [
-                "=" * 160,
+                "=" * 175,
                 f"🧹 Quartile Cleanup Candidate Report: {selected_owner} - {selected_model}",
                 f"Total Q1+Q2 Low-Quality Assets: {len(candidates):,} files | Reclaimable Space: {selected_item['low_gb']:.2f} GB",
-                "=" * 160,
-                f"{'No.':<6} {'Q':<4} {'Candidate Filename':<26} {'Month':<10} {'Size(MB)':<12} {'Score':<8} {'Assigned / Suggested Moment':<45} {'Moment Top Sibling Assets'}",
-                "-" * 160
+                "=" * 175,
+                f"{'No.':<5} {'Q':<4} {'Candidate Filename':<24} {'Month':<9} {'Size(MB)':<11} {'Score':<8} {'Assigned / Suggested Moment':<38} {'Published':<14} {'Moment Top Sibling Assets'}",
+                "-" * 175
             ]
             for c_idx, c_row in enumerate(candidates, 1):
                 c_q = f"Q{c_row[0]}"
@@ -3732,12 +3760,13 @@ def display_quartile_cleanup_flow(cursor=None, conn=None):
                 c_mb = f"{c_row[3]:.2f} MB"
                 c_sc = f"{c_row[4]:.4f}"
                 c_mom = c_row[5] or "—"
-                if len(c_mom) > 42:
-                    c_mom_trunc = c_mom[:39] + "..."
+                if len(c_mom) > 36:
+                    c_mom_trunc = c_mom[:33] + "..."
                 else:
                     c_mom_trunc = c_mom
-                c_sibs = c_row[8] or "—"
-                log_lines.append(f"{c_idx:<6} {c_q:<4} {c_fn:<26} {c_mo:<10} {c_mb:<12} {c_sc:<8} {c_mom_trunc:<45} {c_sibs}")
+                c_pub = c_row[6] or "—"
+                c_sibs = c_row[9] or "—"
+                log_lines.append(f"{c_idx:<5} {c_q:<4} {c_fn:<24} {c_mo:<9} {c_mb:<11} {c_sc:<8} {c_mom_trunc:<38} {c_pub:<14} {c_sibs}")
 
             with open(QUARTILE_CLEANUP_LOG_PATH, 'w', encoding='utf-8') as f:
                 f.write('\n'.join(log_lines) + '\n')
@@ -3752,11 +3781,11 @@ def display_quartile_cleanup_flow(cursor=None, conn=None):
 
         while cur_offset < total_cand:
             page_items = candidates[cur_offset : cur_offset + page_size]
-            print("\n" + "=" * 160)
+            print("\n" + "=" * 175)
             print(f"📷 Candidate Files for Removal: {selected_owner} - {selected_model} (Showing {cur_offset + 1} - {min(cur_offset + page_size, total_cand)} of {total_cand:,} files | {selected_item['low_gb']:.2f} GB)")
-            print("=" * 160)
-            print(f"{'No.':<6} {'Q':<4} {'Candidate Filename':<26} {'Month':<10} {'Size(MB)':<12} {'Score':<8} {'Assigned / Suggested Moment':<45} {'Moment Top Sibling Assets'}")
-            print("-" * 160)
+            print("=" * 175)
+            print(f"{'No.':<5} {'Q':<4} {'Candidate Filename':<24} {'Month':<9} {'Size(MB)':<11} {'Score':<8} {'Assigned / Suggested Moment':<38} {'Published':<14} {'Moment Top Sibling Assets'}")
+            print("-" * 175)
 
             for p_idx, c_row in enumerate(page_items, cur_offset + 1):
                 c_q = f"Q{c_row[0]}"
@@ -3765,16 +3794,17 @@ def display_quartile_cleanup_flow(cursor=None, conn=None):
                 c_mb = f"{c_row[3]:.2f} MB"
                 c_sc = f"{c_row[4]:.4f}"
                 c_mom = c_row[5] or "—"
-                if len(c_mom) > 42:
-                    c_mom_trunc = c_mom[:39] + "..."
+                if len(c_mom) > 36:
+                    c_mom_trunc = c_mom[:33] + "..."
                 else:
                     c_mom_trunc = c_mom
-                c_sibs = c_row[8] or "—"
-                if len(c_sibs) > 60:
-                    c_sibs = c_sibs[:57] + "..."
-                print(f"{p_idx:<6} {c_q:<4} {c_fn:<26} {c_mo:<10} {c_mb:<12} {c_sc:<8} {c_mom_trunc:<45} {c_sibs}")
+                c_pub = c_row[6] or "—"
+                c_sibs = c_row[9] or "—"
+                if len(c_sibs) > 50:
+                    c_sibs = c_sibs[:47] + "..."
+                print(f"{p_idx:<5} {c_q:<4} {c_fn:<24} {c_mo:<9} {c_mb:<11} {c_sc:<8} {c_mom_trunc:<38} {c_pub:<14} {c_sibs}")
 
-            print("-" * 160)
+            print("-" * 175)
             print(f"ℹ️  Full list with details written to {QUARTILE_CLEANUP_LOG_PATH}")
 
             if cur_offset + page_size >= total_cand:

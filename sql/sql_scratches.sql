@@ -46,6 +46,8 @@ JOIN photos_db.Z_30ASSETS aa ON aa.Z_3ASSETS = za.Z_PK
 JOIN photos_db.ZGENERICALBUM ga ON ga.Z_PK = aa.Z_30ALBUMS
 LEFT JOIN photos_db.ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
 LEFT JOIN device_owners do ON do.camera_model = zea.ZCAMERAMODEL
+    AND (do.start_date IS NULL OR do.start_date <= date(za.ZDATECREATED + 978307200, 'unixepoch'))
+    AND (do.end_date IS NULL OR do.end_date >= date(za.ZDATECREATED + 978307200, 'unixepoch'))
 LEFT JOIN ranked_assets_view v ON v.asset_id = a.asset_id
 WHERE ga.ZTITLE = 'Google Upload Skipped Videos'
   AND ga.ZTRASHEDSTATE = 0
@@ -71,6 +73,8 @@ FROM assets a
 LEFT JOIN ZASSET za ON za.ZUUID = a.asset_id
 LEFT JOIN ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
 LEFT JOIN device_owners do ON do.camera_model = zea.ZCAMERAMODEL
+    AND (do.start_date IS NULL OR do.start_date <= date(za.ZDATECREATED + 978307200, 'unixepoch'))
+    AND (do.end_date IS NULL OR do.end_date >= date(za.ZDATECREATED + 978307200, 'unixepoch'))
 LEFT JOIN publications p ON p.asset_id = a.asset_id
 -- WHERE a.month = '2026-07'  -- 👈 Change month here (or remove to view all months)
 GROUP BY a.month, primary_owner, device_camera_model
@@ -93,6 +97,8 @@ FROM assets a
 LEFT JOIN ZASSET za ON za.ZUUID = a.asset_id
 LEFT JOIN ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
 LEFT JOIN device_owners do ON do.camera_model = zea.ZCAMERAMODEL
+    AND (do.start_date IS NULL OR do.start_date <= date(za.ZDATECREATED + 978307200, 'unixepoch'))
+    AND (do.end_date IS NULL OR do.end_date >= date(za.ZDATECREATED + 978307200, 'unixepoch'))
 LEFT JOIN publications p ON p.asset_id = a.asset_id
 -- WHERE a.month = '2026-07'  -- 👈 Change month here
 GROUP BY a.month, primary_owner, device_camera_model
@@ -163,31 +169,12 @@ SELECT
 FROM device_month_stats dms
 LEFT JOIN published_stats ps ON ps.camera_model = dms.camera_model AND ps.month = dms.month
 LEFT JOIN device_owners do ON do.camera_model = dms.camera_model
+    AND (do.start_date IS NULL OR do.start_date <= dms.month || '-31')
+    AND (do.end_date IS NULL OR do.end_date >= dms.month || '-01')
 LEFT JOIN month_batches mb ON mb.month = dms.month
 LEFT JOIN batch_status bs ON mb.status_code = bs.code
 WHERE COALESCE(ps.published_count, 0) > 0 OR mb.status_code >= '600'
-ORDER BY primary_owner ASC, 
--- ============================================================================
--- Summary of Featured Assets Grouped by Device & Month
--- ============================================================================
-SELECT 
-    a.month AS asset_month,
-    COALESCE(do.owner_name, 'Shared/Other') AS primary_owner,
-    COALESCE(zea.ZCAMERAMODEL, 'Unknown') AS device_camera_model,
-    COUNT(a.asset_id) AS total_assets_on_device,
-    SUM(CASE WHEN a.mobile_apple_photos_featured_photos = 1 THEN 1 ELSE 0 END) AS featured_count,
-    GROUP_CONCAT(CASE WHEN a.mobile_apple_photos_featured_photos = 1 THEN a.original_filename END, ', ') AS featured_filenames,
-    SUM(CASE WHEN a.google_favorite = 1 THEN 1 ELSE 0 END) AS google_fav_count,
-    COUNT(DISTINCT p.asset_id) AS published_count
-FROM assets a
-LEFT JOIN ZASSET za ON za.ZUUID = a.asset_id
-LEFT JOIN ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
-LEFT JOIN device_owners do ON do.camera_model = zea.ZCAMERAMODEL
-LEFT JOIN publications p ON p.asset_id = a.asset_id
-WHERE a.month = '2026-07'  -- 👈 Change month here
-GROUP BY a.month, primary_owner, device_camera_model
-HAVING featured_count > 0
-ORDER BY primary_owner ASC, device_camera_model ASC; ;
+ORDER BY primary_owner ASC, dms.month DESC;
 
 -- get count of favorites for month batches
 select mb.*, 

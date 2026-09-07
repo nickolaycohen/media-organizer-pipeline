@@ -2892,13 +2892,42 @@ def run_memory_publishing_flow(cursor=None, conn=None):
         elif choice == 'e':
             break
 
-def resolve_device_owner(cursor, camera_model):
+def resolve_device_owner(cursor, camera_model, asset_date=None):
     """
-    Looks up the owner of a camera model. Checks database overrides first,
+    Looks up the owner of a camera model. Checks database overrides first
+    (matching asset_date if provided against start_date and end_date),
     then defaults to DEVICE_OWNER_MAPPING, then 'Shared/Other'.
     """
     try:
-        cursor.execute("SELECT owner_name FROM device_owners WHERE camera_model = ?", (camera_model,))
+        if asset_date:
+            date_str = str(asset_date).split(' ')[0].split('T')[0]
+            cursor.execute("""
+                SELECT owner_name FROM device_owners
+                WHERE camera_model = ?
+                  AND (start_date IS NULL OR start_date <= ?)
+                  AND (end_date IS NULL OR end_date >= ?)
+                ORDER BY 
+                    CASE 
+                        WHEN start_date IS NOT NULL AND end_date IS NOT NULL THEN 1
+                        WHEN start_date IS NOT NULL OR end_date IS NOT NULL THEN 2
+                        ELSE 3 
+                    END ASC,
+                    updated_at_utc DESC
+                LIMIT 1
+            """, (camera_model, date_str, date_str))
+            row = cursor.fetchone()
+            if row:
+                return row[0], "Database Override"
+
+        # If no asset_date or no date-specific interval matched, fall back to ongoing or latest
+        cursor.execute("""
+            SELECT owner_name FROM device_owners
+            WHERE camera_model = ?
+            ORDER BY 
+                CASE WHEN end_date IS NULL THEN 1 ELSE 2 END ASC,
+                updated_at_utc DESC
+            LIMIT 1
+        """, (camera_model,))
         row = cursor.fetchone()
         if row:
             return row[0], "Database Override"
@@ -2912,7 +2941,7 @@ def resolve_device_owner(cursor, camera_model):
 
 def manage_device_owners_flow(cursor=None, conn=None):
     """
-    Interactive flow to view and edit primary owners of camera devices.
+    Interactive flow to view and edit owners and ownership date intervals of camera devices.
     Lists devices ordered by their total asset count in the database copy.
     """
     from constants import DEVICE_OWNER_MAPPING
@@ -2981,8 +3010,30 @@ def manage_device_owners_flow(cursor=None, conn=None):
         except Exception as e:
             logger.debug(f"Could not count assets by device model: {e}")
 
+        # Fetch all device ownership records from DB
+        db_ownerships = {}
+        try:
+            cursor.execute("""
+                SELECT id, camera_model, owner_name, start_date, end_date, notes 
+                FROM device_owners 
+                ORDER BY COALESCE(start_date, '0000-00-00') ASC, id ASC
+            """)
+            for row in cursor.fetchall():
+                c_mod = row[1]
+                if c_mod not in db_ownerships:
+                    db_ownerships[c_mod] = []
+                db_ownerships[c_mod].append({
+                    'id': row[0],
+                    'owner_name': row[2],
+                    'start_date': row[3],
+                    'end_date': row[4],
+                    'notes': row[5]
+                })
+        except Exception as e:
+            logger.debug(f"Could not load device_owners records: {e}")
+
         # Merge with constants DEVICE_OWNER_MAPPING
-        db_models = list(counts_dict.keys())
+        db_models = list(set(list(counts_dict.keys()) + list(db_ownerships.keys())))
         all_unique_models = list(set(db_models + list(DEVICE_OWNER_MAPPING.keys())))
         
         models_list = []
@@ -2995,7 +3046,27 @@ def manage_device_owners_flow(cursor=None, conn=None):
             min_created = item_data.get('min_created', '—') or '—'
             max_filename = item_data.get('max_filename', '—') or '—'
             max_created = item_data.get('max_created', '—') or '—'
-            owner, src_type = resolve_device_owner(cursor, model)
+            
+            periods = db_ownerships.get(model, [])
+            if periods:
+                src_type = "Database Override"
+                period_strs = []
+                for p in periods:
+                    s_str = p['start_date'] or ''
+                    e_str = p['end_date'] or 'Present' if p['start_date'] else ''
+                    if s_str or e_str:
+                        date_span = f" ({s_str or '...'} -> {e_str or 'Present'})"
+                    else:
+                        date_span = ""
+                    period_strs.append(f"{p['owner_name']}{date_span}")
+                owner_display = "; ".join(period_strs)
+            elif model in DEVICE_OWNER_MAPPING:
+                src_type = "Default Mapping"
+                owner_display = DEVICE_OWNER_MAPPING[model]
+            else:
+                src_type = "Default Fallback"
+                owner_display = "Shared/Other"
+
             models_list.append({
                 'model': model,
                 'count': count,
@@ -3003,54 +3074,62 @@ def manage_device_owners_flow(cursor=None, conn=None):
                 'min_created': min_created,
                 'max_filename': max_filename,
                 'max_created': max_created,
-                'owner': owner,
+                'owner_display': owner_display,
+                'periods': periods,
                 'src_type': src_type
             })
 
         # Sort by asset count ascending, then model name ascending to keep most-used at the bottom
         models_list.sort(key=lambda x: (x['count'], x['model']))
 
-        print("\n" + "=" * 161)
-        print("👤  MANAGE DEVICE PRIMARY OWNERS")
-        print("=" * 161)
-        print(f"{'No.':<4} {'Device Camera Model':<36} {'Asset Count':<13} {'Earliest Created Asset (Filename & Date)':<38} {'Latest Created Asset (Filename & Date)':<38} {'Current Owner':<16} {'Source Type':<16}")
-        print("-" * 161)
+        print("\n" + "=" * 175)
+        print("👤  MANAGE DEVICE PRIMARY OWNERS & OWNERSHIP PERIODS")
+        print("=" * 175)
+        print(f"{'No.':<4} {'Device Camera Model':<34} {'Asset Count':<13} {'Earliest Asset (Date)':<26} {'Latest Asset (Date)':<26} {'Owners & Ownership Dates':<52} {'Source Type':<16}")
+        print("-" * 175)
 
-        model_owners = []
         for idx, item in enumerate(models_list, 1):
             earliest_str = f"{item['min_filename']} ({item['min_created']})" if item['min_filename'] != '—' else '—'
             latest_str = f"{item['max_filename']} ({item['max_created']})" if item['max_filename'] != '—' else '—'
-            print(f"{idx:<4} {item['model']:<36} {item['count']:<13,} {earliest_str:<38} {latest_str:<38} {item['owner']:<16} {item['src_type']:<16}")
-            model_owners.append((item['model'], item['owner']))
+            print(f"{idx:<4} {item['model']:<34} {item['count']:<13,} {earliest_str:<26} {latest_str:<26} {item['owner_display']:<52} {item['src_type']:<16}")
 
-        print("-" * 185)
+        print("-" * 175)
 
-        # Filter and group overrides
-        overrides_by_owner = {}
+        # Timeline grouped by Owner across all ownership periods
+        timeline_by_owner = {}
         for item in models_list:
-            if item['src_type'] == 'Database Override':
-                owner = item['owner']
-                if owner not in overrides_by_owner:
-                    overrides_by_owner[owner] = []
-                overrides_by_owner[owner].append(item)
+            if item['periods']:
+                for p in item['periods']:
+                    own = p['owner_name']
+                    if own not in timeline_by_owner:
+                        timeline_by_owner[own] = []
+                    timeline_by_owner[own].append({
+                        'model': item['model'],
+                        'count': item['count'],
+                        'start_date': p['start_date'] or '—',
+                        'end_date': p['end_date'] or 'Present',
+                        'earliest_asset': item['min_created'],
+                        'latest_asset': item['max_created']
+                    })
 
-        if overrides_by_owner:
-            print("\n" + "=" * 100)
-            print("👤  DEVICE TIMELINE BY OWNER (DATABASE OVERRIDES ONLY)")
-            print("=" * 100)
-            print(f"{'Primary Owner':<16} {'Device Camera Model':<36} {'Asset Count':<14} {'Earliest Date':<15} {'Latest Date':<15}")
-            print("-" * 100)
+        if timeline_by_owner:
+            print("\n" + "=" * 130)
+            print("👤  DEVICE TIMELINE BY OWNER (DATABASE OVERRIDES)")
+            print("=" * 130)
+            print(f"{'Primary Owner':<16} {'Device Camera Model':<34} {'Ownership Period':<26} {'Asset Count':<14} {'Earliest Asset':<15} {'Latest Asset':<15}")
+            print("-" * 130)
 
-            for owner in sorted(overrides_by_owner.keys()):
-                devices = overrides_by_owner[owner]
-                devices.sort(key=lambda x: x['min_created'] if x['min_created'] != '—' else '9999-12-31')
+            for owner in sorted(timeline_by_owner.keys()):
+                entries = timeline_by_owner[owner]
+                entries.sort(key=lambda x: x['start_date'] if x['start_date'] != '—' else (x['earliest_asset'] if x['earliest_asset'] != '—' else '9999-12-31'))
                 
                 first_row = True
-                for dev in devices:
+                for ent in entries:
                     owner_col = owner if first_row else ""
-                    print(f"{owner_col:<16} {dev['model']:<36} {dev['count']:<14,} {dev['min_created']:<15} {dev['max_created']:<15}")
+                    period_str = f"{ent['start_date']} -> {ent['end_date']}"
+                    print(f"{owner_col:<16} {ent['model']:<34} {period_str:<26} {ent['count']:<14,} {ent['earliest_asset']:<15} {ent['latest_asset']:<15}")
                     first_row = False
-            print("-" * 100)
+            print("-" * 130)
 
         # Detach and release before waiting for user action prompts
         if photos_db_attached:
@@ -3061,11 +3140,64 @@ def manage_device_owners_flow(cursor=None, conn=None):
         close_conn()
         release_planner_lock()
 
-        choice = input("\nOptions: [E]it an owner | [B]ack to main menu: ").strip().lower()
+        choice = input("\nOptions: [E]dit device owners & periods | [O]wners registry | [B]ack to main menu: ").strip().lower()
         if choice == 'b' or not choice:
             break
+        elif choice == 'o':
+            # Manage owners registry
+            while True:
+                acquire_planner_lock()
+                conn = get_connection()
+                cursor = get_cursor()
+                cursor.execute("SELECT id, name FROM owners ORDER BY name ASC")
+                registered_owners = cursor.fetchall()
+                close_conn()
+                release_planner_lock()
+
+                print("\n" + "=" * 60)
+                print("👥  REGISTERED OWNERS REGISTRY")
+                print("=" * 60)
+                for o_idx, (o_id, o_name) in enumerate(registered_owners, 1):
+                    print(f"  {o_idx}. {o_name}")
+                print("-" * 60)
+                o_choice = input("Options: [A]dd owner | [R]ename owner | [B]ack: ").strip().lower()
+                if o_choice in ('b', ''):
+                    break
+                elif o_choice == 'a':
+                    new_name = input("Enter new owner name: ").strip()
+                    if new_name:
+                        acquire_planner_lock()
+                        conn = get_connection()
+                        cursor = get_cursor()
+                        try:
+                            cursor.execute("INSERT OR IGNORE INTO owners (name) VALUES (?)", (new_name,))
+                            conn.commit()
+                            print(f"✅ Added '{new_name}' to owners registry.")
+                        except Exception as e:
+                            print(f"⚠️ Could not add owner: {e}")
+                        close_conn()
+                        release_planner_lock()
+                elif o_choice == 'r':
+                    r_num = input(f"Enter owner number to rename (1-{len(registered_owners)}): ").strip()
+                    try:
+                        r_idx = int(r_num) - 1
+                        if 0 <= r_idx < len(registered_owners):
+                            old_name = registered_owners[r_idx][1]
+                            renamed = input(f"Enter new name for '{old_name}': ").strip()
+                            if renamed:
+                                acquire_planner_lock()
+                                conn = get_connection()
+                                cursor = get_cursor()
+                                cursor.execute("UPDATE owners SET name = ? WHERE name = ?", (renamed, old_name))
+                                cursor.execute("UPDATE device_owners SET owner_name = ? WHERE owner_name = ?", (renamed, old_name))
+                                conn.commit()
+                                print(f"✅ Renamed '{old_name}' to '{renamed}' across registry and device records.")
+                                close_conn()
+                                release_planner_lock()
+                    except ValueError:
+                        print("⚠️ Invalid selection.")
         elif choice == 'e':
-            num_input = input(f"Enter device number to edit (1-{len(models_list)}) or Q to cancel: ").strip()
+            num_input = input(f"Enter device number to manage (1-{len(models_list)}) or Q to cancel: ").strip()
             if num_input.lower() == 'q':
                 continue
             try:
@@ -3073,34 +3205,150 @@ def manage_device_owners_flow(cursor=None, conn=None):
                 if num < 1 or num > len(models_list):
                     print("⚠️ Invalid number selection.")
                     continue
-                selected_model, current_owner = model_owners[num - 1]
-                new_owner = input(f"Enter new owner name for '{selected_model}' (leave empty to reset to default): ").strip()
-                
-                # Now perform the update, acquire lock and connect
-                acquire_planner_lock()
-                conn = get_connection()
-                conn.execute("PRAGMA busy_timeout = 30000")
-                cursor = get_cursor()
-                
-                # Check if empty, then delete override
-                if not new_owner:
-                    cursor.execute("DELETE FROM device_owners WHERE camera_model = ?", (selected_model,))
-                    conn.commit()
-                    print(f"✅ Reset '{selected_model}' to its default configuration.")
-                else:
+                selected_item = models_list[num - 1]
+                selected_model = selected_item['model']
+
+                # Submenu for managing periods of this specific device
+                while True:
+                    acquire_planner_lock()
+                    conn = get_connection()
+                    cursor = get_cursor()
                     cursor.execute("""
-                        INSERT OR REPLACE INTO device_owners (camera_model, owner_name)
-                        VALUES (?, ?)
-                    """, (selected_model, new_owner))
-                    conn.commit()
-                    print(f"✅ Updated owner of '{selected_model}' to '{new_owner}'.")
-                
-                close_conn()
-                release_planner_lock()
+                        SELECT id, owner_name, start_date, end_date, notes 
+                        FROM device_owners 
+                        WHERE camera_model = ?
+                        ORDER BY COALESCE(start_date, '0000-00-00') ASC, id ASC
+                    """, (selected_model,))
+                    current_periods = cursor.fetchall()
+                    
+                    cursor.execute("SELECT name FROM owners ORDER BY name ASC")
+                    known_owners = [r[0] for r in cursor.fetchall()]
+                    close_conn()
+                    release_planner_lock()
+
+                    print("\n" + "=" * 80)
+                    print(f"📱 MANAGE DEVICE: {selected_model}")
+                    print(f"   Total Assets: {selected_item['count']:,} | Span: {selected_item['min_created']} to {selected_item['max_created']}")
+                    print("=" * 80)
+                    if not current_periods:
+                        print("   (No database overrides. Using default fallback)")
+                    else:
+                        print("Current Ownership Periods:")
+                        for p_idx, (p_id, p_owner, p_start, p_end, p_notes) in enumerate(current_periods, 1):
+                            s_text = p_start or "Beginning"
+                            e_text = p_end or "Present"
+                            notes_text = f" [{p_notes}]" if p_notes else ""
+                            print(f"  [{p_idx}] Owner: {p_owner:<16} | Range: {s_text} to {e_text}{notes_text}")
+
+                    print("-" * 80)
+                    print("Options: [A]dd period | [E]dit period | [D]elete period | [C]lear all | [B]ack")
+                    dev_choice = input("Select action: ").strip().lower()
+
+                    if dev_choice in ('b', ''):
+                        break
+                    elif dev_choice == 'a':
+                        # Add new period
+                        print("\nAvailable Owners:")
+                        for k_idx, k_name in enumerate(known_owners, 1):
+                            print(f"  {k_idx}. {k_name}")
+                        owner_input = input("Enter owner number or new owner name: ").strip()
+                        if not owner_input:
+                            continue
+                        if owner_input.isdigit() and 1 <= int(owner_input) <= len(known_owners):
+                            owner_name_to_add = known_owners[int(owner_input) - 1]
+                        else:
+                            owner_name_to_add = owner_input
+
+                        start_date_in = input("Enter start date (YYYY-MM-DD, or leave empty for beginning of time): ").strip()
+                        end_date_in = input("Enter end date (YYYY-MM-DD, or leave empty for ongoing/present): ").strip()
+                        notes_in = input("Enter optional notes (or leave empty): ").strip()
+
+                        acquire_planner_lock()
+                        conn = get_connection()
+                        cursor = get_cursor()
+                        cursor.execute("INSERT OR IGNORE INTO owners (name) VALUES (?)", (owner_name_to_add,))
+                        cursor.execute("""
+                            INSERT INTO device_owners (camera_model, owner_name, start_date, end_date, notes)
+                            VALUES (?, ?, ?, ?, ?)
+                        """, (
+                            selected_model,
+                            owner_name_to_add,
+                            start_date_in if start_date_in else None,
+                            end_date_in if end_date_in else None,
+                            notes_in if notes_in else None
+                        ))
+                        conn.commit()
+                        print(f"✅ Added ownership period: {owner_name_to_add} ({start_date_in or 'Beginning'} -> {end_date_in or 'Present'}) for '{selected_model}'.")
+                        close_conn()
+                        release_planner_lock()
+
+                    elif dev_choice == 'e':
+                        if not current_periods:
+                            print("⚠️ No periods to edit.")
+                            continue
+                        p_sel = input(f"Enter period number to edit (1-{len(current_periods)}): ").strip()
+                        try:
+                            p_idx = int(p_sel) - 1
+                            if 0 <= p_idx < len(current_periods):
+                                tgt_id, tgt_owner, tgt_start, tgt_end, tgt_notes = current_periods[p_idx]
+                                new_owner = input(f"Owner name [{tgt_owner}]: ").strip() or tgt_owner
+                                new_start = input(f"Start date (YYYY-MM-DD, or '-' to clear) [{tgt_start or 'None'}]: ").strip()
+                                new_end = input(f"End date (YYYY-MM-DD, or '-' to clear) [{tgt_end or 'None'}]: ").strip()
+
+                                final_start = None if new_start == '-' else (new_start if new_start else tgt_start)
+                                final_end = None if new_end == '-' else (new_end if new_end else tgt_end)
+
+                                acquire_planner_lock()
+                                conn = get_connection()
+                                cursor = get_cursor()
+                                cursor.execute("INSERT OR IGNORE INTO owners (name) VALUES (?)", (new_owner,))
+                                cursor.execute("""
+                                    UPDATE device_owners 
+                                    SET owner_name = ?, start_date = ?, end_date = ?, updated_at_utc = datetime('now')
+                                    WHERE id = ?
+                                """, (new_owner, final_start, final_end, tgt_id))
+                                conn.commit()
+                                print(f"✅ Updated ownership period #{p_idx + 1} for '{selected_model}'.")
+                                close_conn()
+                                release_planner_lock()
+                        except ValueError:
+                            print("⚠️ Invalid number.")
+
+                    elif dev_choice == 'd':
+                        if not current_periods:
+                            print("⚠️ No periods to delete.")
+                            continue
+                        p_sel = input(f"Enter period number to delete (1-{len(current_periods)}): ").strip()
+                        try:
+                            p_idx = int(p_sel) - 1
+                            if 0 <= p_idx < len(current_periods):
+                                tgt_id = current_periods[p_idx][0]
+                                acquire_planner_lock()
+                                conn = get_connection()
+                                cursor = get_cursor()
+                                cursor.execute("DELETE FROM device_owners WHERE id = ?", (tgt_id,))
+                                conn.commit()
+                                print(f"✅ Deleted ownership period #{p_idx + 1} for '{selected_model}'.")
+                                close_conn()
+                                release_planner_lock()
+                        except ValueError:
+                            print("⚠️ Invalid number.")
+
+                    elif dev_choice == 'c':
+                        confirm = input(f"Are you sure you want to clear ALL ownership periods for '{selected_model}'? [y/N]: ").strip().lower()
+                        if confirm == 'y':
+                            acquire_planner_lock()
+                            conn = get_connection()
+                            cursor = get_cursor()
+                            cursor.execute("DELETE FROM device_owners WHERE camera_model = ?", (selected_model,))
+                            conn.commit()
+                            print(f"✅ Cleared all database overrides for '{selected_model}'.")
+                            close_conn()
+                            release_planner_lock()
             except ValueError:
                 print("⚠️ Please enter a valid number.")
             except Exception as e:
-                print(f"⚠️ Failed to update database: {e}")
+                print(f"⚠️ Error: {e}")
                 try:
                     close_conn()
                 except Exception:
@@ -3116,7 +3364,7 @@ def manage_device_owners_flow(cursor=None, conn=None):
 def display_media_cleanup_recommendations(cursor, verbose=True):
     """
     Generates and displays media cleanup recommendations for source cameras based on published albums.
-    Groups recommendations by device model. For each recommendation row, queries Apple Photos DB copy
+    Groups recommendations by device owner. For each recommendation row, queries Apple Photos DB copy
     for the total asset count and size within the corresponding date range to quantify storage gains.
     """
     # First, attach photos_db to query full camera/source libraries
@@ -3169,10 +3417,11 @@ def display_media_cleanup_recommendations(cursor, verbose=True):
             c_model = row[3] or "Unknown"
             c_source = f"{c_model}" if (c_model != "Unknown" and c_model) else (c_make or "Unknown")
             
-            # Look up owner dynamically via database or defaults
-            owner_resolved, _ = resolve_device_owner(cursor, c_source)
+            # Look up owner dynamically via database (with asset date) or defaults
+            month_date = row[7] if row[7] else (f"{row[0]}-01" if row[0] else None)
+            owner_resolved, _ = resolve_device_owner(cursor, c_source, asset_date=month_date)
             if owner_resolved == "Shared/Other" and c_model != c_source:
-                owner_resolved, _ = resolve_device_owner(cursor, c_model)
+                owner_resolved, _ = resolve_device_owner(cursor, c_model, asset_date=month_date)
             owner = owner_resolved
             
             if owner not in owner_groups:
@@ -3183,6 +3432,7 @@ def display_media_cleanup_recommendations(cursor, verbose=True):
 
         global_idx = 1
         # Process each owner group
+
         for owner_name in sorted(owner_groups.keys()):
             cleanup_report.append(f"👤 Primary Owner: {owner_name}")
             cleanup_report.append("=" * 135)

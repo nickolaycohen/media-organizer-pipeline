@@ -3404,59 +3404,54 @@ def display_quartile_cleanup_flow(cursor=None, conn=None):
     with assigned/suggested moments and moment sister assets.
     Allows interactive selection of assets to mark them as removed from source.
     """
-    acquire_planner_lock()
-    conn = get_connection()
-    conn.execute("PRAGMA busy_timeout = 30000")
-    cursor = get_cursor()
-
-    # Attempt to attach photos_db read-only for Apple Moments & size querying
-    photos_db_attached = False
-    try:
-        cursor.execute(f"ATTACH DATABASE 'file:{APPLE_PHOTOS_DB_PATH}?mode=ro' AS photos_db;")
-        photos_db_attached = True
-        logger.debug("Attached Photos.sqlite database read-only for quartile cleanup.")
-    except Exception as e:
-        logger.warning(f"Could not attach Photos.sqlite: {e}")
-
     while True:
         # 1. Query device summary grouped by primary owner (excluding already removed assets)
-        cursor.execute("""
-            WITH scored_assets AS (
+        acquire_planner_lock()
+        conn = get_connection()
+        conn.execute("PRAGMA busy_timeout = 30000")
+        cursor = get_cursor()
+
+        try:
+            cursor.execute("""
+                WITH scored_assets AS (
+                    SELECT 
+                        COALESCE(zea.ZCAMERAMODEL, 'Unknown') AS camera_model,
+                        COALESCE(do.owner_name, 'Shared/Other') AS primary_owner,
+                        COALESCE(v.score_normalized, 0.0) AS score_normalized,
+                        COALESCE(aaa.ZORIGINALFILESIZE, 0) AS file_size_bytes,
+                        NTILE(4) OVER (
+                            PARTITION BY COALESCE(zea.ZCAMERAMODEL, 'Unknown')
+                            ORDER BY COALESCE(v.score_normalized, 0.0) ASC
+                        ) AS score_quartile
+                    FROM assets a
+                    LEFT JOIN ZASSET za ON za.ZUUID = a.asset_id
+                    LEFT JOIN ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = za.Z_PK
+                    LEFT JOIN ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
+                    LEFT JOIN device_owners do ON do.camera_model = zea.ZCAMERAMODEL
+                        AND (do.start_date IS NULL OR do.start_date <= date(za.ZDATECREATED + 978307200, 'unixepoch'))
+                        AND (do.end_date IS NULL OR do.end_date >= date(za.ZDATECREATED + 978307200, 'unixepoch'))
+                    LEFT JOIN ranked_assets_view v ON v.asset_id = a.asset_id
+                    WHERE zea.ZCAMERAMODEL IS NOT NULL 
+                      AND zea.ZCAMERAMODEL != ''
+                      AND COALESCE(a.removed_from_source, 0) = 0
+                )
                 SELECT 
-                    COALESCE(zea.ZCAMERAMODEL, 'Unknown') AS camera_model,
-                    COALESCE(do.owner_name, 'Shared/Other') AS primary_owner,
-                    COALESCE(v.score_normalized, 0.0) AS score_normalized,
-                    COALESCE(aaa.ZORIGINALFILESIZE, 0) AS file_size_bytes,
-                    NTILE(4) OVER (
-                        PARTITION BY COALESCE(zea.ZCAMERAMODEL, 'Unknown')
-                        ORDER BY COALESCE(v.score_normalized, 0.0) ASC
-                    ) AS score_quartile
-                FROM assets a
-                LEFT JOIN ZASSET za ON za.ZUUID = a.asset_id
-                LEFT JOIN ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = za.Z_PK
-                LEFT JOIN ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
-                LEFT JOIN device_owners do ON do.camera_model = zea.ZCAMERAMODEL
-                    AND (do.start_date IS NULL OR do.start_date <= date(za.ZDATECREATED + 978307200, 'unixepoch'))
-                    AND (do.end_date IS NULL OR do.end_date >= date(za.ZDATECREATED + 978307200, 'unixepoch'))
-                LEFT JOIN ranked_assets_view v ON v.asset_id = a.asset_id
-                WHERE zea.ZCAMERAMODEL IS NOT NULL 
-                  AND zea.ZCAMERAMODEL != ''
-                  AND COALESCE(a.removed_from_source, 0) = 0
-            )
-            SELECT 
-                primary_owner,
-                camera_model,
-                COUNT(CASE WHEN score_quartile IN (1, 2) THEN 1 END) AS low_quality_count,
-                ROUND(SUM(CASE WHEN score_quartile IN (1, 2) THEN file_size_bytes ELSE 0 END) / 1073741824.0, 2) AS low_quality_gb,
-                COUNT(*) AS total_assets,
-                ROUND(SUM(file_size_bytes) / 1073741824.0, 2) AS total_gb,
-                ROUND(MIN(score_normalized), 4) AS min_score,
-                ROUND(MAX(CASE WHEN score_quartile = 2 THEN score_normalized END), 4) AS q2_max_score
-            FROM scored_assets
-            GROUP BY primary_owner, camera_model
-            ORDER BY primary_owner ASC, low_quality_gb DESC, low_quality_count DESC;
-        """)
-        summary_rows = cursor.fetchall()
+                    primary_owner,
+                    camera_model,
+                    COUNT(CASE WHEN score_quartile IN (1, 2) THEN 1 END) AS low_quality_count,
+                    ROUND(SUM(CASE WHEN score_quartile IN (1, 2) THEN file_size_bytes ELSE 0 END) / 1073741824.0, 2) AS low_quality_gb,
+                    COUNT(*) AS total_assets,
+                    ROUND(SUM(file_size_bytes) / 1073741824.0, 2) AS total_gb,
+                    ROUND(MIN(score_normalized), 4) AS min_score,
+                    ROUND(MAX(CASE WHEN score_quartile = 2 THEN score_normalized END), 4) AS q2_max_score
+                FROM scored_assets
+                GROUP BY primary_owner, camera_model
+                ORDER BY primary_owner ASC, low_quality_gb DESC, low_quality_count DESC;
+            """)
+            summary_rows = cursor.fetchall()
+        finally:
+            close_conn()
+            release_planner_lock()
 
         if not summary_rows:
             print("\nℹ️  No imported assets found with camera model attributes.")
@@ -3569,222 +3564,246 @@ def display_quartile_cleanup_flow(cursor=None, conn=None):
         while True:
             print(f"\n🔍 Querying bottom 2 quartiles for {selected_owner} - {selected_model} (ordered largest-to-smallest)...")
 
-            # Query candidate files with moment siblings & publication status
-            if photos_db_attached:
-                cand_query = """
-                    WITH all_assets_with_moments AS (
-                        SELECT 
-                            a.asset_id,
-                            a.original_filename,
-                            a.month,
-                            a.date_created_utc,
-                            COALESCE(zea.ZCAMERAMODEL, 'Unknown') AS camera_model,
-                            COALESCE(zea.ZCAMERAMAKE, 'Unknown') AS camera_make,
-                            COALESCE(do.owner_name, 'Shared/Other') AS primary_owner,
-                            COALESCE(v.score_normalized, 0.0) AS score_normalized,
-                            a.aesthetic_score,
-                            a.google_favorite,
-                            a.mobile_apple_photos_featured_photos AS apple_featured,
-                            a.apple_photos_monthly_selection AS apple_monthly_sel,
-                            COALESCE(
-                                a.MomentsAlbumName, 
-                                a.curated_album, 
-                                a.to_be_curated_album, 
-                                ps.published_moments,
-                                CASE 
-                                    WHEN m.ZTITLE IS NOT NULL AND m.ZTITLE != '' 
-                                    THEN 'SUGG: ' || COALESCE(substr(a.date_created_utc, 1, 10), date(za.ZDATECREATED + 978307200, 'unixepoch'), a.month, '') || ' - ' || m.ZTITLE
-                                    ELSE NULL 
-                                END,
-                                '—'
-                            ) AS assigned_moment,
-                            ps.last_asset_pub,
-                            aaa.ZORIGINALFILESIZE AS file_size_bytes,
-                            ROUND(COALESCE(aaa.ZORIGINALFILESIZE, 0) / 1048576.0, 2) AS file_size_mb,
-                            ROUND(COALESCE(aaa.ZORIGINALFILESIZE, 0) / 1073741824.0, 3) AS file_size_gb,
-                            NTILE(4) OVER (
-                                PARTITION BY COALESCE(zea.ZCAMERAMODEL, 'Unknown')
-                                ORDER BY COALESCE(v.score_normalized, 0.0) ASC
-                            ) AS score_quartile
-                        FROM assets a
-                        LEFT JOIN photos_db.ZASSET za_ext ON za_ext.ZUUID = a.asset_id
-                        LEFT JOIN photos_db.ZMOMENT m ON za_ext.ZMOMENT = m.Z_PK
-                        LEFT JOIN ZASSET za ON za.ZUUID = a.asset_id
-                        LEFT JOIN ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = za.Z_PK
-                        LEFT JOIN ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
-                        LEFT JOIN device_owners do ON do.camera_model = zea.ZCAMERAMODEL
-                            AND (do.start_date IS NULL OR do.start_date <= date(za.ZDATECREATED + 978307200, 'unixepoch'))
-                            AND (do.end_date IS NULL OR do.end_date >= date(za.ZDATECREATED + 978307200, 'unixepoch'))
-                        LEFT JOIN (
-                            SELECT asset_id, GROUP_CONCAT(DISTINCT moment_name) AS published_moments, MAX(published_at_utc) AS last_asset_pub 
-                            FROM publications 
-                            GROUP BY asset_id
-                        ) ps ON ps.asset_id = a.asset_id
-                        LEFT JOIN ranked_assets_view v ON v.asset_id = a.asset_id
-                        WHERE zea.ZCAMERAMODEL = ?
-                          AND COALESCE(a.removed_from_source, 0) = 0
-                    ),
-                    moment_pub_stats AS (
-                        SELECT 
-                            moment_name,
-                            MAX(published_at_utc) AS last_published_at
-                        FROM publications
-                        GROUP BY moment_name
-                    ),
-                    moment_top_siblings AS (
-                        SELECT 
-                            assigned_moment,
-                            COUNT(*) AS total_moment_assets,
-                            ROUND(MAX(score_normalized), 4) AS max_moment_score,
-                            GROUP_CONCAT(
-                                original_filename || ' (score: ' || ROUND(score_normalized, 3) || ', ' || file_size_mb || 'MB)',
-                                ' | '
-                            ) AS other_moment_assets_sample
-                        FROM (
-                            SELECT 
-                                assigned_moment,
-                                original_filename,
-                                score_normalized,
-                                file_size_mb,
-                                ROW_NUMBER() OVER (PARTITION BY assigned_moment ORDER BY score_normalized DESC) as rn
-                            FROM all_assets_with_moments
-                            WHERE assigned_moment != '—'
-                        )
-                        WHERE rn <= 5
-                        GROUP BY assigned_moment
-                    )
-                    SELECT 
-                        c.score_quartile,
-                        c.original_filename AS candidate_file,
-                        c.month,
-                        c.file_size_mb,
-                        ROUND(c.score_normalized, 4) AS candidate_score,
-                        c.assigned_moment,
-                        CASE 
-                            WHEN mp.last_published_at IS NOT NULL THEN '✅ ' || substr(mp.last_published_at, 1, 10)
-                            WHEN c.last_asset_pub IS NOT NULL THEN '✅ ' || substr(c.last_asset_pub, 1, 10)
-                            ELSE '—'
-                        END AS moment_published_date,
-                        COALESCE(s.total_moment_assets, 1) AS total_assets_in_moment,
-                        s.max_moment_score AS best_score_in_moment,
-                        COALESCE(s.other_moment_assets_sample, '— (Standalone / No other assets)') AS moment_top_assets_with_scores,
-                        c.date_created_utc,
-                        c.primary_owner,
-                        c.camera_model,
-                        c.asset_id,
-                        c.file_size_bytes
-                    FROM all_assets_with_moments c
-                    LEFT JOIN moment_pub_stats mp ON mp.moment_name = c.assigned_moment AND c.assigned_moment != '—'
-                    LEFT JOIN moment_top_siblings s ON s.assigned_moment = c.assigned_moment AND c.assigned_moment != '—'
-                    WHERE c.score_quartile IN (1, 2)
-                    ORDER BY c.file_size_bytes DESC;
-                """
-                cursor.execute(cand_query, (selected_model,))
-            else:
-                cand_query = """
-                    WITH all_assets_with_moments AS (
-                        SELECT 
-                            a.asset_id,
-                            a.original_filename,
-                            a.month,
-                            a.date_created_utc,
-                            COALESCE(zea.ZCAMERAMODEL, 'Unknown') AS camera_model,
-                            COALESCE(zea.ZCAMERAMAKE, 'Unknown') AS camera_make,
-                            COALESCE(do.owner_name, 'Shared/Other') AS primary_owner,
-                            COALESCE(v.score_normalized, 0.0) AS score_normalized,
-                            a.aesthetic_score,
-                            a.google_favorite,
-                            a.mobile_apple_photos_featured_photos AS apple_featured,
-                            a.apple_photos_monthly_selection AS apple_monthly_sel,
-                            COALESCE(
-                                a.MomentsAlbumName, 
-                                a.curated_album, 
-                                a.to_be_curated_album, 
-                                ps.published_moments,
-                                '—'
-                            ) AS assigned_moment,
-                            ps.last_asset_pub,
-                            aaa.ZORIGINALFILESIZE AS file_size_bytes,
-                            ROUND(COALESCE(aaa.ZORIGINALFILESIZE, 0) / 1048576.0, 2) AS file_size_mb,
-                            ROUND(COALESCE(aaa.ZORIGINALFILESIZE, 0) / 1073741824.0, 3) AS file_size_gb,
-                            NTILE(4) OVER (
-                                PARTITION BY COALESCE(zea.ZCAMERAMODEL, 'Unknown')
-                                ORDER BY COALESCE(v.score_normalized, 0.0) ASC
-                            ) AS score_quartile
-                        FROM assets a
-                        LEFT JOIN ZASSET za ON za.ZUUID = a.asset_id
-                        LEFT JOIN ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = za.Z_PK
-                        LEFT JOIN ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
-                        LEFT JOIN device_owners do ON do.camera_model = zea.ZCAMERAMODEL
-                            AND (do.start_date IS NULL OR do.start_date <= date(za.ZDATECREATED + 978307200, 'unixepoch'))
-                            AND (do.end_date IS NULL OR do.end_date >= date(za.ZDATECREATED + 978307200, 'unixepoch'))
-                        LEFT JOIN (
-                            SELECT asset_id, GROUP_CONCAT(DISTINCT moment_name) AS published_moments, MAX(published_at_utc) AS last_asset_pub 
-                            FROM publications 
-                            GROUP BY asset_id
-                        ) ps ON ps.asset_id = a.asset_id
-                        LEFT JOIN ranked_assets_view v ON v.asset_id = a.asset_id
-                        WHERE zea.ZCAMERAMODEL = ?
-                          AND COALESCE(a.removed_from_source, 0) = 0
-                    ),
-                    moment_pub_stats AS (
-                        SELECT 
-                            moment_name,
-                            MAX(published_at_utc) AS last_published_at
-                        FROM publications
-                        GROUP BY moment_name
-                    ),
-                    moment_top_siblings AS (
-                        SELECT 
-                            assigned_moment,
-                            COUNT(*) AS total_moment_assets,
-                            ROUND(MAX(score_normalized), 4) AS max_moment_score,
-                            GROUP_CONCAT(
-                                original_filename || ' (score: ' || ROUND(score_normalized, 3) || ', ' || file_size_mb || 'MB)',
-                                ' | '
-                            ) AS other_moment_assets_sample
-                        FROM (
-                            SELECT 
-                                assigned_moment,
-                                original_filename,
-                                score_normalized,
-                                file_size_mb,
-                                ROW_NUMBER() OVER (PARTITION BY assigned_moment ORDER BY score_normalized DESC) as rn
-                            FROM all_assets_with_moments
-                            WHERE assigned_moment != '—'
-                        )
-                        WHERE rn <= 5
-                        GROUP BY assigned_moment
-                    )
-                    SELECT 
-                        c.score_quartile,
-                        c.original_filename AS candidate_file,
-                        c.month,
-                        c.file_size_mb,
-                        ROUND(c.score_normalized, 4) AS candidate_score,
-                        c.assigned_moment,
-                        CASE 
-                            WHEN mp.last_published_at IS NOT NULL THEN '✅ ' || substr(mp.last_published_at, 1, 10)
-                            WHEN c.last_asset_pub IS NOT NULL THEN '✅ ' || substr(c.last_asset_pub, 1, 10)
-                            ELSE '—'
-                        END AS moment_published_date,
-                        COALESCE(s.total_moment_assets, 1) AS total_assets_in_moment,
-                        s.max_moment_score AS best_score_in_moment,
-                        COALESCE(s.other_moment_assets_sample, '— (Standalone / No other assets)') AS moment_top_assets_with_scores,
-                        c.date_created_utc,
-                        c.primary_owner,
-                        c.camera_model,
-                        c.asset_id,
-                        c.file_size_bytes
-                    FROM all_assets_with_moments c
-                    LEFT JOIN moment_pub_stats mp ON mp.moment_name = c.assigned_moment AND c.assigned_moment != '—'
-                    LEFT JOIN moment_top_siblings s ON s.assigned_moment = c.assigned_moment AND c.assigned_moment != '—'
-                    WHERE c.score_quartile IN (1, 2)
-                    ORDER BY c.file_size_bytes DESC;
-                """
-                cursor.execute(cand_query, (selected_model,))
+            acquire_planner_lock()
+            conn = get_connection()
+            conn.execute("PRAGMA busy_timeout = 30000")
+            cursor = get_cursor()
 
-            candidates = cursor.fetchall()
+            photos_db_attached = False
+            try:
+                cursor.execute(f"ATTACH DATABASE 'file:{APPLE_PHOTOS_DB_PATH}?mode=ro' AS photos_db;")
+                photos_db_attached = True
+                logger.debug("Attached Photos.sqlite database read-only for quartile cleanup.")
+            except Exception as e:
+                logger.warning(f"Could not attach Photos.sqlite: {e}")
+
+            try:
+                # Query candidate files with moment siblings & publication status
+                if photos_db_attached:
+                    cand_query = """
+                        WITH all_assets_with_moments AS (
+                            SELECT 
+                                a.asset_id,
+                                a.original_filename,
+                                a.month,
+                                a.date_created_utc,
+                                COALESCE(zea.ZCAMERAMODEL, 'Unknown') AS camera_model,
+                                COALESCE(zea.ZCAMERAMAKE, 'Unknown') AS camera_make,
+                                COALESCE(do.owner_name, 'Shared/Other') AS primary_owner,
+                                COALESCE(v.score_normalized, 0.0) AS score_normalized,
+                                a.aesthetic_score,
+                                a.google_favorite,
+                                a.mobile_apple_photos_featured_photos AS apple_featured,
+                                a.apple_photos_monthly_selection AS apple_monthly_sel,
+                                COALESCE(
+                                    a.MomentsAlbumName, 
+                                    a.curated_album, 
+                                    a.to_be_curated_album, 
+                                    ps.published_moments,
+                                    CASE 
+                                        WHEN m.ZTITLE IS NOT NULL AND m.ZTITLE != '' 
+                                        THEN 'SUGG: ' || COALESCE(substr(a.date_created_utc, 1, 10), date(za.ZDATECREATED + 978307200, 'unixepoch'), a.month, '') || ' - ' || m.ZTITLE
+                                        ELSE NULL 
+                                    END,
+                                    '—'
+                                ) AS assigned_moment,
+                                ps.last_asset_pub,
+                                aaa.ZORIGINALFILESIZE AS file_size_bytes,
+                                ROUND(COALESCE(aaa.ZORIGINALFILESIZE, 0) / 1048576.0, 2) AS file_size_mb,
+                                ROUND(COALESCE(aaa.ZORIGINALFILESIZE, 0) / 1073741824.0, 3) AS file_size_gb,
+                                NTILE(4) OVER (
+                                    PARTITION BY COALESCE(zea.ZCAMERAMODEL, 'Unknown')
+                                    ORDER BY COALESCE(v.score_normalized, 0.0) ASC
+                                ) AS score_quartile
+                            FROM assets a
+                            LEFT JOIN photos_db.ZASSET za_ext ON za_ext.ZUUID = a.asset_id
+                            LEFT JOIN photos_db.ZMOMENT m ON za_ext.ZMOMENT = m.Z_PK
+                            LEFT JOIN ZASSET za ON za.ZUUID = a.asset_id
+                            LEFT JOIN ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = za.Z_PK
+                            LEFT JOIN ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
+                            LEFT JOIN device_owners do ON do.camera_model = zea.ZCAMERAMODEL
+                                AND (do.start_date IS NULL OR do.start_date <= date(za.ZDATECREATED + 978307200, 'unixepoch'))
+                                AND (do.end_date IS NULL OR do.end_date >= date(za.ZDATECREATED + 978307200, 'unixepoch'))
+                            LEFT JOIN (
+                                SELECT asset_id, GROUP_CONCAT(DISTINCT moment_name) AS published_moments, MAX(published_at_utc) AS last_asset_pub 
+                                FROM publications 
+                                GROUP BY asset_id
+                            ) ps ON ps.asset_id = a.asset_id
+                            LEFT JOIN ranked_assets_view v ON v.asset_id = a.asset_id
+                            WHERE zea.ZCAMERAMODEL = ?
+                              AND COALESCE(a.removed_from_source, 0) = 0
+                        ),
+                        moment_pub_stats AS (
+                            SELECT 
+                                moment_name,
+                                MAX(published_at_utc) AS last_published_at
+                            FROM publications
+                            GROUP BY moment_name
+                        ),
+                        moment_top_siblings AS (
+                            SELECT 
+                                assigned_moment,
+                                COUNT(*) AS total_moment_assets,
+                                ROUND(MAX(score_normalized), 4) AS max_moment_score,
+                                GROUP_CONCAT(
+                                    original_filename || ' (score: ' || ROUND(score_normalized, 3) || ', ' || file_size_mb || 'MB)',
+                                    ' | '
+                                ) AS other_moment_assets_sample
+                            FROM (
+                                SELECT 
+                                    assigned_moment,
+                                    original_filename,
+                                    score_normalized,
+                                    file_size_mb,
+                                    ROW_NUMBER() OVER (PARTITION BY assigned_moment ORDER BY score_normalized DESC) as rn
+                                FROM all_assets_with_moments
+                                WHERE assigned_moment != '—'
+                            )
+                            WHERE rn <= 5
+                            GROUP BY assigned_moment
+                        )
+                        SELECT 
+                            c.score_quartile,
+                            c.original_filename AS candidate_file,
+                            c.month,
+                            c.file_size_mb,
+                            ROUND(c.score_normalized, 4) AS candidate_score,
+                            c.assigned_moment,
+                            CASE 
+                                WHEN mp.last_published_at IS NOT NULL THEN '✅ ' || substr(mp.last_published_at, 1, 10)
+                                WHEN c.last_asset_pub IS NOT NULL THEN '✅ ' || substr(c.last_asset_pub, 1, 10)
+                                ELSE '—'
+                            END AS moment_published_date,
+                            COALESCE(s.total_moment_assets, 1) AS total_assets_in_moment,
+                            s.max_moment_score AS best_score_in_moment,
+                            COALESCE(s.other_moment_assets_sample, '— (Standalone / No other assets)') AS moment_top_assets_with_scores,
+                            c.date_created_utc,
+                            c.primary_owner,
+                            c.camera_model,
+                            c.asset_id,
+                            c.file_size_bytes
+                        FROM all_assets_with_moments c
+                        LEFT JOIN moment_pub_stats mp ON mp.moment_name = c.assigned_moment AND c.assigned_moment != '—'
+                        LEFT JOIN moment_top_siblings s ON s.assigned_moment = c.assigned_moment AND c.assigned_moment != '—'
+                        WHERE c.score_quartile IN (1, 2)
+                        ORDER BY c.file_size_bytes DESC;
+                    """
+                    cursor.execute(cand_query, (selected_model,))
+                else:
+                    cand_query = """
+                        WITH all_assets_with_moments AS (
+                            SELECT 
+                                a.asset_id,
+                                a.original_filename,
+                                a.month,
+                                a.date_created_utc,
+                                COALESCE(zea.ZCAMERAMODEL, 'Unknown') AS camera_model,
+                                COALESCE(zea.ZCAMERAMAKE, 'Unknown') AS camera_make,
+                                COALESCE(do.owner_name, 'Shared/Other') AS primary_owner,
+                                COALESCE(v.score_normalized, 0.0) AS score_normalized,
+                                a.aesthetic_score,
+                                a.google_favorite,
+                                a.mobile_apple_photos_featured_photos AS apple_featured,
+                                a.apple_photos_monthly_selection AS apple_monthly_sel,
+                                COALESCE(
+                                    a.MomentsAlbumName, 
+                                    a.curated_album, 
+                                    a.to_be_curated_album, 
+                                    ps.published_moments,
+                                    '—'
+                                ) AS assigned_moment,
+                                ps.last_asset_pub,
+                                aaa.ZORIGINALFILESIZE AS file_size_bytes,
+                                ROUND(COALESCE(aaa.ZORIGINALFILESIZE, 0) / 1048576.0, 2) AS file_size_mb,
+                                ROUND(COALESCE(aaa.ZORIGINALFILESIZE, 0) / 1073741824.0, 3) AS file_size_gb,
+                                NTILE(4) OVER (
+                                    PARTITION BY COALESCE(zea.ZCAMERAMODEL, 'Unknown')
+                                    ORDER BY COALESCE(v.score_normalized, 0.0) ASC
+                                ) AS score_quartile
+                            FROM assets a
+                            LEFT JOIN ZASSET za ON za.ZUUID = a.asset_id
+                            LEFT JOIN ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = za.Z_PK
+                            LEFT JOIN ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
+                            LEFT JOIN device_owners do ON do.camera_model = zea.ZCAMERAMODEL
+                                AND (do.start_date IS NULL OR do.start_date <= date(za.ZDATECREATED + 978307200, 'unixepoch'))
+                                AND (do.end_date IS NULL OR do.end_date >= date(za.ZDATECREATED + 978307200, 'unixepoch'))
+                            LEFT JOIN (
+                                SELECT asset_id, GROUP_CONCAT(DISTINCT moment_name) AS published_moments, MAX(published_at_utc) AS last_asset_pub 
+                                FROM publications 
+                                GROUP BY asset_id
+                            ) ps ON ps.asset_id = a.asset_id
+                            LEFT JOIN ranked_assets_view v ON v.asset_id = a.asset_id
+                            WHERE zea.ZCAMERAMODEL = ?
+                              AND COALESCE(a.removed_from_source, 0) = 0
+                        ),
+                        moment_pub_stats AS (
+                            SELECT 
+                                moment_name,
+                                MAX(published_at_utc) AS last_published_at
+                            FROM publications
+                            GROUP BY moment_name
+                        ),
+                        moment_top_siblings AS (
+                            SELECT 
+                                assigned_moment,
+                                COUNT(*) AS total_moment_assets,
+                                ROUND(MAX(score_normalized), 4) AS max_moment_score,
+                                GROUP_CONCAT(
+                                    original_filename || ' (score: ' || ROUND(score_normalized, 3) || ', ' || file_size_mb || 'MB)',
+                                    ' | '
+                                ) AS other_moment_assets_sample
+                            FROM (
+                                SELECT 
+                                    assigned_moment,
+                                    original_filename,
+                                    score_normalized,
+                                    file_size_mb,
+                                    ROW_NUMBER() OVER (PARTITION BY assigned_moment ORDER BY score_normalized DESC) as rn
+                                FROM all_assets_with_moments
+                                WHERE assigned_moment != '—'
+                            )
+                            WHERE rn <= 5
+                            GROUP BY assigned_moment
+                        )
+                        SELECT 
+                            c.score_quartile,
+                            c.original_filename AS candidate_file,
+                            c.month,
+                            c.file_size_mb,
+                            ROUND(c.score_normalized, 4) AS candidate_score,
+                            c.assigned_moment,
+                            CASE 
+                                WHEN mp.last_published_at IS NOT NULL THEN '✅ ' || substr(mp.last_published_at, 1, 10)
+                                WHEN c.last_asset_pub IS NOT NULL THEN '✅ ' || substr(c.last_asset_pub, 1, 10)
+                                ELSE '—'
+                            END AS moment_published_date,
+                            COALESCE(s.total_moment_assets, 1) AS total_assets_in_moment,
+                            s.max_moment_score AS best_score_in_moment,
+                            COALESCE(s.other_moment_assets_sample, '— (Standalone / No other assets)') AS moment_top_assets_with_scores,
+                            c.date_created_utc,
+                            c.primary_owner,
+                            c.camera_model,
+                            c.asset_id,
+                            c.file_size_bytes
+                        FROM all_assets_with_moments c
+                        LEFT JOIN moment_pub_stats mp ON mp.moment_name = c.assigned_moment AND c.assigned_moment != '—'
+                        LEFT JOIN moment_top_siblings s ON s.assigned_moment = c.assigned_moment AND c.assigned_moment != '—'
+                        WHERE c.score_quartile IN (1, 2)
+                        ORDER BY c.file_size_bytes DESC;
+                    """
+                    cursor.execute(cand_query, (selected_model,))
+
+                candidates = cursor.fetchall()
+            finally:
+                if photos_db_attached:
+                    try:
+                        cursor.execute("DETACH DATABASE photos_db;")
+                        logger.debug("Detached Photos.sqlite database after candidate query.")
+                    except Exception:
+                        pass
+                close_conn()
+                release_planner_lock()
+
             if not candidates:
                 print(f"ℹ️  No candidate files in Q1/Q2 found for {selected_model}.")
                 break
@@ -3891,14 +3910,23 @@ def display_quartile_cleanup_flow(cursor=None, conn=None):
                     confirm = input(f"\nAre you sure you want to mark these {len(chosen_items)} asset(s) as removed from source? [Y/n]: ").strip().lower()
                     if confirm in ('', 'y', 'yes'):
                         asset_ids_to_remove = [ch[13] for ch in chosen_items]
-                        cursor.executemany("""
-                            UPDATE assets 
-                            SET removed_from_source = 1,
-                                removed_from_source_at_utc = datetime('now'),
-                                updated_at_utc = datetime('now')
-                            WHERE asset_id = ?
-                        """, [(aid,) for aid in asset_ids_to_remove])
-                        conn.commit()
+                        acquire_planner_lock()
+                        conn = get_connection()
+                        conn.execute("PRAGMA busy_timeout = 30000")
+                        cursor = get_cursor()
+                        try:
+                            cursor.executemany("""
+                                UPDATE assets 
+                                SET removed_from_source = 1,
+                                    removed_from_source_at_utc = datetime('now'),
+                                    updated_at_utc = datetime('now')
+                                WHERE asset_id = ?
+                            """, [(aid,) for aid in asset_ids_to_remove])
+                            conn.commit()
+                        finally:
+                            close_conn()
+                            release_planner_lock()
+
                         print(f"\n✅ Marked {len(chosen_items)} asset(s) as removed from source ({human_readable_size(sel_bytes)} freed).")
                         # Break pagination loop to refresh candidates query
                         break
@@ -3911,17 +3939,6 @@ def display_quartile_cleanup_flow(cursor=None, conn=None):
 
             if exit_to_devices:
                 break
-
-    # Detach database safely
-    if photos_db_attached:
-        try:
-            cursor.execute("DETACH DATABASE photos_db;")
-            logger.debug("Detached Photos.sqlite database after quartile cleanup.")
-        except Exception:
-            pass
-
-    close_conn()
-    release_planner_lock()
 
 def display_media_cleanup_recommendations(cursor, verbose=True):
     """

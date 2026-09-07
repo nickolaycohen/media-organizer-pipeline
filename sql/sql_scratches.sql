@@ -62,7 +62,9 @@ WITH all_assets_with_moments AS (
         GROUP BY asset_id
     ) ps ON ps.asset_id = a.asset_id
     LEFT JOIN ranked_assets_view v ON v.asset_id = a.asset_id
-    WHERE zea.ZCAMERAMODEL IS NOT NULL AND zea.ZCAMERAMODEL != ''
+    WHERE zea.ZCAMERAMODEL IS NOT NULL 
+      AND zea.ZCAMERAMODEL != ''
+      AND COALESCE(a.removed_from_source, 0) = 0
 ),
 moment_pub_stats AS (
     SELECT 
@@ -143,7 +145,9 @@ WITH scored_assets AS (
         AND (do.start_date IS NULL OR do.start_date <= date(za.ZDATECREATED + 978307200, 'unixepoch'))
         AND (do.end_date IS NULL OR do.end_date >= date(za.ZDATECREATED + 978307200, 'unixepoch'))
     LEFT JOIN ranked_assets_view v ON v.asset_id = a.asset_id
-    WHERE zea.ZCAMERAMODEL IS NOT NULL AND zea.ZCAMERAMODEL != ''
+    WHERE zea.ZCAMERAMODEL IS NOT NULL 
+      AND zea.ZCAMERAMODEL != ''
+      AND COALESCE(a.removed_from_source, 0) = 0
 )
 SELECT 
     primary_owner,

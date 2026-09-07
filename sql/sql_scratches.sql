@@ -1,10 +1,149 @@
--- 1. Attach the Photos.sqlite database as 'photos_db'
-ATTACH DATABASE '/Volumes/Extreme Pro/Photos Library/All-Media.photoslibrary/database/Photos.sqlite' AS photos_db;
+-- ============================================================================
+-- 🧹 ASSET CLEANUP: Bottom 2 Quartiles (Lowest 50%) Ordered by File Size
+-- ============================================================================
+-- Splits imported assets for a device (or all devices) into 4 quartiles based on
+-- score_normalized (quality/curation score), filters for the bottom 2 quartiles (Q1 & Q2 - bottom 50%),
+-- and orders them largest-to-smallest so you can delete high-storage/low-value files first.
+-- ============================================================================
 
--- (If using your local DB copy instead, use this line instead:)
+-- 1. Attach Apple Photos database for Apple Moment suggestions
+ATTACH DATABASE '/Volumes/Extreme Pro/Photos Library/All-Media.photoslibrary/database/Photos.sqlite' AS photos_db;
+-- (Or local DB copy:)
 -- ATTACH DATABASE '/Users/nickolaycohen/Photos Library DB/All-Media-Extreme/database/Photos.sqlite' AS photos_db;
 
--- 2. Run the Skipped Videos Query
+WITH all_assets_with_moments AS (
+    SELECT 
+        a.asset_id,
+        a.original_filename,
+        a.month,
+        a.date_created_utc,
+        COALESCE(zea.ZCAMERAMODEL, 'Unknown') AS camera_model,
+        COALESCE(zea.ZCAMERAMAKE, 'Unknown') AS camera_make,
+        COALESCE(do.owner_name, 'Shared/Other') AS primary_owner,
+        COALESCE(v.score_normalized, 0.0) AS score_normalized,
+        a.aesthetic_score,
+        a.google_favorite,
+        a.mobile_apple_photos_featured_photos AS apple_featured,
+        a.apple_photos_monthly_selection AS apple_monthly_sel,
+        -- Assigned moment (or fallback to Apple Photos suggested moment with YYYY-MM-DD prefix)
+        COALESCE(
+            a.MomentsAlbumName, 
+            a.curated_album, 
+            a.to_be_curated_album, 
+            ps.published_moments,
+            CASE 
+                WHEN m.ZTITLE IS NOT NULL AND m.ZTITLE != '' 
+                THEN 'SUGG: ' || COALESCE(substr(a.date_created_utc, 1, 10), date(za.ZDATECREATED + 978307200, 'unixepoch'), a.month, '') || ' - ' || m.ZTITLE
+                ELSE NULL 
+            END,
+            '—'
+        ) AS assigned_moment,
+        aaa.ZORIGINALFILESIZE AS file_size_bytes,
+        ROUND(COALESCE(aaa.ZORIGINALFILESIZE, 0) / 1048576.0, 2) AS file_size_mb,
+        ROUND(COALESCE(aaa.ZORIGINALFILESIZE, 0) / 1073741824.0, 3) AS file_size_gb,
+        -- Splits assets into 4 equal quartiles (1 = Lowest 25%, 2 = 25-50%, 3 = 50-75%, 4 = Top 25%)
+        NTILE(4) OVER (
+            PARTITION BY COALESCE(zea.ZCAMERAMODEL, 'Unknown')
+            ORDER BY COALESCE(v.score_normalized, 0.0) ASC
+        ) AS score_quartile
+    FROM assets a
+    LEFT JOIN photos_db.ZASSET za_ext ON za_ext.ZUUID = a.asset_id
+    LEFT JOIN photos_db.ZMOMENT m ON za_ext.ZMOMENT = m.Z_PK
+    LEFT JOIN ZASSET za ON za.ZUUID = a.asset_id
+    LEFT JOIN ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = za.Z_PK
+    LEFT JOIN ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
+    LEFT JOIN device_owners do ON do.camera_model = zea.ZCAMERAMODEL
+        AND (do.start_date IS NULL OR do.start_date <= date(za.ZDATECREATED + 978307200, 'unixepoch'))
+        AND (do.end_date IS NULL OR do.end_date >= date(za.ZDATECREATED + 978307200, 'unixepoch'))
+    LEFT JOIN (
+        SELECT asset_id, GROUP_CONCAT(DISTINCT moment_name) AS published_moments 
+        FROM publications 
+        GROUP BY asset_id
+    ) ps ON ps.asset_id = a.asset_id
+    LEFT JOIN ranked_assets_view v ON v.asset_id = a.asset_id
+    WHERE zea.ZCAMERAMODEL IS NOT NULL AND zea.ZCAMERAMODEL != ''
+),
+moment_top_siblings AS (
+    SELECT 
+        assigned_moment,
+        COUNT(*) AS total_moment_assets,
+        ROUND(MAX(score_normalized), 4) AS max_moment_score,
+        GROUP_CONCAT(
+            original_filename || ' (score: ' || ROUND(score_normalized, 3) || ', ' || file_size_mb || 'MB)',
+            ' | '
+        ) AS other_moment_assets_sample
+    FROM (
+        SELECT 
+            assigned_moment,
+            original_filename,
+            score_normalized,
+            file_size_mb,
+            ROW_NUMBER() OVER (PARTITION BY assigned_moment ORDER BY score_normalized DESC) as rn
+        FROM all_assets_with_moments
+        WHERE assigned_moment != '—'
+    )
+    WHERE rn <= 5  -- Top 5 highest scoring assets in the same moment
+    GROUP BY assigned_moment
+)
+SELECT 
+    c.score_quartile,
+    c.original_filename AS candidate_file,
+    c.month,
+    c.file_size_mb,
+    ROUND(c.score_normalized, 4) AS candidate_score,
+    c.assigned_moment,
+    COALESCE(s.total_moment_assets, 1) AS total_assets_in_moment,
+    s.max_moment_score AS best_score_in_moment,
+    COALESCE(s.other_moment_assets_sample, '— (Standalone / No other assets)') AS moment_top_assets_with_scores,
+    c.date_created_utc,
+    c.primary_owner,
+    c.camera_model
+FROM all_assets_with_moments c
+LEFT JOIN moment_top_siblings s ON s.assigned_moment = c.assigned_moment AND c.assigned_moment != '—'
+WHERE c.camera_model = 'iPhone 16 Pro'  -- 👈 Filter by device
+  AND c.score_quartile IN (1, 2)         -- 👈 Bottom 50% lowest quality assets (Q1 and Q2)
+  -- Optional Safety Guards (uncomment if desired):
+  -- AND COALESCE(c.google_favorite, 0) = 0
+  -- AND COALESCE(c.apple_featured, 0) = 0
+ORDER BY c.file_size_bytes DESC;
+
+
+-- ============================================================================
+-- 📊 Quartile Summary by Device (Count, Total GB & Score Range per Quartile)
+-- ============================================================================
+WITH scored_assets AS (
+    SELECT 
+        COALESCE(zea.ZCAMERAMODEL, 'Unknown') AS camera_model,
+        COALESCE(do.owner_name, 'Shared/Other') AS primary_owner,
+        COALESCE(v.score_normalized, 0.0) AS score_normalized,
+        COALESCE(aaa.ZORIGINALFILESIZE, 0) AS file_size_bytes,
+        NTILE(4) OVER (
+            PARTITION BY COALESCE(zea.ZCAMERAMODEL, 'Unknown')
+            ORDER BY COALESCE(v.score_normalized, 0.0) ASC
+        ) AS score_quartile
+    FROM assets a
+    LEFT JOIN ZASSET za ON za.ZUUID = a.asset_id
+    LEFT JOIN ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = za.Z_PK
+    LEFT JOIN ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
+    LEFT JOIN device_owners do ON do.camera_model = zea.ZCAMERAMODEL
+        AND (do.start_date IS NULL OR do.start_date <= date(za.ZDATECREATED + 978307200, 'unixepoch'))
+        AND (do.end_date IS NULL OR do.end_date >= date(za.ZDATECREATED + 978307200, 'unixepoch'))
+    LEFT JOIN ranked_assets_view v ON v.asset_id = a.asset_id
+    WHERE zea.ZCAMERAMODEL IS NOT NULL AND zea.ZCAMERAMODEL != ''
+)
+SELECT 
+    primary_owner,
+    camera_model,
+    score_quartile,
+    COUNT(*) AS asset_count,
+    ROUND(SUM(file_size_bytes) / 1073741824.0, 2) AS total_size_gb,
+    ROUND(MIN(score_normalized), 4) AS min_score,
+    ROUND(MAX(score_normalized), 4) AS max_score
+FROM scored_assets
+GROUP BY primary_owner, camera_model, score_quartile
+ORDER BY primary_owner ASC, camera_model ASC, score_quartile ASC;
+
+
 -- 1. Attach Apple Photos database
 ATTACH DATABASE '/Volumes/Extreme Pro/Photos Library/All-Media.photoslibrary/database/Photos.sqlite' AS photos_db;
 -- (Or local copy:)

@@ -16,7 +16,7 @@ from utils.utils import get_full_transition_path, human_readable_size
 from google_photos import check_google_quota, authenticate, get_all_favorites
 import argparse
 import sqlite3
-from constants import MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_LOCK_PATH, APPLE_PHOTOS_DB_PATH, LOG_PATH, GOOGLE_PHOTOS_READONLY_SCOPES, GOOGLE_DRIVE_READ_ONLY_SCOPES, PLANNER_REQUIRED_SCOPES, CURATION_THRESHOLD_LOG_PATH, PUBLISHED_MOMENTS_LOG_PATH, SCORING_BREAKDOWN_LOG_PATH, MEDIA_CLEANUP_LOG_PATH, WEEKLY_MEMORY_LOG_PATH, PUBLISHING_RECOMMENDATIONS_LOG_PATH, MAX_UPLOAD_FILE_SIZE_BYTES, MAX_UPLOAD_FILE_SIZE_MB, BG_SERVICE_PID_PATH
+from constants import MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_LOCK_PATH, APPLE_PHOTOS_DB_PATH, LOG_PATH, GOOGLE_PHOTOS_READONLY_SCOPES, GOOGLE_DRIVE_READ_ONLY_SCOPES, PLANNER_REQUIRED_SCOPES, CURATION_THRESHOLD_LOG_PATH, PUBLISHED_MOMENTS_LOG_PATH, SCORING_BREAKDOWN_LOG_PATH, MEDIA_CLEANUP_LOG_PATH, QUARTILE_CLEANUP_LOG_PATH, WEEKLY_MEMORY_LOG_PATH, PUBLISHING_RECOMMENDATIONS_LOG_PATH, MAX_UPLOAD_FILE_SIZE_BYTES, MAX_UPLOAD_FILE_SIZE_MB, BG_SERVICE_PID_PATH
 from constants import ACTIVE_CAMERA_MODELS, DEVICE_OWNER_MAPPING, AESTHETIC_SCORE_WEIGHT, GOOGLE_FAVORITES_WEIGHT, APPLE_SELECTION_WEIGHT, APPLE_FEATURED_WEIGHT
 from db.connections import get_connection, get_cursor, commit, close as close_conn
 from db.queries import get_stage_transitions, get_batch_statuses, get_latest_import_and_month
@@ -3361,6 +3361,444 @@ def manage_device_owners_flow(cursor=None, conn=None):
     except Exception:
         pass
 
+def display_quartile_cleanup_flow(cursor=None, conn=None):
+    """
+    Interactive flow to analyze and clean up low-quality media assets using a 4-quartile model.
+    Groups devices by primary owner, shows low-quality (Q1 & Q2, bottom 50%) file counts and reclaimable space,
+    and lets the user drill down into any device to view candidates ordered by file size descending,
+    with assigned/suggested moments and moment sister assets.
+    """
+    acquire_planner_lock()
+    conn = get_connection()
+    conn.execute("PRAGMA busy_timeout = 30000")
+    cursor = get_cursor()
+
+    # Attempt to attach photos_db read-only for Apple Moments & size querying
+    photos_db_attached = False
+    try:
+        cursor.execute(f"ATTACH DATABASE 'file:{APPLE_PHOTOS_DB_PATH}?mode=ro' AS photos_db;")
+        photos_db_attached = True
+        logger.debug("Attached Photos.sqlite database read-only for quartile cleanup.")
+    except Exception as e:
+        logger.warning(f"Could not attach Photos.sqlite: {e}")
+
+    while True:
+        # 1. Query device summary grouped by primary owner
+        cursor.execute("""
+            WITH scored_assets AS (
+                SELECT 
+                    COALESCE(zea.ZCAMERAMODEL, 'Unknown') AS camera_model,
+                    COALESCE(do.owner_name, 'Shared/Other') AS primary_owner,
+                    COALESCE(v.score_normalized, 0.0) AS score_normalized,
+                    COALESCE(aaa.ZORIGINALFILESIZE, 0) AS file_size_bytes,
+                    NTILE(4) OVER (
+                        PARTITION BY COALESCE(zea.ZCAMERAMODEL, 'Unknown')
+                        ORDER BY COALESCE(v.score_normalized, 0.0) ASC
+                    ) AS score_quartile
+                FROM assets a
+                LEFT JOIN ZASSET za ON za.ZUUID = a.asset_id
+                LEFT JOIN ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = za.Z_PK
+                LEFT JOIN ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
+                LEFT JOIN device_owners do ON do.camera_model = zea.ZCAMERAMODEL
+                    AND (do.start_date IS NULL OR do.start_date <= date(za.ZDATECREATED + 978307200, 'unixepoch'))
+                    AND (do.end_date IS NULL OR do.end_date >= date(za.ZDATECREATED + 978307200, 'unixepoch'))
+                LEFT JOIN ranked_assets_view v ON v.asset_id = a.asset_id
+                WHERE zea.ZCAMERAMODEL IS NOT NULL AND zea.ZCAMERAMODEL != ''
+            )
+            SELECT 
+                primary_owner,
+                camera_model,
+                COUNT(CASE WHEN score_quartile IN (1, 2) THEN 1 END) AS low_quality_count,
+                ROUND(SUM(CASE WHEN score_quartile IN (1, 2) THEN file_size_bytes ELSE 0 END) / 1073741824.0, 2) AS low_quality_gb,
+                COUNT(*) AS total_assets,
+                ROUND(SUM(file_size_bytes) / 1073741824.0, 2) AS total_gb,
+                ROUND(MIN(score_normalized), 4) AS min_score,
+                ROUND(MAX(CASE WHEN score_quartile = 2 THEN score_normalized END), 4) AS q2_max_score
+            FROM scored_assets
+            GROUP BY primary_owner, camera_model
+            ORDER BY primary_owner ASC, low_quality_gb DESC, low_quality_count DESC;
+        """)
+        summary_rows = cursor.fetchall()
+
+        if not summary_rows:
+            print("\nℹ️  No imported assets found with camera model attributes.")
+            break
+
+        # Build clean owner groups
+        owner_data = {}
+        device_lookup = {}
+        device_idx = 1
+        grand_low_count = 0
+        grand_low_gb = 0.0
+        grand_total_count = 0
+        grand_total_gb = 0.0
+
+        for r in summary_rows:
+            p_owner = r[0]
+            c_model = r[1]
+            l_count = r[2] or 0
+            l_gb = r[3] or 0.0
+            t_count = r[4] or 0
+            t_gb = r[5] or 0.0
+            min_s = r[6] if r[6] is not None else 0.0
+            max_s = r[7] if r[7] is not None else 0.0
+
+            if p_owner not in owner_data:
+                owner_data[p_owner] = []
+
+            item = {
+                'idx': device_idx,
+                'owner': p_owner,
+                'model': c_model,
+                'low_count': l_count,
+                'low_gb': l_gb,
+                'total_count': t_count,
+                'total_gb': t_gb,
+                'min_score': min_s,
+                'max_score': max_s
+            }
+            owner_data[p_owner].append(item)
+            device_lookup[device_idx] = item
+            device_lookup[c_model.lower()] = item
+            device_idx += 1
+
+            grand_low_count += l_count
+            grand_low_gb += l_gb
+            grand_total_count += t_count
+            grand_total_gb += t_gb
+
+        # Print Owner-Grouped Overview Table
+        print("\n" + "=" * 140)
+        print("🧹 Quartile Media Cleanup: Low-Quality Asset Overview by Device (Bottom 2 Quartiles / Lowest 50%)")
+        print("=" * 140)
+        print("Splits imported assets into 4 equal quartiles partitioned by device based on quality/curation scores.")
+        print("Q1 & Q2 represent the bottom 50% lowest quality assets. Ordered largest-to-smallest so high storage gains appear first.\n")
+
+        for owner_name in sorted(owner_data.keys()):
+            items = owner_data[owner_name]
+            sub_low_count = sum(i['low_count'] for i in items)
+            sub_low_gb = sum(i['low_gb'] for i in items)
+            sub_total_count = sum(i['total_count'] for i in items)
+            sub_total_gb = sum(i['total_gb'] for i in items)
+
+            print(f"👤 Primary Owner: {owner_name}")
+            print("-" * 140)
+            print(f"  {'No.':<5} {'Camera Model':<34} {'Low-Quality (Q1+Q2)':<22} {'Reclaimable Space':<20} {'Total on Device':<20} {'Total Device Size':<20} {'Score Ceiling (Q2 Max)':<20}")
+            print("  " + "-" * 138)
+
+            for it in items:
+                low_cnt_str = f"{it['low_count']:,} files"
+                low_gb_str = f"{it['low_gb']:.2f} GB"
+                tot_cnt_str = f"{it['total_count']:,} files"
+                tot_gb_str = f"{it['total_gb']:.2f} GB"
+                score_range = f"{it['min_score']:.4f} - {it['max_score']:.4f}"
+
+                print(f"  {it['idx']:<5} {it['model']:<34} {low_cnt_str:<22} {low_gb_str:<20} {tot_cnt_str:<20} {tot_gb_str:<20} {score_range:<20}")
+
+            print("  " + "-" * 138)
+            print(f"  💰 Subtotal for {owner_name}: {sub_low_count:,} low-quality files ({sub_low_gb:.2f} GB reclaimable out of {sub_total_gb:.2f} GB total across {sub_total_count:,} assets)\n")
+
+        print("=" * 140)
+        print(f"💰 GRAND TOTAL ACROSS ALL DEVICES: {grand_low_count:,} low-quality files ({grand_low_gb:.2f} GB reclaimable out of {grand_total_gb:.2f} GB total across {grand_total_count:,} assets)")
+        print("=" * 140)
+
+        # Device Selection Prompt
+        print("\nOptions: Select device number [1-{}] or device name to view candidate files | [B]ack to Main Menu [default: B]: ".format(device_idx - 1))
+        choice = input("Enter choice: ").strip()
+        if not choice or choice.lower() in ('b', 'back', 'q', 'quit'):
+            break
+
+        selected_item = None
+        if choice.isdigit() and int(choice) in device_lookup:
+            selected_item = device_lookup[int(choice)]
+        elif choice.lower() in device_lookup:
+            selected_item = device_lookup[choice.lower()]
+        else:
+            matches = [it for it in device_lookup.values() if isinstance(it, dict) and choice.lower() in it['model'].lower()]
+            if len(matches) == 1:
+                selected_item = matches[0]
+            elif len(matches) > 1:
+                print(f"Multiple devices matched '{choice}'. Please pick by number: {[m['idx'] for m in matches]}")
+                continue
+            else:
+                print(f"❌ Unknown device selection '{choice}'.")
+                continue
+
+        # Drill-down into candidate files for selected device
+        selected_model = selected_item['model']
+        selected_owner = selected_item['owner']
+        print(f"\n🔍 Querying bottom 2 quartiles for {selected_owner} - {selected_model} (ordered largest-to-smallest)...")
+
+        # Query candidate files with moment siblings
+        if photos_db_attached:
+            cand_query = """
+                WITH all_assets_with_moments AS (
+                    SELECT 
+                        a.asset_id,
+                        a.original_filename,
+                        a.month,
+                        a.date_created_utc,
+                        COALESCE(zea.ZCAMERAMODEL, 'Unknown') AS camera_model,
+                        COALESCE(zea.ZCAMERAMAKE, 'Unknown') AS camera_make,
+                        COALESCE(do.owner_name, 'Shared/Other') AS primary_owner,
+                        COALESCE(v.score_normalized, 0.0) AS score_normalized,
+                        a.aesthetic_score,
+                        a.google_favorite,
+                        a.mobile_apple_photos_featured_photos AS apple_featured,
+                        a.apple_photos_monthly_selection AS apple_monthly_sel,
+                        COALESCE(
+                            a.MomentsAlbumName, 
+                            a.curated_album, 
+                            a.to_be_curated_album, 
+                            ps.published_moments,
+                            CASE 
+                                WHEN m.ZTITLE IS NOT NULL AND m.ZTITLE != '' 
+                                THEN 'SUGG: ' || COALESCE(substr(a.date_created_utc, 1, 10), date(za.ZDATECREATED + 978307200, 'unixepoch'), a.month, '') || ' - ' || m.ZTITLE
+                                ELSE NULL 
+                            END,
+                            '—'
+                        ) AS assigned_moment,
+                        aaa.ZORIGINALFILESIZE AS file_size_bytes,
+                        ROUND(COALESCE(aaa.ZORIGINALFILESIZE, 0) / 1048576.0, 2) AS file_size_mb,
+                        ROUND(COALESCE(aaa.ZORIGINALFILESIZE, 0) / 1073741824.0, 3) AS file_size_gb,
+                        NTILE(4) OVER (
+                            PARTITION BY COALESCE(zea.ZCAMERAMODEL, 'Unknown')
+                            ORDER BY COALESCE(v.score_normalized, 0.0) ASC
+                        ) AS score_quartile
+                    FROM assets a
+                    LEFT JOIN photos_db.ZASSET za_ext ON za_ext.ZUUID = a.asset_id
+                    LEFT JOIN photos_db.ZMOMENT m ON za_ext.ZMOMENT = m.Z_PK
+                    LEFT JOIN ZASSET za ON za.ZUUID = a.asset_id
+                    LEFT JOIN ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = za.Z_PK
+                    LEFT JOIN ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
+                    LEFT JOIN device_owners do ON do.camera_model = zea.ZCAMERAMODEL
+                        AND (do.start_date IS NULL OR do.start_date <= date(za.ZDATECREATED + 978307200, 'unixepoch'))
+                        AND (do.end_date IS NULL OR do.end_date >= date(za.ZDATECREATED + 978307200, 'unixepoch'))
+                    LEFT JOIN (
+                        SELECT asset_id, GROUP_CONCAT(DISTINCT moment_name) AS published_moments 
+                        FROM publications 
+                        GROUP BY asset_id
+                    ) ps ON ps.asset_id = a.asset_id
+                    LEFT JOIN ranked_assets_view v ON v.asset_id = a.asset_id
+                    WHERE zea.ZCAMERAMODEL = ?
+                ),
+                moment_top_siblings AS (
+                    SELECT 
+                        assigned_moment,
+                        COUNT(*) AS total_moment_assets,
+                        ROUND(MAX(score_normalized), 4) AS max_moment_score,
+                        GROUP_CONCAT(
+                            original_filename || ' (score: ' || ROUND(score_normalized, 3) || ', ' || file_size_mb || 'MB)',
+                            ' | '
+                        ) AS other_moment_assets_sample
+                    FROM (
+                        SELECT 
+                            assigned_moment,
+                            original_filename,
+                            score_normalized,
+                            file_size_mb,
+                            ROW_NUMBER() OVER (PARTITION BY assigned_moment ORDER BY score_normalized DESC) as rn
+                        FROM all_assets_with_moments
+                        WHERE assigned_moment != '—'
+                    )
+                    WHERE rn <= 5
+                    GROUP BY assigned_moment
+                )
+                SELECT 
+                    c.score_quartile,
+                    c.original_filename AS candidate_file,
+                    c.month,
+                    c.file_size_mb,
+                    ROUND(c.score_normalized, 4) AS candidate_score,
+                    c.assigned_moment,
+                    COALESCE(s.total_moment_assets, 1) AS total_assets_in_moment,
+                    s.max_moment_score AS best_score_in_moment,
+                    COALESCE(s.other_moment_assets_sample, '— (Standalone / No other assets)') AS moment_top_assets_with_scores,
+                    c.date_created_utc,
+                    c.primary_owner,
+                    c.camera_model
+                FROM all_assets_with_moments c
+                LEFT JOIN moment_top_siblings s ON s.assigned_moment = c.assigned_moment AND c.assigned_moment != '—'
+                WHERE c.score_quartile IN (1, 2)
+                ORDER BY c.file_size_bytes DESC;
+            """
+            cursor.execute(cand_query, (selected_model,))
+        else:
+            cand_query = """
+                WITH all_assets_with_moments AS (
+                    SELECT 
+                        a.asset_id,
+                        a.original_filename,
+                        a.month,
+                        a.date_created_utc,
+                        COALESCE(zea.ZCAMERAMODEL, 'Unknown') AS camera_model,
+                        COALESCE(zea.ZCAMERAMAKE, 'Unknown') AS camera_make,
+                        COALESCE(do.owner_name, 'Shared/Other') AS primary_owner,
+                        COALESCE(v.score_normalized, 0.0) AS score_normalized,
+                        a.aesthetic_score,
+                        a.google_favorite,
+                        a.mobile_apple_photos_featured_photos AS apple_featured,
+                        a.apple_photos_monthly_selection AS apple_monthly_sel,
+                        COALESCE(
+                            a.MomentsAlbumName, 
+                            a.curated_album, 
+                            a.to_be_curated_album, 
+                            ps.published_moments,
+                            '—'
+                        ) AS assigned_moment,
+                        aaa.ZORIGINALFILESIZE AS file_size_bytes,
+                        ROUND(COALESCE(aaa.ZORIGINALFILESIZE, 0) / 1048576.0, 2) AS file_size_mb,
+                        ROUND(COALESCE(aaa.ZORIGINALFILESIZE, 0) / 1073741824.0, 3) AS file_size_gb,
+                        NTILE(4) OVER (
+                            PARTITION BY COALESCE(zea.ZCAMERAMODEL, 'Unknown')
+                            ORDER BY COALESCE(v.score_normalized, 0.0) ASC
+                        ) AS score_quartile
+                    FROM assets a
+                    LEFT JOIN ZASSET za ON za.ZUUID = a.asset_id
+                    LEFT JOIN ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = za.Z_PK
+                    LEFT JOIN ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
+                    LEFT JOIN device_owners do ON do.camera_model = zea.ZCAMERAMODEL
+                        AND (do.start_date IS NULL OR do.start_date <= date(za.ZDATECREATED + 978307200, 'unixepoch'))
+                        AND (do.end_date IS NULL OR do.end_date >= date(za.ZDATECREATED + 978307200, 'unixepoch'))
+                    LEFT JOIN (
+                        SELECT asset_id, GROUP_CONCAT(DISTINCT moment_name) AS published_moments 
+                        FROM publications 
+                        GROUP BY asset_id
+                    ) ps ON ps.asset_id = a.asset_id
+                    LEFT JOIN ranked_assets_view v ON v.asset_id = a.asset_id
+                    WHERE zea.ZCAMERAMODEL = ?
+                ),
+                moment_top_siblings AS (
+                    SELECT 
+                        assigned_moment,
+                        COUNT(*) AS total_moment_assets,
+                        ROUND(MAX(score_normalized), 4) AS max_moment_score,
+                        GROUP_CONCAT(
+                            original_filename || ' (score: ' || ROUND(score_normalized, 3) || ', ' || file_size_mb || 'MB)',
+                            ' | '
+                        ) AS other_moment_assets_sample
+                    FROM (
+                        SELECT 
+                            assigned_moment,
+                            original_filename,
+                            score_normalized,
+                            file_size_mb,
+                            ROW_NUMBER() OVER (PARTITION BY assigned_moment ORDER BY score_normalized DESC) as rn
+                        FROM all_assets_with_moments
+                        WHERE assigned_moment != '—'
+                    )
+                    WHERE rn <= 5
+                    GROUP BY assigned_moment
+                )
+                SELECT 
+                    c.score_quartile,
+                    c.original_filename AS candidate_file,
+                    c.month,
+                    c.file_size_mb,
+                    ROUND(c.score_normalized, 4) AS candidate_score,
+                    c.assigned_moment,
+                    COALESCE(s.total_moment_assets, 1) AS total_assets_in_moment,
+                    s.max_moment_score AS best_score_in_moment,
+                    COALESCE(s.other_moment_assets_sample, '— (Standalone / No other assets)') AS moment_top_assets_with_scores,
+                    c.date_created_utc,
+                    c.primary_owner,
+                    c.camera_model
+                FROM all_assets_with_moments c
+                LEFT JOIN moment_top_siblings s ON s.assigned_moment = c.assigned_moment AND c.assigned_moment != '—'
+                WHERE c.score_quartile IN (1, 2)
+                ORDER BY c.file_size_bytes DESC;
+            """
+            cursor.execute(cand_query, (selected_model,))
+
+        candidates = cursor.fetchall()
+        if not candidates:
+            print(f"ℹ️  No candidate files in Q1/Q2 found for {selected_model}.")
+            continue
+
+        # Write candidate report to log file
+        try:
+            log_lines = [
+                "=" * 160,
+                f"🧹 Quartile Cleanup Candidate Report: {selected_owner} - {selected_model}",
+                f"Total Q1+Q2 Low-Quality Assets: {len(candidates):,} files | Reclaimable Space: {selected_item['low_gb']:.2f} GB",
+                "=" * 160,
+                f"{'No.':<6} {'Q':<4} {'Candidate Filename':<26} {'Month':<10} {'Size(MB)':<12} {'Score':<8} {'Assigned / Suggested Moment':<45} {'Moment Top Sibling Assets'}",
+                "-" * 160
+            ]
+            for c_idx, c_row in enumerate(candidates, 1):
+                c_q = f"Q{c_row[0]}"
+                c_fn = c_row[1]
+                c_mo = c_row[2] or "—"
+                c_mb = f"{c_row[3]:.2f} MB"
+                c_sc = f"{c_row[4]:.4f}"
+                c_mom = c_row[5] or "—"
+                if len(c_mom) > 42:
+                    c_mom_trunc = c_mom[:39] + "..."
+                else:
+                    c_mom_trunc = c_mom
+                c_sibs = c_row[8] or "—"
+                log_lines.append(f"{c_idx:<6} {c_q:<4} {c_fn:<26} {c_mo:<10} {c_mb:<12} {c_sc:<8} {c_mom_trunc:<45} {c_sibs}")
+
+            with open(QUARTILE_CLEANUP_LOG_PATH, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(log_lines) + '\n')
+            logger.info(f"📄 Full candidate report ({len(candidates)} files) saved to {QUARTILE_CLEANUP_LOG_PATH}")
+        except Exception as e:
+            logger.warning(f"Could not write candidate log: {e}")
+
+        # Interactive pagination of candidates
+        page_size = 25
+        cur_offset = 0
+        total_cand = len(candidates)
+
+        while cur_offset < total_cand:
+            page_items = candidates[cur_offset : cur_offset + page_size]
+            print("\n" + "=" * 160)
+            print(f"📷 Candidate Files for Removal: {selected_owner} - {selected_model} (Showing {cur_offset + 1} - {min(cur_offset + page_size, total_cand)} of {total_cand:,} files | {selected_item['low_gb']:.2f} GB)")
+            print("=" * 160)
+            print(f"{'No.':<6} {'Q':<4} {'Candidate Filename':<26} {'Month':<10} {'Size(MB)':<12} {'Score':<8} {'Assigned / Suggested Moment':<45} {'Moment Top Sibling Assets'}")
+            print("-" * 160)
+
+            for p_idx, c_row in enumerate(page_items, cur_offset + 1):
+                c_q = f"Q{c_row[0]}"
+                c_fn = c_row[1]
+                c_mo = c_row[2] or "—"
+                c_mb = f"{c_row[3]:.2f} MB"
+                c_sc = f"{c_row[4]:.4f}"
+                c_mom = c_row[5] or "—"
+                if len(c_mom) > 42:
+                    c_mom_trunc = c_mom[:39] + "..."
+                else:
+                    c_mom_trunc = c_mom
+                c_sibs = c_row[8] or "—"
+                if len(c_sibs) > 60:
+                    c_sibs = c_sibs[:57] + "..."
+                print(f"{p_idx:<6} {c_q:<4} {c_fn:<26} {c_mo:<10} {c_mb:<12} {c_sc:<8} {c_mom_trunc:<45} {c_sibs}")
+
+            print("-" * 160)
+            print(f"ℹ️  Full list with details written to {QUARTILE_CLEANUP_LOG_PATH}")
+
+            if cur_offset + page_size >= total_cand:
+                input("\nReached end of candidate list. Press [Enter] to return to device list: ")
+                break
+
+            p_choice = input(f"\n[Enter] Next {page_size} | [A]ll remaining | [B]ack to device list [default: Next]: ").strip().lower()
+            if p_choice in ('b', 'back', 'q'):
+                break
+            elif p_choice == 'a':
+                page_size = total_cand
+            cur_offset += page_size
+
+    # Detach database safely
+    if photos_db_attached:
+        try:
+            cursor.execute("DETACH DATABASE photos_db;")
+            logger.debug("Detached Photos.sqlite database after quartile cleanup.")
+        except Exception:
+            pass
+
+    close_conn()
+    release_planner_lock()
+
 def display_media_cleanup_recommendations(cursor, verbose=True):
     """
     Generates and displays media cleanup recommendations for source cameras based on published albums.
@@ -3596,14 +4034,19 @@ def main(auto_apply, no_sync=False):
             run_memory_publishing_flow(None, None)
             sys.exit(0)
         elif mode == 'c':
-            acquire_planner_lock()
-            conn = get_connection()
-            conn.execute("PRAGMA busy_timeout = 30000")
-            cursor = get_cursor()
-            display_media_cleanup_recommendations(cursor, verbose=True)
-            close_conn()
-            release_planner_lock()
-            sys.exit(0)
+            cleanup_type = input("\nSelect Cleanup Mode: [Q] Quartile Low-Quality Device Cleanup (default) | [L] Legacy Published SD-Card Cleanup: ").strip().lower()
+            if cleanup_type == 'l':
+                acquire_planner_lock()
+                conn = get_connection()
+                conn.execute("PRAGMA busy_timeout = 30000")
+                cursor = get_cursor()
+                display_media_cleanup_recommendations(cursor, verbose=True)
+                close_conn()
+                release_planner_lock()
+                sys.exit(0)
+            else:
+                display_quartile_cleanup_flow(None, None)
+                sys.exit(0)
         elif mode == 'o':
             manage_device_owners_flow(None, None)
             # Restart the script to return to the main menu clean

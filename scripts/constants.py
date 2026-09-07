@@ -9,6 +9,7 @@ PUBLISHED_MOMENTS_LOG_PATH = os.path.abspath(os.path.join(BASE_DIR, '../logs/pub
 UNPROCESSED_MONTHS_LOG_PATH = os.path.abspath(os.path.join(BASE_DIR, '../logs/unprocessed_months.log'))
 SCORING_BREAKDOWN_LOG_PATH = os.path.abspath(os.path.join(BASE_DIR, '../logs/qualified_assets_scoring_breakdown.log'))
 MEDIA_CLEANUP_LOG_PATH = os.path.abspath(os.path.join(BASE_DIR, '../logs/media_cleanup_recommendations.log'))
+QUARTILE_CLEANUP_LOG_PATH = os.path.abspath(os.path.join(BASE_DIR, '../logs/quartile_cleanup_recommendations.log'))
 BG_SERVICE_LOG_PATH = os.path.abspath(os.path.join(BASE_DIR, '../logs/bg_copy_db_service.log'))
 WEEKLY_MEMORY_LOG_PATH = os.path.abspath(os.path.join(BASE_DIR, '../logs/weekly_memory_publishing.log'))
 PUBLISHING_RECOMMENDATIONS_LOG_PATH = os.path.abspath(os.path.join(BASE_DIR, '../logs/publishing_recommendations.log'))

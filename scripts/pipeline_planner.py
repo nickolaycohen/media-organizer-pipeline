@@ -3815,12 +3815,12 @@ def display_quartile_cleanup_flow(cursor=None, conn=None):
             # Write candidate report to log file
             try:
                 log_lines = [
-                    "=" * 175,
+                    "=" * 230,
                     f"🧹 Quartile Cleanup Candidate Report: {selected_owner} - {selected_model}",
                     f"Total Q1+Q2 Low-Quality Assets: {len(candidates):,} files | Reclaimable Space: {total_cand_gb:.2f} GB",
-                    "=" * 175,
+                    "=" * 230,
                     f"{'No.':<5} {'Q':<4} {'Candidate Filename':<24} {'Month':<9} {'Size(MB)':<11} {'Score':<8} {'Assigned / Suggested Moment':<38} {'Published':<14} {'Moment Top Sibling Assets'}",
-                    "-" * 175
+                    "-" * 230
                 ]
                 for c_idx, c_row in enumerate(candidates, 1):
                     c_q = f"Q{c_row[0]}"
@@ -3829,8 +3829,8 @@ def display_quartile_cleanup_flow(cursor=None, conn=None):
                     c_mb = f"{c_row[3]:.2f} MB"
                     c_sc = f"{c_row[4]:.4f}"
                     c_mom = c_row[5] or "—"
-                    if len(c_mom) > 36:
-                        c_mom_trunc = c_mom[:33] + "..."
+                    if len(c_mom) > 38:
+                        c_mom_trunc = c_mom[:35] + "..."
                     else:
                         c_mom_trunc = c_mom
                     c_pub = c_row[6] or "—"
@@ -3850,11 +3850,11 @@ def display_quartile_cleanup_flow(cursor=None, conn=None):
 
             while cur_offset < total_cand:
                 page_items = candidates[cur_offset : cur_offset + page_size]
-                print("\n" + "=" * 175)
+                print("\n" + "=" * 230)
                 print(f"📷 Candidate Files for Removal: {selected_owner} - {selected_model} (Showing {cur_offset + 1} - {min(cur_offset + page_size, total_cand)} of {total_cand:,} files | {total_cand_gb:.2f} GB)")
-                print("=" * 175)
+                print("=" * 230)
                 print(f"{'No.':<5} {'Q':<4} {'Candidate Filename':<24} {'Month':<9} {'Size(MB)':<11} {'Score':<8} {'Assigned / Suggested Moment':<38} {'Published':<14} {'Moment Top Sibling Assets'}")
-                print("-" * 175)
+                print("-" * 230)
 
                 for p_idx, c_row in enumerate(page_items, cur_offset + 1):
                     c_q = f"Q{c_row[0]}"
@@ -3863,17 +3863,17 @@ def display_quartile_cleanup_flow(cursor=None, conn=None):
                     c_mb = f"{c_row[3]:.2f} MB"
                     c_sc = f"{c_row[4]:.4f}"
                     c_mom = c_row[5] or "—"
-                    if len(c_mom) > 36:
-                        c_mom_trunc = c_mom[:33] + "..."
+                    if len(c_mom) > 38:
+                        c_mom_trunc = c_mom[:35] + "..."
                     else:
                         c_mom_trunc = c_mom
                     c_pub = c_row[6] or "—"
                     c_sibs = c_row[9] or "—"
-                    if len(c_sibs) > 50:
-                        c_sibs = c_sibs[:47] + "..."
+                    if len(c_sibs) > 110:
+                        c_sibs = c_sibs[:107] + "..."
                     print(f"{p_idx:<5} {c_q:<4} {c_fn:<24} {c_mo:<9} {c_mb:<11} {c_sc:<8} {c_mom_trunc:<38} {c_pub:<14} {c_sibs}")
 
-                print("-" * 175)
+                print("-" * 230)
                 print(f"ℹ️  Full list with details written to {QUARTILE_CLEANUP_LOG_PATH}")
 
                 prompt_msg = (

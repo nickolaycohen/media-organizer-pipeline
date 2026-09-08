@@ -3701,13 +3701,26 @@ def display_quartile_cleanup_flow(cursor=None, conn=None):
                             COALESCE(p.photo_count, 0) + COALESCE(v.video_count, 0) AS total_assets_in_moment,
                             MAX(COALESCE(p.max_photo_score, 0), COALESCE(v.max_video_score, 0)) AS best_score_in_moment,
                             CASE 
-                                WHEN p.top_photos IS NOT NULL AND v.top_videos IS NOT NULL 
-                                THEN '📷 Photos: ' || p.top_photos || '  ||  🎥 Videos: ' || v.top_videos
-                                WHEN p.top_photos IS NOT NULL 
-                                THEN '📷 Photos: ' || p.top_photos
-                                WHEN v.top_videos IS NOT NULL 
-                                THEN '🎥 Videos: ' || v.top_videos
-                                ELSE '— (Standalone / No other assets)'
+                                WHEN c.media_type = 'video' THEN
+                                    CASE 
+                                        WHEN v.top_videos IS NOT NULL AND p.top_photos IS NOT NULL 
+                                        THEN '🎥 Videos: ' || v.top_videos || '  ||  📷 Photos: ' || p.top_photos
+                                        WHEN v.top_videos IS NOT NULL 
+                                        THEN '🎥 Videos: ' || v.top_videos
+                                        WHEN p.top_photos IS NOT NULL 
+                                        THEN '📷 Photos: ' || p.top_photos
+                                        ELSE '— (Standalone / No other assets)'
+                                    END
+                                ELSE
+                                    CASE 
+                                        WHEN p.top_photos IS NOT NULL AND v.top_videos IS NOT NULL 
+                                        THEN '📷 Photos: ' || p.top_photos || '  ||  🎥 Videos: ' || v.top_videos
+                                        WHEN p.top_photos IS NOT NULL 
+                                        THEN '📷 Photos: ' || p.top_photos
+                                        WHEN v.top_videos IS NOT NULL 
+                                        THEN '🎥 Videos: ' || v.top_videos
+                                        ELSE '— (Standalone / No other assets)'
+                                    END
                             END AS moment_top_assets_with_scores,
                             c.date_created_utc,
                             c.primary_owner,
@@ -3837,13 +3850,26 @@ def display_quartile_cleanup_flow(cursor=None, conn=None):
                             COALESCE(p.photo_count, 0) + COALESCE(v.video_count, 0) AS total_assets_in_moment,
                             MAX(COALESCE(p.max_photo_score, 0), COALESCE(v.max_video_score, 0)) AS best_score_in_moment,
                             CASE 
-                                WHEN p.top_photos IS NOT NULL AND v.top_videos IS NOT NULL 
-                                THEN '📷 Photos: ' || p.top_photos || '  ||  🎥 Videos: ' || v.top_videos
-                                WHEN p.top_photos IS NOT NULL 
-                                THEN '📷 Photos: ' || p.top_photos
-                                WHEN v.top_videos IS NOT NULL 
-                                THEN '🎥 Videos: ' || v.top_videos
-                                ELSE '— (Standalone / No other assets)'
+                                WHEN c.media_type = 'video' THEN
+                                    CASE 
+                                        WHEN v.top_videos IS NOT NULL AND p.top_photos IS NOT NULL 
+                                        THEN '🎥 Videos: ' || v.top_videos || '  ||  📷 Photos: ' || p.top_photos
+                                        WHEN v.top_videos IS NOT NULL 
+                                        THEN '🎥 Videos: ' || v.top_videos
+                                        WHEN p.top_photos IS NOT NULL 
+                                        THEN '📷 Photos: ' || p.top_photos
+                                        ELSE '— (Standalone / No other assets)'
+                                    END
+                                ELSE
+                                    CASE 
+                                        WHEN p.top_photos IS NOT NULL AND v.top_videos IS NOT NULL 
+                                        THEN '📷 Photos: ' || p.top_photos || '  ||  🎥 Videos: ' || v.top_videos
+                                        WHEN p.top_photos IS NOT NULL 
+                                        THEN '📷 Photos: ' || p.top_photos
+                                        WHEN v.top_videos IS NOT NULL 
+                                        THEN '🎥 Videos: ' || v.top_videos
+                                        ELSE '— (Standalone / No other assets)'
+                                    END
                             END AS moment_top_assets_with_scores,
                             c.date_created_utc,
                             c.primary_owner,

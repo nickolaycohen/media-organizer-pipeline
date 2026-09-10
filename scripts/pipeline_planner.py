@@ -4067,15 +4067,49 @@ def display_media_cleanup_recommendations(cursor, verbose=True):
     """)
     rows = cursor.fetchall()
 
+    # Fetch month selection assets for all devices & months
+    month_selection_map = {}
+    try:
+        cursor.execute("""
+            WITH RECURSIVE selection_albums(album_pk, album_title) AS (
+                SELECT Z_PK, ZTITLE
+                FROM photos_db.ZGENERICALBUM
+                WHERE ZTITLE = 'Apple Photos Month Selection' AND ZTRASHEDSTATE = 0
+                UNION ALL
+                SELECT ga.Z_PK, ga.ZTITLE
+                FROM photos_db.ZGENERICALBUM ga
+                JOIN selection_albums sa ON ga.ZPARENTFOLDER = sa.album_pk
+                WHERE ga.ZTRASHEDSTATE = 0
+            )
+            SELECT 
+                COALESCE(zea.ZCAMERAMODEL, zea.ZCAMERAMAKE, 'Unknown') AS dev_model,
+                strftime('%Y-%m', datetime(za.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) AS month,
+                COUNT(DISTINCT za.ZUUID) AS selected_count,
+                GROUP_CONCAT(DISTINCT COALESCE(a.original_filename, za.ZFILENAME)) AS selected_filenames
+            FROM selection_albums sa
+            JOIN photos_db.Z_30ASSETS aa ON aa.Z_30ALBUMS = sa.album_pk
+            JOIN photos_db.ZASSET za ON za.Z_PK = aa.Z_3ASSETS
+            LEFT JOIN assets a ON a.asset_id = za.ZUUID
+            LEFT JOIN photos_db.ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
+            WHERE za.ZTRASHEDSTATE = 0 
+              AND sa.album_title != 'Apple Photos Month Selection'
+            GROUP BY dev_model, month
+        """)
+        for s_model, s_month, s_count, s_filenames in cursor.fetchall():
+            if s_model and s_month:
+                month_selection_map[(s_model, s_month)] = (s_count, s_filenames or "")
+    except Exception as e:
+        logger.debug(f"Could not scan month selection assets: {e}")
+
     cleanup_report = []
-    cleanup_report.append("==================================================================================================================================")
+    cleanup_report.append("=" * 180)
     cleanup_report.append("🧹 Media Cleanup Recommendations (Safe to Delete from Source Cameras)")
-    cleanup_report.append("==================================================================================================================================")
+    cleanup_report.append("=" * 180)
 
     if not rows:
         cleanup_report.append("ℹ️  No published moments found in database.")
         cleanup_report.append("👉 Once moments are published in Mode [M], safe deletion recommendations for your camera SD cards will appear here.")
-        cleanup_report.append("==================================================================================================================================\n")
+        cleanup_report.append("=" * 180 + "\n")
     else:
         cleanup_report.append("The following events/moments have been curated and published.")
         cleanup_report.append("You can safely format or delete these files from your source cameras / SD cards (grouped by device):\n")
@@ -4106,7 +4140,7 @@ def display_media_cleanup_recommendations(cursor, verbose=True):
 
         for owner_name in sorted(owner_groups.keys()):
             cleanup_report.append(f"👤 Primary Owner: {owner_name}")
-            cleanup_report.append("=" * 135)
+            cleanup_report.append("=" * 180)
             
             owner_total_files = 0
             owner_total_bytes = 0
@@ -4114,10 +4148,10 @@ def display_media_cleanup_recommendations(cursor, verbose=True):
             # Process each device for this owner
             for device_name, group_rows in sorted(owner_groups[owner_name].items()):
                 cleanup_report.append(f"  📷 Device: {device_name}")
-                cleanup_report.append("  " + "-" * 133)
-                header = f"  {'No.':<4} {'Month':<12} {'Published':<12} {'Filename Range':<32} {'Date Range':<24} {'Reclaimable from SD Card (Whole Month)':<30}"
+                cleanup_report.append("  " + "-" * 178)
+                header = f"  {'No.':<4} {'Month':<10} {'Published':<12} {'Filename Range':<32} {'Date Range':<24} {'Reclaimable from SD Card (Whole Month)':<38} Apple Photos Month Selection"
                 cleanup_report.append(header)
-                cleanup_report.append("  " + "-" * 133)
+                cleanup_report.append("  " + "-" * 178)
 
                 device_total_files = 0
                 device_total_bytes = 0
@@ -4128,6 +4162,7 @@ def display_media_cleanup_recommendations(cursor, verbose=True):
                     month_val = row[0] or "—"
                     c_make = row[2] or ""
                     c_model = row[3] or "Unknown"
+                    c_source = f"{c_model}" if (c_model != "Unknown" and c_model) else (c_make or "Unknown")
                     file_count = str(row[4])
                     f_min = row[5] or "—"
                     f_max = row[6] or "—"
@@ -4156,13 +4191,28 @@ def display_media_cleanup_recommendations(cursor, verbose=True):
                         except Exception as e:
                             logger.debug(f"Could not scan files size range: {e}")
 
+                    # Look up Apple Photos Month Selection assets
+                    sel_info = (
+                        month_selection_map.get((c_model, month_val)) or 
+                        month_selection_map.get((c_source, month_val)) or 
+                        month_selection_map.get((device_name, month_val)) or 
+                        (0, "")
+                    )
+                    sel_count, sel_files = sel_info
+                    if sel_count > 0:
+                        sel_files_formatted = sel_files.replace(',', ', ')
+                        sel_str = f"{sel_count} files: {sel_files_formatted}" if sel_count > 1 else f"1 file: {sel_files_formatted}"
+                    else:
+                        sel_str = "—"
+
                     processed_rows.append({
                         "month_val": month_val,
                         "file_count": file_count,
                         "f_range": f_range,
                         "d_range": d_range,
                         "total_scan_count": total_scan_count,
-                        "total_scan_bytes": total_scan_bytes
+                        "total_scan_bytes": total_scan_bytes,
+                        "sel_str": sel_str
                     })
 
                 # Sort processed_rows by total_scan_bytes descending
@@ -4174,20 +4224,20 @@ def display_media_cleanup_recommendations(cursor, verbose=True):
 
                     scan_range_str = f"{item['total_scan_count']} files ({human_readable_size(item['total_scan_bytes'])})" if item['total_scan_count'] > 0 else "—"
 
-                    line = f"  {global_idx:<4} {item['month_val']:<12} {item['file_count'] + ' files':<12} {item['f_range']:<32} {item['d_range']:<24} {scan_range_str:<30}"
+                    line = f"  {global_idx:<4} {item['month_val']:<10} {item['file_count'] + ' files':<12} {item['f_range']:<32} {item['d_range']:<24} {scan_range_str:<38} {item['sel_str']}"
                     cleanup_report.append(line)
                     global_idx += 1
 
                 owner_total_files += device_total_files
                 owner_total_bytes += device_total_bytes
 
-                cleanup_report.append("  " + "-" * 133)
+                cleanup_report.append("  " + "-" * 178)
                 cleanup_report.append(f"  💰 Subtotal reclaimable space on {device_name}: {device_total_files} files ({human_readable_size(device_total_bytes)})")
                 cleanup_report.append("")
 
-            cleanup_report.append("-" * 135)
+            cleanup_report.append("-" * 180)
             cleanup_report.append(f"💰 Total reclaimable space for owner {owner_name}: {owner_total_files} files ({human_readable_size(owner_total_bytes)})")
-            cleanup_report.append("==================================================================================================================================\n")
+            cleanup_report.append("=" * 180 + "\n")
 
     # Detach database safely
     try:

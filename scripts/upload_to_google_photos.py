@@ -267,6 +267,7 @@ def main(args):
     # Store metadata by original_filename. Multiple sources can have the same original_filename.
     # We store them in a list to match against exported files (which might have suffixes like ' 2').
     existing_metadata = {} 
+    all_db_records = []
     cursor.execute("""
         SELECT original_filename, month, import_id, aesthetic_score, date_created_utc, imported_date_utc, asset_id, uploaded_to_google, ignore_continuity_check
         FROM assets
@@ -277,7 +278,7 @@ def main(args):
         if fname_lower not in existing_metadata:
             existing_metadata[fname_lower] = []
             
-        existing_metadata[fname_lower].append({
+        record = {
             "import_id": row[2],
             "aesthetic_score": row[3],
             "original_filename": row[0],
@@ -287,19 +288,54 @@ def main(args):
             "uploaded_to_google": row[7],
             "ignore_continuity_check": row[8],
             "matched": False # internal flag to track matches for disk files with suffixes
-        })
+        }
+        existing_metadata[fname_lower].append(record)
+        all_db_records.append(record)
 
     # Close connection and release DB lock immediately after reading
     close_conn()
     release_db_lock()
 
     def find_metadata_match(filename):
-        # Strip the " 2", " 3" suffix added by Apple Photos export to find the original DB record
-        clean_name = re.sub(r'\s\d+(\.[^.]+)$', r'\1', filename.lower())
-        for m in existing_metadata.get(clean_name, []):
-            if not m['matched']:
+        fn_lower = filename.lower()
+        # 1. Exact match
+        if fn_lower in existing_metadata:
+            for m in existing_metadata[fn_lower]:
+                if not m['matched']:
+                    m['matched'] = True
+                    return m
+
+        # 2. Strip parentheses duplicate suffixes added by export: " (1)", " (2)", "(1)", etc.
+        candidate = re.sub(r'\s*\(\d+\)(\.[^.]+)$', r'\1', fn_lower)
+        if candidate != fn_lower and candidate in existing_metadata:
+            for m in existing_metadata[candidate]:
+                if not m['matched']:
+                    m['matched'] = True
+                    return m
+
+        # 3. Strip space-separated duplicate suffixes added by Apple Photos export: " 1", " 2", " 3", etc.
+        candidate = re.sub(r'\s+\d+(\.[^.]+)$', r'\1', fn_lower)
+        if candidate != fn_lower and candidate in existing_metadata:
+            for m in existing_metadata[candidate]:
+                if not m['matched']:
+                    m['matched'] = True
+                    return m
+
+        # 4. Fallback: strip any combination of trailing duplicate suffixes from both disk and DB records
+        def strip_all_dups(s):
+            prev = None
+            curr = s
+            while prev != curr:
+                prev = curr
+                curr = re.sub(r'(?:\s*\(\d+\)|\s+\d+)(\.[^.]+)$', r'\1', curr)
+            return curr
+
+        clean_fn = strip_all_dups(fn_lower)
+        for m in all_db_records:
+            if not m['matched'] and strip_all_dups(m['original_filename'].lower()) == clean_fn:
                 m['matched'] = True
                 return m
+
         return None
 
     # Filter physical files: ignore those that DB says belong to other months or are already uploaded,

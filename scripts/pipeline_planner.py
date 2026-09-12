@@ -998,7 +998,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
 
     generate_weekly_memory_report = False
     generate_skipped_videos = False
-    auto_synced_needs_folder = False
+    auto_exported_needs_folder = False
     
     while True:
         acquire_planner_lock()
@@ -1924,16 +1924,16 @@ def run_memory_publishing_flow(cursor=None, conn=None):
             console_moments = list(ranked_moments)
             table_title = "🌟 Weekly Memory Feature & Publishing (Mode [M])"
 
-        # If all moments in M200 table require folder creation ("📁 Needs Folder"), automatically run Option [1]
+        # If all moments in M200/M300 table require folder creation ("📁 Needs Folder"), automatically run Option [2] (Export)
         all_needs_folder = (
             has_pending_curation and 
             bool(console_moments) and 
             all(m['curated_str'] == "📁 Needs Folder" for m in console_moments)
         )
         if all_needs_folder:
-            if not auto_synced_needs_folder:
-                logger.info("🔄 All moments in M200 table require folders ('📁 Needs Folder'). Automatically running Option [1] (Sync proposed assets to ToBeCurated in Apple Photos)...")
-                print("\n🔄 All moments in M200 table require folders ('📁 Needs Folder'). Automatically syncing proposed assets to ToBeCurated albums in Apple Photos (Option [1])...")
+            if not auto_exported_needs_folder:
+                logger.info("🔄 All moments in table require export to local Curated folder ('📁 Needs Folder'). Automatically running Option [2] (Export Curated Moment) for all folders in the table...")
+                print("\n🔄 All moments in table require folders ('📁 Needs Folder'). Automatically exporting Curated albums to local folders (Option [2])...")
                 if photos_db_attached:
                     try:
                         cursor.execute("DETACH DATABASE photos_db")
@@ -1944,17 +1944,22 @@ def run_memory_publishing_flow(cursor=None, conn=None):
 
                 acquire_planner_lock()
                 script_dir = os.path.dirname(os.path.abspath(__file__))
-                try:
-                    subprocess.run([sys.executable, os.path.join(script_dir, "create_apple_moments_albums.py")], check=True)
-                    logger.info("✅ Automatic sync to ToBeCurated complete.")
-                except subprocess.CalledProcessError as e:
-                    logger.error(f"Automatic sync failed: {e}")
+                for m_item in console_moments:
+                    m_name = m_item['name']
+                    dest_folder = os.path.join(CURATED_LACIE_DIR, m_name)
+                    os.makedirs(dest_folder, exist_ok=True)
+                    logger.info(f"🔄 Auto-exporting Curated album '{m_name}' to '{dest_folder}'...")
+                    print(f"  📦 Exporting '{m_name}'...")
+                    try:
+                        subprocess.run([sys.executable, os.path.join(script_dir, "export_curated_album.py"), m_name], check=True)
+                    except subprocess.CalledProcessError as e:
+                        logger.error(f"Auto-export failed for '{m_name}': {e}")
                 release_planner_lock()
 
-                auto_synced_needs_folder = True
+                auto_exported_needs_folder = True
                 continue
         else:
-            auto_synced_needs_folder = False
+            auto_exported_needs_folder = False
 
         header_m = f"{'No.':<4} {'Moment Name':<30} {'Status':<8} {'Rank Score':<12} {'Avg Score':<10} {'Min Score':<10} {'Max Score':<10} {'Assets':<8} {'Pub.':<6} {'Pub. Avg':<10} {'Pub. Range':<17} {'ToBeCurated?':<13} {'Curated?':<15} {'Published?':<13} {'Can Publish?':<18} {'Last Published':<18}"
 

@@ -2793,6 +2793,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
         print(" [3] Record publication in the database (Mark as Published to Shutterfly/YouTube)")
         print(" [4] Generate Publishing Candidates report (on demand)")
         print(" [5] Display Skipped Videos Table (on demand)")
+        print(" [6] Move ToBeCurated assets to Curated in Apple Photos")
         print(" [R] Restart the planner")
         print(" [E] Exit")
         
@@ -2828,6 +2829,22 @@ def run_memory_publishing_flow(cursor=None, conn=None):
         elif choice == '5':
             generate_skipped_videos = True
             continue
+        elif choice == '6':
+            acquire_planner_lock()
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            moment_input = input("Enter Moment Name to move to Curated (or index from list, or 'all'): ").strip()
+            if moment_input.isdigit():
+                idx = int(moment_input)
+                if idx in displayed_moments_map:
+                    item_info = displayed_moments_map[idx]
+                    moment_input = item_info['name']
+            
+            if moment_input:
+                try:
+                    subprocess.run([sys.executable, os.path.join(script_dir, "move_to_be_curated_to_curated.py"), moment_input], check=True)
+                except subprocess.CalledProcessError as e:
+                    logger.error(f"Failed to move assets from ToBeCurated: {e}")
+            release_planner_lock()
         elif choice == '1':
             acquire_planner_lock()
             script_dir = os.path.dirname(os.path.abspath(__file__))

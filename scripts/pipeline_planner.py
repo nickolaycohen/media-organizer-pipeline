@@ -1983,16 +1983,25 @@ def run_memory_publishing_flow(cursor=None, conn=None):
         
         table_lines.append(header_m)
         table_lines.append("-" * len(header_m))
-        divider_printed = False
+        needs_update_divider_printed = False
+        up_to_date_divider_printed = False
         for idx, m in enumerate(console_moments, 1):
             displayed_moments_map[idx] = {'name': m['name'], 'type': 'ranked_moment'}
             is_needs_update = (m['proposed_count'] + m['curated_count']) < m['total_qualified']
-            if not is_needs_update and not divider_printed:
+            if is_needs_update and not needs_update_divider_printed:
+                label = "--- Moments Requiring Curation Updates (Run Option [1] to sync proposed assets to ToBeCurated) "
+                d_len = max(0, len(header_m) - len(label))
+                table_lines.append(label + "-" * d_len)
+                table_lines.append("-" * len(header_m))
+                needs_update_divider_printed = True
+            elif not is_needs_update and not up_to_date_divider_printed:
                 if idx > 1:
                     table_lines.append("-" * len(header_m))
-                    table_lines.append(f"--- Up-To-Date Moments " + "-" * (len(header_m) - 23))
-                    table_lines.append("-" * len(header_m))
-                divider_printed = True
+                label = "--- Up-To-Date Moments (All qualified assets are already curated or in ToBeCurated) "
+                d_len = max(0, len(header_m) - len(label))
+                table_lines.append(label + "-" * d_len)
+                table_lines.append("-" * len(header_m))
+                up_to_date_divider_printed = True
                 
             has_tbc = m['to_be_curated_exists']
             to_be_curated_str = "✅ Yes" if has_tbc else "❌ No"

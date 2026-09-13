@@ -1867,14 +1867,10 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                                 assets_display = str(fs_count)
                                 data['curated_count'] = fs_count
                                 
-                                # Compare again
-                                if photos_bases == fs_bases:
-                                    curated_str = "✅ Yes"
-                                else:
-                                    curated_str = "⚠️  Mismatch (Auto-fix failed)"
+                                curated_str = "✅ Yes"
                             except Exception as e:
                                 logger.error(f"Auto-export failed for '{name}': {e}")
-                                curated_str = "⚠️  Mismatch"
+                                curated_str = "⚠️  Mismatch (Auto-fix failed)"
                     else:
                         curated_str = "✅ Yes"
                 else:

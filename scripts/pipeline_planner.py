@@ -1865,7 +1865,6 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                                 fs_bases = set(os.path.splitext(f)[0].lower() for f in all_files)
                                 fs_count = len(fs_bases)
                                 assets_display = str(fs_count)
-                                data['curated_count'] = fs_count
                                 
                                 curated_str = "✅ Yes"
                             except Exception as e:

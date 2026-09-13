@@ -16,7 +16,7 @@ from utils.utils import get_full_transition_path, human_readable_size
 from google_photos import check_google_quota, authenticate, get_all_favorites
 import argparse
 import sqlite3
-from constants import MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_LOCK_PATH, APPLE_PHOTOS_DB_PATH, LOG_PATH, GOOGLE_PHOTOS_READONLY_SCOPES, GOOGLE_DRIVE_READ_ONLY_SCOPES, PLANNER_REQUIRED_SCOPES, CURATION_THRESHOLD_LOG_PATH, PUBLISHED_MOMENTS_LOG_PATH, SCORING_BREAKDOWN_LOG_PATH, MEDIA_CLEANUP_LOG_PATH, QUARTILE_CLEANUP_LOG_PATH, WEEKLY_MEMORY_LOG_PATH, PUBLISHING_RECOMMENDATIONS_LOG_PATH, MAX_UPLOAD_FILE_SIZE_BYTES, MAX_UPLOAD_FILE_SIZE_MB, BG_SERVICE_PID_PATH
+from constants import MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_LOCK_PATH, APPLE_PHOTOS_DB_PATH, LOG_PATH, GOOGLE_PHOTOS_READONLY_SCOPES, GOOGLE_DRIVE_READ_ONLY_SCOPES, PLANNER_REQUIRED_SCOPES, CURATION_THRESHOLD_LOG_PATH, PUBLISHED_MOMENTS_LOG_PATH, SCORING_BREAKDOWN_LOG_PATH, MEDIA_CLEANUP_LOG_PATH, QUARTILE_CLEANUP_LOG_PATH, PUBLISHING_CANDIDATES_LOG_PATH, WEEKLY_MEMORY_LOG_PATH, PUBLISHING_RECOMMENDATIONS_LOG_PATH, MAX_UPLOAD_FILE_SIZE_BYTES, MAX_UPLOAD_FILE_SIZE_MB, BG_SERVICE_PID_PATH
 from constants import ACTIVE_CAMERA_MODELS, DEVICE_OWNER_MAPPING, AESTHETIC_SCORE_WEIGHT, GOOGLE_FAVORITES_WEIGHT, APPLE_SELECTION_WEIGHT, APPLE_FEATURED_WEIGHT
 from db.connections import get_connection, get_cursor, commit, close as close_conn
 from db.queries import get_stage_transitions, get_batch_statuses, get_latest_import_and_month
@@ -996,7 +996,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
     except Exception as e:
         logger.warning(f"Could not fetch previous threshold_met status: {e}")
 
-    generate_weekly_memory_report = False
+    generate_publishing_candidates_report = False
     generate_skipped_videos = False
     auto_exported_needs_folder = False
     
@@ -1820,7 +1820,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
             # Compare Apple Photos Curated album assets with local filesystem folder contents
             curated_str = "❌ No"
             if curated_exists and fs_curated_exists:
-                if generate_weekly_memory_report:
+                if generate_publishing_candidates_report:
                     # Retrieve Apple Photos Curated album asset base names from Photos DB (excluding skipped assets)
                     photos_bases = set()
                     if photos_db_attached:
@@ -1929,7 +1929,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
             table_title = "🌟 M200: Proposed Moments in ToBeCurated (Require Curation & Move to Curated)"
         else:
             console_moments = list(ranked_moments)
-            table_title = "🌟 Weekly Memory Feature & Publishing (Mode [M])"
+            table_title = "🌟 Publishing Candidates (Mode [M])"
 
         # If all moments in M200/M300 table require folder creation ("📁 Needs Folder"), automatically run Option [2] (Export)
         all_needs_folder = (
@@ -2033,16 +2033,16 @@ def run_memory_publishing_flow(cursor=None, conn=None):
 
         duration_weekly = time.time() - start_time_weekly
         try:
-            os.makedirs(os.path.dirname(WEEKLY_MEMORY_LOG_PATH), exist_ok=True)
-            with open(WEEKLY_MEMORY_LOG_PATH, 'w', encoding='utf-8') as f:
+            os.makedirs(os.path.dirname(PUBLISHING_CANDIDATES_LOG_PATH), exist_ok=True)
+            with open(PUBLISHING_CANDIDATES_LOG_PATH, 'w', encoding='utf-8') as f:
                 f.write("\n".join(table_lines) + "\n")
         except Exception as e:
-            logger.warning(f"Could not write weekly memory log: {e}")
+            logger.warning(f"Could not write publishing candidates log: {e}")
 
-        if table_title == "🌟 Weekly Memory Feature & Publishing (Mode [M])":
-            if generate_weekly_memory_report:
+        if table_title == "🌟 Publishing Candidates (Mode [M])":
+            if generate_publishing_candidates_report:
                 print("\n".join(table_lines))
-                print(f"\n📄 Weekly Memory Feature & Publishing report saved to: {WEEKLY_MEMORY_LOG_PATH} (took {duration_weekly:.2f}s)\n")
+                print(f"\n📄 Publishing Candidates report saved to: {PUBLISHING_CANDIDATES_LOG_PATH} (took {duration_weekly:.2f}s)\n")
         else:
             print("\n".join(table_lines))
 
@@ -2791,7 +2791,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
         print(" [1] Sync proposed assets to ToBeCurated albums in Apple Photos")
         print(" [2] Export Curated Moment for Publishing")
         print(" [3] Record publication in the database (Mark as Published to Shutterfly/YouTube)")
-        print(" [4] Generate Weekly Memory report (on demand)")
+        print(" [4] Generate Publishing Candidates report (on demand)")
         print(" [5] Display Skipped Videos Table (on demand)")
         print(" [R] Restart the planner")
         print(" [E] Exit")
@@ -2811,7 +2811,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
             needs_sync = any((m['proposed_count'] + m['curated_count']) < m['total_qualified'] for m in ranked_moments)
             if needs_sync:
                 print("\n🔄 Detected moments requiring curation updates. Automatically syncing proposed assets to Apple Photos ToBeCurated (Option [1])...")
-                logger.info("Automatically syncing proposed assets to Apple Photos ToBeCurated before generating weekly memory report...")
+                logger.info("Automatically syncing proposed assets to Apple Photos ToBeCurated before generating publishing candidates report...")
                 acquire_planner_lock()
                 script_dir = os.path.dirname(os.path.abspath(__file__))
                 try:
@@ -2823,7 +2823,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                     print(f"⚠️ Sync to ToBeCurated failed: {e}")
                 release_planner_lock()
 
-            generate_weekly_memory_report = True
+            generate_publishing_candidates_report = True
             continue
         elif choice == '5':
             generate_skipped_videos = True

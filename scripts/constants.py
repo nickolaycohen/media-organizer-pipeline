@@ -11,7 +11,8 @@ SCORING_BREAKDOWN_LOG_PATH = os.path.abspath(os.path.join(BASE_DIR, '../logs/qua
 MEDIA_CLEANUP_LOG_PATH = os.path.abspath(os.path.join(BASE_DIR, '../logs/media_cleanup_recommendations.log'))
 QUARTILE_CLEANUP_LOG_PATH = os.path.abspath(os.path.join(BASE_DIR, '../logs/quartile_cleanup_recommendations.log'))
 BG_SERVICE_LOG_PATH = os.path.abspath(os.path.join(BASE_DIR, '../logs/bg_copy_db_service.log'))
-WEEKLY_MEMORY_LOG_PATH = os.path.abspath(os.path.join(BASE_DIR, '../logs/weekly_memory_publishing.log'))
+PUBLISHING_CANDIDATES_LOG_PATH = os.path.abspath(os.path.join(BASE_DIR, '../logs/publishing_candidates.log'))
+WEEKLY_MEMORY_LOG_PATH = PUBLISHING_CANDIDATES_LOG_PATH
 PUBLISHING_RECOMMENDATIONS_LOG_PATH = os.path.abspath(os.path.join(BASE_DIR, '../logs/publishing_recommendations.log'))
 
 # Paths to the Apple Photos database and Media Organizer database

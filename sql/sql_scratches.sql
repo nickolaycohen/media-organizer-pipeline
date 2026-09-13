@@ -66,10 +66,10 @@ WITH all_assets_with_moments AS (
         AND (do.start_date IS NULL OR do.start_date <= date(za.ZDATECREATED + 978307200, 'unixepoch'))
         AND (do.end_date IS NULL OR do.end_date >= date(za.ZDATECREATED + 978307200, 'unixepoch'))
     LEFT JOIN (
-        SELECT asset_id, GROUP_CONCAT(DISTINCT moment_name) AS published_moments, MAX(published_at_utc) AS last_asset_pub 
+        SELECT asset_uuid, GROUP_CONCAT(DISTINCT moment_name) AS published_moments, MAX(published_at_utc) AS last_asset_pub 
         FROM publications 
-        GROUP BY asset_id
-    ) ps ON ps.asset_id = a.asset_id
+        GROUP BY asset_uuid
+    ) ps ON ps.asset_uuid = a.asset_id
     LEFT JOIN ranked_assets_view v ON v.asset_id = a.asset_id
     WHERE zea.ZCAMERAMODEL IS NOT NULL 
       AND zea.ZCAMERAMODEL != ''
@@ -120,10 +120,10 @@ moment_videos AS (
     GROUP BY assigned_moment
 )
 SELECT 
-    c.score_quartile,
+    c.score_quartile as QUA,
     c.original_filename AS candidate_file,
     c.month,
-    c.file_size_mb,
+    c.file_size_mb as MB,
     ROUND(c.score_normalized, 4) AS candidate_score,
     c.assigned_moment,
     CASE 
@@ -278,7 +278,7 @@ LEFT JOIN ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
 LEFT JOIN device_owners do ON do.camera_model = zea.ZCAMERAMODEL
     AND (do.start_date IS NULL OR do.start_date <= date(za.ZDATECREATED + 978307200, 'unixepoch'))
     AND (do.end_date IS NULL OR do.end_date >= date(za.ZDATECREATED + 978307200, 'unixepoch'))
-LEFT JOIN publications p ON p.asset_id = a.asset_id
+LEFT JOIN publications p ON p.asset_uuid = a.asset_id
 -- WHERE a.month = '2026-07'  -- 👈 Change month here (or remove to view all months)
 GROUP BY a.month, primary_owner, device_camera_model
 HAVING featured_count > 0 OR published_count > 0
@@ -302,7 +302,7 @@ LEFT JOIN ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
 LEFT JOIN device_owners do ON do.camera_model = zea.ZCAMERAMODEL
     AND (do.start_date IS NULL OR do.start_date <= date(za.ZDATECREATED + 978307200, 'unixepoch'))
     AND (do.end_date IS NULL OR do.end_date >= date(za.ZDATECREATED + 978307200, 'unixepoch'))
-LEFT JOIN publications p ON p.asset_id = a.asset_id
+LEFT JOIN publications p ON p.asset_uuid = a.asset_id
 -- WHERE a.month = '2026-07'  -- 👈 Change month here
 GROUP BY a.month, primary_owner, device_camera_model
 HAVING featured_count > 0
@@ -337,9 +337,9 @@ published_stats AS (
         a.month,
         COUNT(DISTINCT p.asset_id) AS published_count,
         GROUP_CONCAT(DISTINCT p.moment_name) AS published_moments,
-        GROUP_CONCAT(DISTINCT p.platform) AS platforms
+        GROUP_CONCAT(DISTINCT p.platform || ' (' || p.account || ')') AS platforms
     FROM publications p
-    JOIN assets a ON p.asset_id = a.asset_id
+    JOIN assets a ON p.asset_uuid = a.asset_id
     LEFT JOIN ZASSET za ON za.ZUUID = a.asset_id
     LEFT JOIN ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
     GROUP BY COALESCE(zea.ZCAMERAMODEL, 'Unknown'), a.month
@@ -1499,7 +1499,7 @@ SELECT
      WHERE me.asset_id = v.asset_id AND me.curation_stage = 'curated') AS is_curated,
     ast.curated_album,
     (SELECT 1 FROM publications p 
-     WHERE p.asset_id = v.asset_id LIMIT 1) AS is_published
+     WHERE p.asset_uuid = v.asset_id LIMIT 1) AS is_published
 FROM ranked_assets_view v
 JOIN assets ast ON v.asset_id = ast.asset_id
 JOIN month_batches mb ON v.month = mb.month

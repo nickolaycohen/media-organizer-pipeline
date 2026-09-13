@@ -1049,9 +1049,9 @@ def run_memory_publishing_flow(cursor=None, conn=None):
         # belongs to SkipPublishing/Ignore, or its moment assignment changed.
         try:
             cursor.execute("""
-                SELECT p.id, p.asset_id, p.moment_name, a.MomentsAlbumName, a.original_filename
+                SELECT p.id, p.asset_uuid, p.moment_name, a.MomentsAlbumName, a.original_filename
                 FROM publications p
-                LEFT JOIN assets a ON p.asset_id = a.asset_id
+                LEFT JOIN assets a ON p.asset_uuid = a.asset_id
                 WHERE a.asset_id IS NULL
                    OR a.MomentsAlbumName IS NULL 
                    OR a.MomentsAlbumName = ''
@@ -1375,16 +1375,16 @@ def run_memory_publishing_flow(cursor=None, conn=None):
             SELECT 
                 p.moment_name,
                 MAX(p.published_at_utc) AS last_published_at,
-                COUNT(DISTINCT p.asset_id) AS published_count,
+                COUNT(DISTINCT p.asset_uuid) AS published_count,
                 AVG(v.score_normalized) AS avg_score,
                 MIN(v.score_normalized) AS min_score,
                 MAX(v.score_normalized) AS max_score,
                 MIN(a.date_created_utc) AS min_captured,
                 MAX(a.date_created_utc) AS max_captured,
                 GROUP_CONCAT(DISTINCT COALESCE(zea.ZCAMERAMODEL, i.camera_model, 'Unknown')) AS camera_sources,
-                GROUP_CONCAT(DISTINCT p.platform) AS platforms
+                GROUP_CONCAT(DISTINCT p.platform || ' (' || p.account || ')') AS platforms
             FROM publications p
-            JOIN assets a ON p.asset_id = a.asset_id
+            JOIN assets a ON p.asset_uuid = a.asset_id
             LEFT JOIN ranked_assets_view v ON v.asset_id = a.asset_id
             LEFT JOIN imports i ON a.import_id = i.import_uuid
             LEFT JOIN ZASSET za ON za.ZUUID = a.asset_id
@@ -1454,7 +1454,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                        (SELECT 1 FROM moment_exports me WHERE me.asset_id = v.asset_id AND me.curation_stage = 'curated') as is_curated,
                        (SELECT album_name FROM moment_exports me WHERE me.asset_id = v.asset_id ORDER BY exported_at_utc DESC LIMIT 1) as exported_album_name,
                        ast.curated_album,
-                       (SELECT 1 FROM publications p WHERE p.asset_id = v.asset_id LIMIT 1) as is_published
+                       (SELECT 1 FROM publications p WHERE p.asset_uuid = v.asset_id LIMIT 1) as is_published
                 FROM ranked_assets_view v
                 JOIN assets ast ON v.asset_id = ast.asset_id
                 JOIN month_batches mb ON v.month = mb.month
@@ -1479,7 +1479,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                        (SELECT 1 FROM moment_exports me WHERE me.asset_id = v.asset_id AND me.curation_stage = 'curated') as is_curated,
                        (SELECT album_name FROM moment_exports me WHERE me.asset_id = v.asset_id ORDER BY exported_at_utc DESC LIMIT 1) as exported_album_name,
                        ast.curated_album,
-                       (SELECT 1 FROM publications p WHERE p.asset_id = v.asset_id LIMIT 1) as is_published
+                       (SELECT 1 FROM publications p WHERE p.asset_uuid = v.asset_id LIMIT 1) as is_published
                 FROM ranked_assets_view v
                 JOIN assets ast ON v.asset_id = ast.asset_id
                 JOIN month_batches mb ON v.month = mb.month
@@ -1674,12 +1674,12 @@ def run_memory_publishing_flow(cursor=None, conn=None):
             SELECT 
                 p.moment_name,
                 MAX(p.published_at_utc) AS last_published_at,
-                COUNT(DISTINCT p.asset_id) AS pub_count,
+                COUNT(DISTINCT p.asset_uuid) AS pub_count,
                 AVG(v.score_normalized) AS pub_avg_score,
                 MIN(v.score_normalized) AS pub_min_score,
                 MAX(v.score_normalized) AS pub_max_score
             FROM publications p
-            JOIN assets a ON p.asset_id = a.asset_id
+            JOIN assets a ON p.asset_uuid = a.asset_id
             LEFT JOIN ranked_assets_view v ON v.asset_id = a.asset_id
             GROUP BY p.moment_name
         """)
@@ -2116,7 +2116,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
         # Display Weekly Memory Publishing Recommendations (only if all M200/M300 curation & export moments are complete)
         published_assets_by_moment = {}
         if not has_pending_curation:
-            cursor.execute("SELECT asset_id, moment_name FROM publications")
+            cursor.execute("SELECT asset_uuid, moment_name FROM publications")
             for aid, mom_name in cursor.fetchall():
                 if mom_name not in published_assets_by_moment:
                     published_assets_by_moment[mom_name] = set()
@@ -2338,7 +2338,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                     JOIN ranked_assets_view v ON me.asset_id = v.asset_id 
                     WHERE (me.album_name = ? OR me.album_name = ?)
                       AND me.curation_stage = 'curated'
-                      AND me.asset_id NOT IN (SELECT asset_id FROM publications)
+                      AND me.asset_id NOT IN (SELECT asset_uuid FROM publications)
                     ORDER BY v.score_normalized DESC
                 """, (m['name'], m['name'].strip()))
                 all_curated_pending = [r for r in cursor.fetchall() if r[0] not in skipped_asset_ids]
@@ -2372,9 +2372,8 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                 # Gather files of already published assets for this moment (to include in Publishing Recommendation)
                 published_files = []
                 cursor.execute("""
-                    SELECT a.original_filename
+                    SELECT p.filename
                     FROM publications p
-                    JOIN assets a ON p.asset_id = a.asset_id
                     WHERE (p.moment_name = ? OR p.moment_name = ?)
                 """, (m['name'], m['name'].strip()))
                 for (p_fname,) in cursor.fetchall():
@@ -2413,7 +2412,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
             if moments_albums:
                 for c_name, c_count in sorted(curated_albums.items()):
                     if c_name not in moments_albums and c_name.lower() not in ('skippublishing', 'ignore'):
-                        cursor.execute("SELECT COUNT(DISTINCT asset_id) FROM publications WHERE (moment_name = ? OR moment_name = ?)", (c_name, c_name.strip()))
+                        cursor.execute("SELECT COUNT(DISTINCT asset_uuid) FROM publications WHERE (moment_name = ? OR moment_name = ?)", (c_name, c_name.strip()))
                         pub_row = cursor.fetchone()
                         p_count = pub_row[0] if pub_row else 0
                         
@@ -2877,7 +2876,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                 release_planner_lock()
                 continue
                 
-            cursor.execute("SELECT asset_id FROM publications WHERE moment_name = ?", (moment_name,))
+            cursor.execute("SELECT asset_uuid FROM publications WHERE moment_name = ?", (moment_name,))
             already_published = set(row[0] for row in cursor.fetchall())
 
             # Filter target assets to publish
@@ -2888,12 +2887,12 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                     if orig_fname:
                         base = os.path.splitext(orig_fname)[0].lower()
                         if base in rec_bases:
-                            target_assets.append(asset_id)
+                            target_assets.append((asset_id, orig_fname))
             else:
-                target_assets = [row[0] for row in curated_assets_info]
+                target_assets = curated_assets_info
 
             # Exclude already published
-            target_assets = [aid for aid in target_assets if aid not in already_published]
+            target_assets = [(aid, fn) for aid, fn in target_assets if aid not in already_published]
 
             if not target_assets:
                 print(f"ℹ️ All selected assets for '{moment_name}' are already marked as published.")
@@ -2901,17 +2900,48 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                 release_planner_lock()
                 continue
 
-            confirm = input(f"Confirm publication of {len(target_assets)} assets of '{moment_name}' to Shutterfly/YouTube? [y/N]: ").strip().lower()
+            # Separate into Photos and Videos
+            video_exts = ('.mov', '.mp4', '.m4v', '.avi', '.mpg')
+            photos = [(aid, fn) for aid, fn in target_assets if os.path.splitext(fn or '')[1].lower() not in video_exts]
+            videos = [(aid, fn) for aid, fn in target_assets if os.path.splitext(fn or '')[1].lower() in video_exts]
+
+            print(f"\nTarget assets to publish for '{moment_name}' ({len(target_assets)} total):")
+            if photos:
+                print(f"  📷 Photos: {len(photos)} asset(s)")
+            if videos:
+                print(f"  🎥 Videos: {len(videos)} asset(s)")
+
+            print("\nSelect publishing destination mode:")
+            print("  [1] Default: Photos -> Shutterfly (nickolay.cohen@gmail.com), Videos -> YouTube (nickolay.cohen@gmail.com)")
+            print("  [2] Custom: Specify platform & account")
+            pub_choice = input("Enter selection [1]: ").strip()
+
+            pub_rows = []
+            if pub_choice == '2':
+                custom_platform = input("Enter platform [e.g. Shutterfly, YouTube, Google Photos]: ").strip()
+                if not custom_platform:
+                    custom_platform = "Shutterfly" if photos and not videos else "YouTube"
+                custom_account = input("Enter account email [default: nickolay.cohen@gmail.com]: ").strip()
+                if not custom_account:
+                    custom_account = "nickolay.cohen@gmail.com"
+                for aid, fn in target_assets:
+                    pub_rows.append((aid, fn or '', moment_name, custom_platform, custom_account))
+            else:
+                for aid, fn in photos:
+                    pub_rows.append((aid, fn or '', moment_name, 'Shutterfly', 'nickolay.cohen@gmail.com'))
+                for aid, fn in videos:
+                    pub_rows.append((aid, fn or '', moment_name, 'YouTube', 'nickolay.cohen@gmail.com'))
+
+            confirm = input(f"\nConfirm recording publication of {len(pub_rows)} assets of '{moment_name}'? [y/N]: ").strip().lower()
             if confirm == 'y':
                 try:
-                    pub_data = [(aid, moment_name, 'Shutterfly/YouTube') for aid in target_assets]
                     cursor.executemany("""
-                        INSERT INTO publications (asset_id, moment_name, platform, published_at_utc)
-                        VALUES (?, ?, ?, datetime('now'))
-                    """, pub_data)
+                        INSERT INTO publications (asset_uuid, filename, moment_name, platform, account, published_at_utc)
+                        VALUES (?, ?, ?, ?, ?, datetime('now'))
+                    """, pub_rows)
                     
                     # Calculate new stage
-                    total_pub_after = len(already_published) + len(target_assets)
+                    total_pub_after = len(already_published) + len(pub_rows)
                     new_stage = 'M500' if total_pub_after >= len(curated_assets_info) else ('M450' if total_pub_after > 0 else 'M400')
 
                     cursor.execute("""
@@ -2921,7 +2951,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                     """, (moment_name, new_stage))
                     
                     conn.commit()
-                    print(f"✅ Recorded publication of {len(target_assets)} assets for '{moment_name}' in database (Stage: {new_stage}).")
+                    print(f"✅ Recorded publication of {len(pub_rows)} assets for '{moment_name}' in database (Stage: {new_stage}).")
                 except Exception as e:
                     logger.warning(f"Failed to record publication: {e}")
                     conn.rollback()
@@ -3672,10 +3702,10 @@ def display_quartile_cleanup_flow(cursor=None, conn=None):
                                 AND (do.start_date IS NULL OR do.start_date <= date(za.ZDATECREATED + 978307200, 'unixepoch'))
                                 AND (do.end_date IS NULL OR do.end_date >= date(za.ZDATECREATED + 978307200, 'unixepoch'))
                             LEFT JOIN (
-                                SELECT asset_id, GROUP_CONCAT(DISTINCT moment_name) AS published_moments, MAX(published_at_utc) AS last_asset_pub 
+                                SELECT asset_uuid, GROUP_CONCAT(DISTINCT moment_name) AS published_moments, MAX(published_at_utc) AS last_asset_pub 
                                 FROM publications 
-                                GROUP BY asset_id
-                            ) ps ON ps.asset_id = a.asset_id
+                                GROUP BY asset_uuid
+                            ) ps ON ps.asset_uuid = a.asset_id
                             LEFT JOIN ranked_assets_view v ON v.asset_id = a.asset_id
                             WHERE zea.ZCAMERAMODEL = ?
                               AND COALESCE(a.removed_from_source, 0) = 0
@@ -3821,10 +3851,10 @@ def display_quartile_cleanup_flow(cursor=None, conn=None):
                                 AND (do.start_date IS NULL OR do.start_date <= date(za.ZDATECREATED + 978307200, 'unixepoch'))
                                 AND (do.end_date IS NULL OR do.end_date >= date(za.ZDATECREATED + 978307200, 'unixepoch'))
                             LEFT JOIN (
-                                SELECT asset_id, GROUP_CONCAT(DISTINCT moment_name) AS published_moments, MAX(published_at_utc) AS last_asset_pub 
+                                SELECT asset_uuid, GROUP_CONCAT(DISTINCT moment_name) AS published_moments, MAX(published_at_utc) AS last_asset_pub 
                                 FROM publications 
-                                GROUP BY asset_id
-                            ) ps ON ps.asset_id = a.asset_id
+                                GROUP BY asset_uuid
+                            ) ps ON ps.asset_uuid = a.asset_id
                             LEFT JOIN ranked_assets_view v ON v.asset_id = a.asset_id
                             WHERE zea.ZCAMERAMODEL = ?
                               AND COALESCE(a.removed_from_source, 0) = 0
@@ -4091,12 +4121,12 @@ def display_media_cleanup_recommendations(cursor, verbose=True):
             zea.ZCAMERAMAKE AS camera_make,
             zea.ZCAMERAMODEL AS camera_model,
             COUNT(DISTINCT a.asset_id) AS total_published_assets,
-            MIN(a.original_filename) AS min_filename,
-            MAX(a.original_filename) AS max_filename,
+            MIN(p.filename) AS min_filename,
+            MAX(p.filename) AS max_filename,
             MIN(a.date_created_utc) AS min_date,
             MAX(a.date_created_utc) AS max_date
         FROM publications p
-        JOIN assets a ON p.asset_id = a.asset_id
+        JOIN assets a ON p.asset_uuid = a.asset_id
         LEFT JOIN ZASSET za ON za.ZUUID = a.asset_id
         LEFT JOIN ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
         WHERE zea.ZCAMERAMODEL IS NOT NULL AND zea.ZCAMERAMODEL != ''

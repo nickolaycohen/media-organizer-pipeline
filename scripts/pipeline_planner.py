@@ -2034,7 +2034,8 @@ def run_memory_publishing_flow(cursor=None, conn=None):
 
         if table_title == "🌟 Weekly Memory Feature & Publishing (Mode [M])":
             if generate_weekly_memory_report:
-                print(f"📄 Weekly Memory Feature & Publishing report saved to: {WEEKLY_MEMORY_LOG_PATH} (took {duration_weekly:.2f}s)\n")
+                print("\n".join(table_lines))
+                print(f"\n📄 Weekly Memory Feature & Publishing report saved to: {WEEKLY_MEMORY_LOG_PATH} (took {duration_weekly:.2f}s)\n")
         else:
             print("\n".join(table_lines))
 
@@ -2799,6 +2800,22 @@ def run_memory_publishing_flow(cursor=None, conn=None):
             release_planner_lock()
             os.execv(sys.executable, [sys.executable] + sys.argv)
         elif choice == '4':
+            # Check if any moments have qualified assets needing to be synced to ToBeCurated
+            needs_sync = any((m['proposed_count'] + m['curated_count']) < m['total_qualified'] for m in ranked_moments)
+            if needs_sync:
+                print("\n🔄 Detected moments requiring curation updates. Automatically syncing proposed assets to Apple Photos ToBeCurated (Option [1])...")
+                logger.info("Automatically syncing proposed assets to Apple Photos ToBeCurated before generating weekly memory report...")
+                acquire_planner_lock()
+                script_dir = os.path.dirname(os.path.abspath(__file__))
+                try:
+                    subprocess.run([sys.executable, os.path.join(script_dir, "create_apple_moments_albums.py")], check=True)
+                    logger.info("Sync to ToBeCurated complete.")
+                    print("✅ Sync to ToBeCurated complete.")
+                except subprocess.CalledProcessError as e:
+                    logger.error(f"Sync to ToBeCurated failed: {e}")
+                    print(f"⚠️ Sync to ToBeCurated failed: {e}")
+                release_planner_lock()
+
             generate_weekly_memory_report = True
             continue
         elif choice == '5':

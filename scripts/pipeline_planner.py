@@ -1030,19 +1030,26 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                     FROM photos_db.ZASSET z
                     JOIN photos_db.Z_30ASSETS aa ON aa.Z_3ASSETS = z.Z_PK
                     JOIN photos_db.ZGENERICALBUM ga ON ga.Z_PK = aa.Z_30ALBUMS
-                    WHERE LOWER(ga.ZTITLE) IN ('skippublishing', 'ignore')
+                    WHERE LOWER(ga.ZTITLE) IN ('skippublishing', 'ignore', 'topscore excluded')
                       AND ga.ZTRASHEDSTATE = 0 AND z.ZTRASHEDSTATE = 0
                 """)
                 skipped_asset_ids = set(r[0] for r in cursor.fetchall() if r[0])
             except Exception as e:
                 logger.warning(f"Could not load skipped assets from Photos DB: {e}")
         try:
-            cursor.execute("SELECT asset_id FROM assets WHERE LOWER(COALESCE(MomentsAlbumName, '')) IN ('skippublishing', 'ignore')")
+            cursor.execute("SELECT asset_id FROM assets WHERE LOWER(COALESCE(MomentsAlbumName, '')) IN ('skippublishing', 'ignore', 'topscore excluded')")
             for r in cursor.fetchall():
                 if r[0]:
                     skipped_asset_ids.add(r[0])
         except Exception:
             pass
+        try:
+            from create_apple_moments_albums import get_skip_publishing_asset_ids
+            for sid in get_skip_publishing_asset_ids():
+                if sid:
+                    skipped_asset_ids.add(sid.split('/')[0])
+        except Exception as e:
+            logger.warning(f"Could not load skipped assets via AppleScript: {e}")
 
         # Check and cleanup stale publication records:
         # Reset publication status to unpublished if an asset no longer belongs to any moment,
@@ -1080,7 +1087,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                           SELECT 1 FROM photos_db.Z_30ASSETS aa
                           JOIN photos_db.ZGENERICALBUM ga ON aa.Z_30ALBUMS = ga.Z_PK
                           WHERE aa.Z_3ASSETS = a.Z_PK
-                            AND LOWER(ga.ZTITLE) IN ('ignore', 'skippublishing')
+                            AND LOWER(ga.ZTITLE) IN ('ignore', 'skippublishing', 'topscore excluded')
                             AND ga.ZTRASHEDSTATE = 0
                       ))
                     ORDER BY v.score_normalized DESC LIMIT 1
@@ -1466,7 +1473,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                       SELECT 1 FROM photos_db.Z_30ASSETS aa
                       JOIN photos_db.ZGENERICALBUM ga ON aa.Z_30ALBUMS = ga.Z_PK
                       WHERE aa.Z_3ASSETS = a.Z_PK
-                        AND LOWER(ga.ZTITLE) IN ('ignore', 'skippublishing')
+                        AND LOWER(ga.ZTITLE) IN ('ignore', 'skippublishing', 'topscore excluded')
                         AND ga.ZTRASHEDSTATE = 0
                   ))
                 ORDER BY v.score_normalized DESC
@@ -1496,6 +1503,9 @@ def run_memory_publishing_flow(cursor=None, conn=None):
         album_counts = {}
         processed_rows = []
         for row in rows:
+            asset_id = row[0]
+            if asset_id in skipped_asset_ids:
+                continue
             assigned_album = row[10] if row[10] else (row[11] if row[11] else "—")
             processed_rows.append((row, assigned_album))
             album_counts[assigned_album] = album_counts.get(assigned_album, 0) + 1
@@ -1543,6 +1553,8 @@ def run_memory_publishing_flow(cursor=None, conn=None):
         moments_data = {}
         for row in rows:
             asset_id, moment_name, score, filename = row[0], row[1], row[2], row[3]
+            if asset_id in skipped_asset_ids:
+                continue
             is_proposed, is_curated = row[8], row[9]
             is_published = row[12] if len(row) > 12 else None
             if moment_name not in moments_data:

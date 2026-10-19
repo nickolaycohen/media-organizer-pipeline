@@ -208,6 +208,33 @@ A maintenance tool to ensure the SQL view used for asset ranking and scoring is 
 python3 scripts/create_ranked_assets_view.py
 ```
 
+### Reconstruct Apple Photos Album Structure & Members (Disaster Recovery)
+
+In the event of a catastrophic failure, corruption, or rebuild of the Apple Photos library, this tool uses `media_organizer.db` as an authoritative backup to recreate all folders, albums, and member assets under **"Media Organizer on LaCie"**.
+
+- **Automatic Backups**: The background refresh service (`bg_copy_db_service.py` via `sync_photos_derived.py`) automatically snapshots all folder paths, album kinds, and member asset UUIDs into `media_organizer_albums` and `media_organizer_album_assets`.
+- **Manual Snapshot**: You can take a manual backup snapshot anytime:
+  ```bash
+  python3 scripts/reconstruct_apple_albums.py --backup
+  ```
+- **Dry-Run Preview**: Preview the hierarchy, album names, and asset counts before making changes:
+  ```bash
+  python3 scripts/reconstruct_apple_albums.py --recreate --dry-run
+  ```
+- **Full Reconstruction**: Recreate all folders, albums, and restore member assets in Apple Photos:
+  ```bash
+  python3 scripts/reconstruct_apple_albums.py --recreate
+  ```
+- **Selective Reconstruction**: Recreate only a specific subfolder tree (e.g. `Curated`, `Moments`, `Retired`) or a single album:
+  ```bash
+  python3 scripts/reconstruct_apple_albums.py --recreate --folder "Curated"
+  python3 scripts/reconstruct_apple_albums.py --recreate --album "2026 - Venice"
+  ```
+- **Verification**: Compare existing Apple Photos albums and item counts against the database backup:
+  ```bash
+  python3 scripts/reconstruct_apple_albums.py --verify --folder "Curated"
+  ```
+
 ---
 
 # ✨ Notes

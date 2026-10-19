@@ -269,6 +269,15 @@ def sync_assets(media_cursor, logger):
 
     logger.info("Smart albums synced successfully.")
 
+    # Synchronize full album structure and member assets backup for 'Media Organizer on LaCie'
+    logger.info("Syncing full album hierarchy and member assets backup for 'Media Organizer on LaCie'...")
+    try:
+        from scripts.reconstruct_apple_albums import sync_album_backup_from_cursor
+        sync_album_backup_from_cursor(media_cursor, logger)
+        commit()
+    except Exception as e:
+        logger.warning(f"Could not update album backup in media_organizer.db: {e}")
+
     logger.info("Syncing import session records (inserting new and updating existing)...")
     media_cursor.execute('''
         INSERT INTO imports (import_uuid, import_name, import_timestamp_utc, album, assets_count, camera_make, camera_model, min_filename, max_filename, min_date, max_date, months_detected)

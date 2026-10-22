@@ -505,29 +505,32 @@ def triage_intake_folder(target_dir, dest_root_dir=None, triage_id=None, dry_run
         index = LibraryIndex(MEDIA_ORGANIZER_DB_PATH)
         index.load()
 
-        # Step 1: Discover all media files outside destination directories and special folders
+        # Step 1: Discover all media files outside destination directories and special system folders
         candidate_files = []
-        ignored_special = {
-            "duplicates", "review-similar", "new", "triagemediaintake",
-            ".ds_store", "thumbs.db", "$recycle.bin", ".spotlight-v100", ".trashes"
+        ignored_dir_names = {
+            "triagemediaintake", "$recycle.bin", ".spotlight-v100", ".trashes", ".fseventsd"
+        }
+        ignored_file_names = {
+            ".ds_store", "thumbs.db", "desktop.ini"
         }
 
         dest_root_abs = os.path.abspath(dest_root_dir)
 
         for root, dirs, files in os.walk(target_dir):
             root_abs = os.path.abspath(root)
-            # Never scan inside destination root or any session directories
+            # Never scan inside the destination root directory or any of its session subdirectories
             if root_abs == dest_root_abs or root_abs.startswith(dest_root_abs + os.sep):
                 continue
 
             rel_root = os.path.relpath(root, target_dir)
             first_segment = rel_root.split(os.sep)[0].lower() if rel_root != '.' else ''
 
-            if first_segment in ignored_special:
+            # If scanning inside or around TriageMediaIntake, skip the destination folder itself
+            if first_segment in ignored_dir_names:
                 continue
 
             for f in sorted(files):
-                if f.startswith('.') or f.lower() in ignored_special:
+                if f.startswith('.') or f.lower() in ignored_file_names:
                     continue
                 ext = os.path.splitext(f)[1].lower()
                 if ext not in MEDIA_EXTENSIONS:

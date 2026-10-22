@@ -123,46 +123,71 @@ def determine_triage_id(db_path, dest_root_dir, requested_id=None):
     except Exception as e:
         logger.warning(f"Could not determine next triage_id from DB: {e}")
 
-    # Ensure no folder collision on disk
-    while os.path.exists(os.path.join(dest_root_dir, str(next_num))):
+    # Ensure no folder collision under Duplicates, Review-Similar, or New
+    def session_exists(num):
+        s_id = str(num)
+        for cat in ["Duplicates", "Review-Similar", "New"]:
+            if os.path.exists(os.path.join(dest_root_dir, cat, s_id)):
+                return True
+        if os.path.exists(os.path.join(dest_root_dir, s_id)):
+            return True
+        return False
+
+    while session_exists(next_num):
         next_num += 1
 
     return str(next_num)
 
-def tag_triage_folders(target_dir):
+def tag_triage_folders(dest_root_dir, triage_id=None):
     """
-    Applies standard macOS Finder color tags to triage folders if they exist:
+    Applies standard macOS Finder color tags to triage folders:
       - Duplicates/                       -> Red (Index 2)
       - Review-Similar/                  -> Yellow (Index 3)
       - Review-Similar/Upgrade-Candidates -> Orange (Index 1)
       - New/                             -> Green (Index 6)
-    Supports tagging a single session folder or recursively checking session folders.
+    Tags both the top-level 3 category folders and any session subfolders.
     """
-    target_dir = os.path.abspath(target_dir)
+    dest_root_dir = os.path.abspath(dest_root_dir)
     results = {}
 
-    # Check direct triage folders inside target_dir
-    found_direct = False
-    for sub_rel, color in TRIAGE_FOLDER_TAGS.items():
-        folder_path = os.path.join(target_dir, sub_rel)
-        if os.path.exists(folder_path):
-            found_direct = True
-            ok = apply_finder_tag(folder_path, color)
-            results[sub_rel] = (color, ok)
-            logger.info(f"🏷️  Tagged '{sub_rel}' as {color} in Finder.")
+    category_colors = {
+        "Duplicates": "Red",
+        "Review-Similar": "Yellow",
+        "New": "Green"
+    }
 
-    # If no direct triage folders found, check if target_dir contains session subfolders (e.g. TriageMediaIntake/1, 2)
-    if not found_direct and os.path.exists(target_dir):
-        for entry in sorted(os.listdir(target_dir)):
-            sub_entry = os.path.join(target_dir, entry)
-            if os.path.isdir(sub_entry) and not entry.startswith('.'):
-                for sub_rel, color in TRIAGE_FOLDER_TAGS.items():
-                    folder_path = os.path.join(sub_entry, sub_rel)
-                    if os.path.exists(folder_path):
-                        key = f"{entry}/{sub_rel}"
-                        ok = apply_finder_tag(folder_path, color)
-                        results[key] = (color, ok)
-                        logger.info(f"🏷️  Tagged '{key}' as {color} in Finder.")
+    # 1. Tag top-level category folders if they exist
+    for cat_name, color in category_colors.items():
+        cat_path = os.path.join(dest_root_dir, cat_name)
+        if os.path.exists(cat_path):
+            ok = apply_finder_tag(cat_path, color)
+            results[cat_name] = (color, ok)
+            logger.info(f"🏷️  Tagged top-level '{cat_name}' as {color} in Finder.")
+
+    # 2. Tag session subfolders (e.g. Duplicates/<id>, Review-Similar/<id>, New/<id>)
+    for cat_name, color in category_colors.items():
+        cat_path = os.path.join(dest_root_dir, cat_name)
+        if not os.path.exists(cat_path):
+            continue
+
+        session_dirs = [triage_id] if triage_id else sorted(os.listdir(cat_path))
+        for s_dir in session_dirs:
+            if not s_dir or str(s_dir).startswith('.'):
+                continue
+            sess_path = os.path.join(cat_path, str(s_dir))
+            if os.path.isdir(sess_path):
+                key = f"{cat_name}/{s_dir}"
+                ok = apply_finder_tag(sess_path, color)
+                results[key] = (color, ok)
+                logger.info(f"🏷️  Tagged session folder '{key}' as {color} in Finder.")
+
+                # If Upgrade-Candidates exists inside Review-Similar/<id>, tag it Orange
+                upg_path = os.path.join(sess_path, "Upgrade-Candidates")
+                if os.path.exists(upg_path):
+                    upg_key = f"{key}/Upgrade-Candidates"
+                    upg_ok = apply_finder_tag(upg_path, "Orange")
+                    results[upg_key] = ("Orange", upg_ok)
+                    logger.info(f"🏷️  Tagged '{upg_key}' as Orange in Finder.")
 
     return results
 
@@ -467,14 +492,15 @@ def triage_intake_folder(target_dir, dest_root_dir=None, triage_id=None, dry_run
     # Attach triage_id to the logger so all logs contain [Triage ID: <triage_id>]
     setup_logger(TRIAGE_LOG_PATH, MODULE_TAG, extra_fields={"triage_id": triage_id})
 
-    session_dest_dir = os.path.join(dest_root_dir, triage_id)
-    duplicates_dir = os.path.join(session_dest_dir, "Duplicates")
-    review_dir = os.path.join(session_dest_dir, "Review-Similar")
-    new_dir = os.path.join(session_dest_dir, "New")
+    # Inverted hierarchy: TriageMediaIntake/[Category]/<triage_id>
+    duplicates_dir = os.path.join(dest_root_dir, "Duplicates", triage_id)
+    review_dir = os.path.join(dest_root_dir, "Review-Similar", triage_id)
+    new_dir = os.path.join(dest_root_dir, "New", triage_id)
+    session_dest_desc = f"{dest_root_dir}/[Duplicates|Review-Similar|New]/{triage_id}"
 
     logger.info(f"🚀 Starting Media Intake Triage [Triage ID: {triage_id}]")
     logger.info(f"   - Source Directory:      {target_dir}")
-    logger.info(f"   - Destination Directory: {session_dest_dir}")
+    logger.info(f"   - Destination Hierarchy: {session_dest_desc}")
     if dry_run:
         logger.info("🔎 DRY RUN MODE: No files will be moved and DB will not be modified.")
 
@@ -494,7 +520,7 @@ def triage_intake_folder(target_dir, dest_root_dir=None, triage_id=None, dry_run
                 INSERT INTO triage_sessions (
                     triage_id, source_directory, destination_directory, status, dry_run, started_at_utc
                 ) VALUES (?, ?, ?, 'running', 0, datetime('now'))
-            """, (triage_id, target_dir, session_dest_dir))
+            """, (triage_id, target_dir, session_dest_desc))
             db_session_pk = cur.lastrowid
             db_conn.commit()
         except Exception as e:
@@ -675,7 +701,7 @@ def triage_intake_folder(target_dir, dest_root_dir=None, triage_id=None, dry_run
         print(f"📊 MEDIA INTAKE 3-WAY TRIAGE SUMMARY [Triage ID: {triage_id}]")
         print("=" * 78)
         print(f"Source Directory:      {target_dir}")
-        print(f"Destination Session:   {session_dest_dir}")
+        print(f"Destination Hierarchy: {session_dest_desc}")
         print(f"Total Files Scanned:   {len(candidate_files):,}")
         print("-" * 78)
         print(f"1. Duplicates Total:                                {len(duplicates_list):>5,} assets ({format_size(total_dup_bytes):>10})")
@@ -694,35 +720,34 @@ def triage_intake_folder(target_dir, dest_root_dir=None, triage_id=None, dry_run
 
         # Log individual files
         for src_full, rel_p, fname, sz, reason in duplicates_list:
-            logger.info(f"  [DUPLICATE]      {rel_p} ({format_size(sz)}) -> {session_dest_dir}/Duplicates/{rel_p} | Reason: {reason}")
+            logger.info(f"  [DUPLICATE]      {rel_p} ({format_size(sz)}) -> Duplicates/{triage_id}/{rel_p} | Reason: {reason}")
         for item in review_list:
             src_full, rel_p, fname, sz, reason, sub_type = item
-            sub_folder = "Review-Similar/Upgrade-Candidates" if sub_type == "upgrade_candidate" else "Review-Similar"
-            logger.info(f"  [REVIEW-SIMILAR] {rel_p} ({format_size(sz)}) -> {session_dest_dir}/{sub_folder}/{rel_p} | Reason: {reason}")
+            sub_folder = f"Review-Similar/{triage_id}/Upgrade-Candidates" if sub_type == "upgrade_candidate" else f"Review-Similar/{triage_id}"
+            logger.info(f"  [REVIEW-SIMILAR] {rel_p} ({format_size(sz)}) -> {sub_folder}/{rel_p} | Reason: {reason}")
         for src_full, rel_p, fname, sz, reason in new_list:
-            logger.info(f"  [NEW]            {rel_p} ({format_size(sz)}) -> {session_dest_dir}/New/{rel_p} | Reason: {reason}")
+            logger.info(f"  [NEW]            {rel_p} ({format_size(sz)}) -> New/{triage_id}/{rel_p} | Reason: {reason}")
 
         if dry_run:
             print(f"🔍 [DRY RUN] Triage ID: {triage_id}")
-            print(f"   Destination Session: {session_dest_dir}")
+            print(f"   Destination Hierarchy: {dest_root_dir}/[Category]/{triage_id}/")
             print(f"   Would move:")
             print(f"   - {len(duplicates_list):,} duplicates to '{duplicates_dir}/'")
             if upgrade_count > 0:
                 print(f"   - {upgrade_count:,} upgrade candidates to '{review_dir}/Upgrade-Candidates/'")
             print(f"   - {len(review_list) - upgrade_count:,} review items to '{review_dir}/'")
             print(f"   - {len(new_list):,} clean new assets to '{new_dir}/'")
-            print(f"🏷️  [DRY RUN] Would apply macOS Finder color tags:")
-            print(f"   - '{duplicates_dir}'                     -> Red 🔴")
-            print(f"   - '{review_dir}'                -> Yellow 🟡")
+            print(f"🏷️  [DRY RUN] Would apply macOS Finder color tags to destination folders:")
+            print(f"   - '{dest_root_dir}/Duplicates' (and /{triage_id})                     -> Red 🔴")
+            print(f"   - '{dest_root_dir}/Review-Similar' (and /{triage_id})                -> Yellow 🟡")
             if upgrade_count > 0:
-                print(f"   - '{review_dir}/Upgrade-Candidates' -> Orange 🟠")
-            print(f"   - '{new_dir}'                           -> Green 🟢")
+                print(f"   - '{review_dir}/Upgrade-Candidates'                             -> Orange 🟠")
+            print(f"   - '{dest_root_dir}/New' (and /{triage_id})                           -> Green 🟢")
             print(f"📝 Logs appended to: {TRIAGE_LOG_PATH}")
             return
 
         # Step 5: Moving files
-        logger.info(f"🚚 Moving triaged files into destination session: {session_dest_dir} ...")
-        os.makedirs(session_dest_dir, exist_ok=True)
+        logger.info(f"🚚 Moving triaged files into destination folders under {dest_root_dir}...")
         moved_duplicates = 0
         moved_review = 0
         moved_new = 0
@@ -764,12 +789,20 @@ def triage_intake_folder(target_dir, dest_root_dir=None, triage_id=None, dry_run
             logger.info("🧹 Cleaning empty source directories...")
             clean_empty_directories(
                 target_dir,
-                protected_subdirs=[dest_root_dir, session_dest_dir, duplicates_dir, review_dir, new_dir]
+                protected_subdirs=[
+                    dest_root_dir,
+                    os.path.join(dest_root_dir, "Duplicates"),
+                    os.path.join(dest_root_dir, "Review-Similar"),
+                    os.path.join(dest_root_dir, "New"),
+                    duplicates_dir,
+                    review_dir,
+                    new_dir
+                ]
             )
 
         # Step 7: Apply macOS Finder color tags
-        logger.info(f"🏷️  Applying macOS Finder color tags to triage folders in {session_dest_dir}...")
-        tag_results = tag_triage_folders(session_dest_dir)
+        logger.info(f"🏷️  Applying macOS Finder color tags under {dest_root_dir}...")
+        tag_results = tag_triage_folders(dest_root_dir, triage_id=triage_id)
 
         # Step 8: Update database records
         if db_conn and db_session_pk:
@@ -835,7 +868,7 @@ def triage_intake_folder(target_dir, dest_root_dir=None, triage_id=None, dry_run
                 db_conn.close()
 
         print(f"✅ Triage Complete! [Triage ID: {triage_id}]")
-        print(f"   Destination Session: {session_dest_dir}")
+        print(f"   Destination Hierarchy: {dest_root_dir}/[Category]/{triage_id}/")
         print(f"   - {moved_duplicates:,} duplicates moved to '{duplicates_dir}/'")
         print(f"   - {moved_review:,} review assets moved to '{review_dir}/'")
         print(f"   - {moved_new:,} clean assets moved to '{new_dir}/'")
@@ -862,7 +895,7 @@ def triage_intake_folder(target_dir, dest_root_dir=None, triage_id=None, dry_run
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Triage media files from an intake folder into Duplicates, Review-Similar, and New folders under /Volumes/LaCie/Storage/Priority 4/Media Preprocessing/TriageMediaIntake/<triage_id>."
+        description="Triage media files from an intake folder into 3 top-level folders: /Volumes/LaCie/Storage/Priority 4/Media Preprocessing/TriageMediaIntake/[Duplicates|Review-Similar|New]/<triage_id>."
     )
     parser.add_argument("target_dir", nargs="?", default=DEFAULT_MEDIA_PREPROCESSING_DIR,
                         help=f"Source intake directory to scan and triage (default: {DEFAULT_MEDIA_PREPROCESSING_DIR})")
@@ -882,16 +915,8 @@ if __name__ == "__main__":
     args = parse_args()
     if args.tag_only:
         dest_root = os.path.abspath(args.dest_dir or TRIAGE_DESTINATION_ROOT)
-        # If triage_id specified, tag that specific session folder
-        if args.triage_id:
-            tag_target = os.path.join(dest_root, str(args.triage_id))
-        elif os.path.exists(args.target_dir) and args.target_dir != DEFAULT_MEDIA_PREPROCESSING_DIR:
-            tag_target = args.target_dir
-        else:
-            tag_target = dest_root
-
-        print(f"🏷️  Applying macOS Finder tags to triage folders in: {tag_target}")
-        res = tag_triage_folders(tag_target)
+        print(f"🏷️  Applying macOS Finder tags to triage folders in: {dest_root}")
+        res = tag_triage_folders(dest_root, triage_id=args.triage_id)
         for folder_rel, (color, ok) in res.items():
             icon = "🔴" if color == "Red" else "🟡" if color == "Yellow" else "🟠" if color == "Orange" else "🟢"
             status = "✅" if ok else "⚠️"

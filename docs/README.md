@@ -33,8 +33,9 @@ Acts as the intermediary between raw storage discovery (`drive-audit-cli` wizard
 - **Scans**: An intake folder (defaults to `/Volumes/LaCie/Storage/Priority 4/Media Preprocessing`).
 - **Compares**: Compares every asset against all 212,000+ assets in `media_organizer.db` using exact byte size, original filename, and EXIF timestamp cascade, plus Live Photo companion pairing.
 - **Triages**: Moves assets preserving their relative subfolder structure into:
-  - `Duplicates/`: Assets already present in `All-Media.photoslibrary` (safe to archive or delete).
-  - `New/`: Assets NOT present in `All-Media.photoslibrary` (ready for clean Apple Photos import).
+  - `Duplicates/`: Assets 100% confirmed present in `All-Media.photoslibrary` (exact size + filename / EXIF date match).
+  - `Review-Similar/`: Assets suspected of having been intentionally discarded or deleted from Apple Photos (folder deletion keywords, sequence/burst siblings $\le 30$s from library photos, or web UI artifacts).
+  - `New/`: Pristine, high-confidence new media (clean sequence, not in library, ready for Apple Photos import).
 - **Cleans**: Automatically prunes empty source directories so categorized assets bubble up cleanly.
 
 ```bash

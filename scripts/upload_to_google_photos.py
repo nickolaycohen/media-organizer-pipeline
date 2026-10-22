@@ -586,6 +586,14 @@ def main(args):
             if row and row[0] < '400':
                 cursor.execute("UPDATE month_batches SET status_code = '400' WHERE month = ?", (month,))
                 logger.info(f"✅ Batch {month} status finalized to 400.")
+
+            # Automatically clean up local staging folder to reclaim disk space on LaCie
+            if not getattr(args, 'keep_staging', False):
+                try:
+                    from scripts.cleanup_staging_exports import clean_staging
+                    clean_staging(month=month, auto_confirm=True)
+                except Exception as clean_err:
+                    logger.warning(f"Failed to auto-clean staging for {month}: {clean_err}")
         else:
             logger.info(f"⚠️ Month {month} remains partially uploaded due to quota limits or error ({uploaded_count}/{total_assets_expected} assets).")
 
@@ -602,6 +610,7 @@ def parse_args():
     parser.add_argument("month", help="Month to process (YYYY-MM)")
     parser.add_argument("--dry-run", action="store_true", help="Only log actions without uploading files.")
     parser.add_argument("--max-size-mb", type=float, default=MAX_UPLOAD_FILE_SIZE_MB, help=f"Maximum file size in MB to upload to Google Photos (default: {MAX_UPLOAD_FILE_SIZE_MB} MB).")
+    parser.add_argument("--keep-staging", action="store_true", help="Preserve local staging directory after upload completes.")
     return parser.parse_args()
 
 if __name__ == "__main__":

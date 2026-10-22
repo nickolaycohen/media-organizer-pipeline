@@ -441,6 +441,125 @@ def handle_reasonability_rejection(cursor, conn, import_uuids, camera_model, cam
         close_conn()
         sys.exit(1)
 
+def check_photos_db_for_smart_album(album_name):
+    """
+    Checks Apple Photos SQLite DB directly for a smart album.
+    Returns: (matching_row, status_message)
+      - If found inside MonthlyExports: (row, None)
+      - If found but in another folder: (None, "Found in folder '...' instead of 'MonthlyExports'")
+      - If not found or error: (None, error_or_None)
+    """
+    if not os.path.exists(APPLE_PHOTOS_DB_PATH):
+        return None, "Apple Photos DB file not found on disk"
+    try:
+        conn = sqlite3.connect(f"file:{APPLE_PHOTOS_DB_PATH}?mode=ro", uri=True, timeout=5)
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT 
+                a.Z_PK, 
+                a.ZTITLE, 
+                a.ZPARENTFOLDER, 
+                p.ZTITLE
+            FROM ZGENERICALBUM a
+            LEFT JOIN ZGENERICALBUM p ON a.ZPARENTFOLDER = p.Z_PK
+            WHERE a.ZKIND = 1507
+              AND a.ZTRASHEDSTATE = 0
+              AND LOWER(a.ZTITLE) = ?
+        """, (album_name.lower(),))
+        rows = cur.fetchall()
+        conn.close()
+
+        for row in rows:
+            if row[3] == 'MonthlyExports':
+                return row, None
+
+        if rows:
+            parent_name = rows[0][3] or "Root/Unknown"
+            return None, f"Found Smart Album '{album_name}' in Apple Photos, but it is located in '{parent_name}' instead of 'MonthlyExports'."
+
+        return None, None
+    except Exception as e:
+        logger.warning(f"Error checking Apple Photos DB for smart album '{album_name}': {e}")
+        return None, str(e)
+
+def ensure_smart_album_exists(cursor, conn, latest_month, auto_apply=False):
+    """
+    Ensures the required Smart Album exists in Apple Photos before proposing migration off of 000 / 100E.
+    If not already in local smart_albums table, checks Apple Photos DB directly.
+    If not found in Apple Photos, polls every 3 seconds until created, then syncs to smart_albums table and proceeds.
+    """
+    # 1. Quick check: already in local smart_albums?
+    cursor.execute("SELECT COUNT(*) FROM smart_albums WHERE LOWER(album_name) = ?", (latest_month.lower(),))
+    if cursor.fetchone()[0] > 0:
+        return True
+
+    # 2. Check if already present in live Apple Photos DB
+    row, mismatch_note = check_photos_db_for_smart_album(latest_month)
+    if row:
+        cursor.execute("SELECT COUNT(*) FROM smart_albums WHERE LOWER(album_name) = ?", (latest_month.lower(),))
+        if cursor.fetchone()[0] == 0:
+            cursor.execute("""
+                INSERT INTO smart_albums (album_pk, album_name, parent_folder_pk, parent_folder_name)
+                VALUES (?, ?, ?, ?)
+            """, (row[0], row[1], row[2], row[3]))
+            cursor.execute("UPDATE db_updates SET raw_synced = 0, derived_synced = 0")
+            conn.commit()
+        logger.info(f"✅ Smart Album '{latest_month}' detected in Apple Photos! Synced to database.")
+        print(f"✅ Smart Album '{latest_month}' detected in Apple Photos! Synced to database.")
+        return True
+
+    # 3. Not found: inform user and poll until created
+    logger.warning(f"⚠️ Smart Album '{latest_month}' does not exist in Apple Photos.")
+    logger.info(f"👉 Please create the Smart Album '{latest_month}' inside 'Media Organizer on LaCie > Google Photos Pipeline > MonthlyExports' in Apple Photos first.")
+    print(f"\n⚠️ Smart Album '{latest_month}' does not exist in Apple Photos.")
+    print(f"👉 Please create the Smart Album '{latest_month}' inside 'Media Organizer on LaCie > Google Photos Pipeline > MonthlyExports' in Apple Photos first.")
+    print(f"⏳ Polling Apple Photos database for Smart Album '{latest_month}' (checking every 3s)... Press Ctrl+C to abort.\n")
+
+    poll_interval = 3
+    start_time = time.time()
+    last_reported_note = None
+
+    try:
+        while True:
+            time.sleep(poll_interval)
+
+            # Check Apple Photos DB
+            row, note = check_photos_db_for_smart_album(latest_month)
+            if row:
+                cursor.execute("SELECT COUNT(*) FROM smart_albums WHERE LOWER(album_name) = ?", (latest_month.lower(),))
+                if cursor.fetchone()[0] == 0:
+                    cursor.execute("""
+                        INSERT INTO smart_albums (album_pk, album_name, parent_folder_pk, parent_folder_name)
+                        VALUES (?, ?, ?, ?)
+                    """, (row[0], row[1], row[2], row[3]))
+                    cursor.execute("UPDATE db_updates SET raw_synced = 0, derived_synced = 0")
+                    conn.commit()
+                print(f"\n✅ Smart Album '{latest_month}' detected in Apple Photos! Synced to database. Proceeding...")
+                logger.info(f"✅ Smart Album '{latest_month}' detected in Apple Photos! Synced to database. Proceeding...")
+                return True
+
+            # Also check if smart_albums was populated by external sync
+            cursor.execute("SELECT COUNT(*) FROM smart_albums WHERE LOWER(album_name) = ?", (latest_month.lower(),))
+            if cursor.fetchone()[0] > 0:
+                print(f"\n✅ Smart Album '{latest_month}' detected in synced database! Proceeding...")
+                logger.info(f"✅ Smart Album '{latest_month}' detected in synced database! Proceeding...")
+                return True
+
+            elapsed = int(time.time() - start_time)
+            if note and note != last_reported_note:
+                last_reported_note = note
+                print(f"\n⚠️ {note} (Waiting for it to be moved into 'MonthlyExports')...")
+                logger.warning(f"⚠️ {note}")
+
+            print(f"\r⏳ Waiting for Smart Album '{latest_month}' in Apple Photos... ({elapsed}s elapsed)", end="", flush=True)
+
+    except KeyboardInterrupt:
+        print(f"\n🛑 Polling cancelled by user. Exiting.")
+        logger.info(f"Polling for Smart Album '{latest_month}' cancelled by user.")
+        close_conn()
+        release_planner_lock()
+        sys.exit(0)
+
 def check_active_sources_import_status(cursor, conn, month, auto_apply):
     """
     Checks if all active camera models have imported assets for the proposed month.
@@ -4829,31 +4948,14 @@ def main(auto_apply, no_sync=False):
         # Only perform import continuity and sequencing checks for batches that haven't reached the upload stage (400)
         # This prevents redundant prompts for batches that are already processed or being curated.
         if current_status and str(current_status) < '400':
-            # Check if Apple Photos Smart Album exists before proposing migration off of 000 / 100E
+            # Verify assets exist in Media Organizer DB before proposing migration off of 000 / 100E
             if str(current_status) in ('000', '100E'):
-                cursor.execute("SELECT COUNT(*) FROM smart_albums WHERE LOWER(album_name) = ?", (latest_month.lower(),))
-                if cursor.fetchone()[0] == 0:
-                    logger.warning(f"⚠️ Smart Album '{latest_month}' does not exist in Apple Photos.")
-                    logger.info(f"👉 Please create the Smart Album '{latest_month}' inside 'Media Organizer on LaCie > Google Photos Pipeline > MonthlyExports' in Apple Photos first.")
-                    if not auto_apply:
-                        close_conn()
-                        release_planner_lock()
-                        ans = input("\nPress [Enter] once created to resync and restart the planner (or [Q] to quit): ").strip().lower()
-                        if ans != 'q':
-                            acquire_planner_lock()
-                            conn = get_connection()
-                            conn.execute("PRAGMA busy_timeout = 30000")
-                            cursor = get_cursor()
-                            logger.info("🔄 Forcing metadata resync and restarting planner...")
-                            cursor.execute("UPDATE db_updates SET raw_synced = 0, derived_synced = 0")
-                            conn.commit()
-                            close_conn()
-                            release_planner_lock()
-                            os.execv(sys.executable, [sys.executable] + sys.argv)
-                    logger.info("Then, re-run the pipeline planner to sync the changes and proceed.")
-                    close_conn()
-                    release_planner_lock()
-                    sys.exit(0)
+                cursor.execute("SELECT COUNT(*) FROM assets WHERE month = ?", (latest_month,))
+                batch_asset_count = cursor.fetchone()[0]
+                if batch_asset_count == 0:
+                    logger.warning(f"⚠️ No assets found for month '{latest_month}' in Media Organizer DB.")
+                else:
+                    logger.info(f"✅ Verified {batch_asset_count} assets for month '{latest_month}' in Media Organizer DB. Ready for direct export.")
 
             check_active_sources_import_status(cursor, conn, latest_month, auto_apply)
 

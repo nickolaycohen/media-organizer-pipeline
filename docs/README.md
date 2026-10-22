@@ -10,13 +10,13 @@ The system is orchestrated by `scripts/pipeline_planner.py` which prompts you to
 
 ### Track 1: Batch Management (Mode `[B]`)
 Handles the monthly ingest, sync, upload to Google Photos, ranking, and storage cleanup.
-- **100 - Verify**: `verify_export_album.py`
-- **200 - Export**: `export_photos_wrapper.py`
-- **210 - Dedupe**: `deduplicate_assets.py`
-- **400 - Upload**: `upload_to_google_photos.py`
-- **550 - Favorites**: `pull_google_favorites.py`
-- **600 - Rank**: `rank_assets_by_score.py`
-- **650 - Cleanup**: `delete_google_assets.py`
+- **100 - Verify**: `verify_export_album.py` (Checks asset readiness in Media Organizer DB)
+- **200 - Export**: `export_photos_wrapper.py` (Fast direct $O(1)$ stat export from `originals/` with Live Photo companions)
+- **210 - Dedupe**: `deduplicate_assets.py` (De-duplicates temporary staging files)
+- **400 - Upload**: `upload_to_google_photos.py` (Uploads to Google Photos and automatically cleans local staging folder)
+- **550 - Favorites**: `pull_google_favorites.py` (Syncs Google Photos favorites for the active curated album)
+- **600 - Rank**: `rank_assets_by_score.py` (Exports top curated assets to `02-AICurrateList/`, with fallback to master originals)
+- **650 - Complete**: `delete_google_assets.py` (Retains assets in Google Photos 5TB cloud archive and ensures local staging is cleaned)
 
 ### Track 2: Memory Feature & Publishing (Mode `[M]`)
 An independent, time-based workflow for curating and publishing specific events/memories.
@@ -213,6 +213,7 @@ python3 scripts/create_ranked_assets_view.py
 In the event of a catastrophic failure, corruption, or rebuild of the Apple Photos library, this tool uses `media_organizer.db` as an authoritative backup to recreate all folders, albums, and member assets under **"Media Organizer on LaCie"**.
 
 - **Automatic Backups**: The background refresh service (`bg_copy_db_service.py` via `sync_photos_derived.py`) automatically snapshots all folder paths, album kinds, and member asset UUIDs into `media_organizer_albums` and `media_organizer_album_assets`.
+- **Scheduled Snapshot**: Scheduled daily via cron at 5:30 AM before the 6:00 AM database backup (logs to `logs/reconstruct_apple_albums.log`).
 - **Manual Snapshot**: You can take a manual backup snapshot anytime:
   ```bash
   python3 scripts/reconstruct_apple_albums.py --backup
@@ -239,9 +240,11 @@ In the event of a catastrophic failure, corruption, or rebuild of the Apple Phot
 
 # ✨ Notes
 
-- **Manual Smart Album creation**: AppleScript cannot create Smart Albums — must be manually created before export.
-- **Dry-run mode**: Available in critical scripts like verification and uploads.
-- **Orphan Handling**: Orphaned folders will be renamed, _not deleted_ immediately.
+- **Direct Database Export**: No manual Smart Album creation needed — exports are handled directly from the Photos database and library `originals/` directory with $O(1)$ stat lookup.
+- **5TB Cloud Archive**: Photos uploaded to Google Photos remain stored permanently; batches do not require manual deletion from Google Photos.
+- **Automated Local Staging Cleanup**: Staging folders under `01-MonthlyExports` are automatically purged after upload (`status 400`) and post-ranking (`status 600`), keeping local disk usage bounded to the active batch (~10–30 GB).
+- **Staging Cleanup Utility**: Use `python3 scripts/cleanup_staging_exports.py [--dry-run]` to audit or reclaim staging space at any time.
+- **Dry-run mode**: Available in critical scripts like verification, cleanup, and uploads.
 - **Failure recovery**: Pipeline designed to be safe, resumable, and auditable at each stage.
 
 ---

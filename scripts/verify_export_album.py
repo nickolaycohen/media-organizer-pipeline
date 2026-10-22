@@ -14,33 +14,16 @@ from db.connections import get_connection, get_cursor, commit, close as close_co
 
 MODULE_TAG = 'verify_export_album'
 
-def check_smart_album_exists(cursor, album_name):
-    """Check if the Smart Album exists in the Media Organizer DB."""
+def check_batch_assets_exist(cursor, month):
+    """Check that assets exist in the Media Organizer DB for the specified month."""
     cursor.execute('''
-        SELECT album_name FROM smart_albums
-    ''')
-    albums = [row[0].strip().lower() for row in cursor.fetchall()]
-    logger = logging.getLogger(MODULE_TAG)
-    logger.debug(f"Albums in DB: {albums}")
-    return album_name.strip().lower() in albums
-
-def run_applescript_export(album_name, logger):
-    """Run AppleScript export if album exists."""
-    logger.info(f"Smart Album '{album_name}' found. Starting export...")
-    try:
-        applescript_path = os.path.join(os.path.dirname(__file__), "export_photos_applescript.scpt")
-        subprocess.run([
-            "osascript",
-            applescript_path,
-            album_name
-        ], check=True)
-        logger.info("✅ AppleScript export completed successfully.")
-    except subprocess.CalledProcessError as e:
-        logger.error(f"❌ AppleScript export failed: {e}")
-        sys.exit(1)
+        SELECT COUNT(*) FROM assets WHERE month = ?
+    ''', (month,))
+    count = cursor.fetchone()[0]
+    return count
 
 def main_process(logger, month=None, dry_run=False):
-    """Main logic to verify if a Smart Album exists."""
+    """Main logic to verify assets exist for a batch before export."""
     logger.info("Connecting to Media Organizer DB...")
 
     if not month:
@@ -51,20 +34,20 @@ def main_process(logger, month=None, dry_run=False):
     conn = get_connection()
     cursor = get_cursor()
 
-    logger.info(f"Next batch is for {month}. Checking Smart Album...")
+    logger.info(f"Next batch is for {month}. Verifying assets in DB...")
 
-    if check_smart_album_exists(cursor, month):
-        logger.info(f"✅ Smart Album '{month}' exists in Media Organizer DB.")
+    count = check_batch_assets_exist(cursor, month)
+    if count > 0:
+        logger.info(f"✅ Verified {count} assets exist in Media Organizer DB for batch '{month}'. Ready for direct export.")
 
         if dry_run:
             logger.info("Dry run enabled.")
         else:
-            logger.info("Smart Album verified. No export performed in this step.")
+            logger.info("Batch assets verified. Ready for direct file export.")
 
-        # set_batch_status(cursor, month, '100')
         conn.commit()
     else:
-        logger.error(f"❌ Smart Album '{month}' does not exist in the synced database. Please ensure it is created manually in Apple Photos inside 'Media Organizer on LaCie > Google Photos Pipeline > MonthlyExports'. If it already exists, re-run the pipeline planner to refresh the database.")
+        logger.error(f"❌ No assets found in Media Organizer DB for month '{month}'.")
         sys.exit(1)  # Block further processing
 
     conn.close()

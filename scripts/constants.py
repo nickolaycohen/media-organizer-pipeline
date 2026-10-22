@@ -26,6 +26,8 @@ TO_BE_CURATED_DIR = '/Volumes/LaCie/Media Organizer/ToBeCurated/'
 CURATED_LACIE_DIR = '/Volumes/LaCie/Media Organizer/Curated/'
 MOMENTS_EXPORT_DIR = TO_BE_CURATED_DIR
 DEFAULT_MEDIA_PREPROCESSING_DIR = '/Volumes/LaCie/Storage/Priority 4/Media Preprocessing'
+TRIAGE_INTAKE_FOLDER_NAME = 'TriageMediaIntake'
+TRIAGE_DESTINATION_ROOT = os.path.join(DEFAULT_MEDIA_PREPROCESSING_DIR, TRIAGE_INTAKE_FOLDER_NAME)
 
 APPLE_PHOTOS_DB_COPY_PATH = "/Volumes/Macintosh HD/Users/nickolaycohen/Photos Library DB/All-Media-Extreme/database/Photos.sqlite"
 APPLE_PHOTOS_DB_MARKER = APPLE_PHOTOS_DB_COPY_PATH + ".lastcopy"

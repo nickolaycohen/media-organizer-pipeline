@@ -14,7 +14,9 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from constants import (
     MEDIA_ORGANIZER_DB_PATH,
     TRIAGE_LOG_PATH,
-    DEFAULT_MEDIA_PREPROCESSING_DIR
+    DEFAULT_MEDIA_PREPROCESSING_DIR,
+    TRIAGE_INTAKE_FOLDER_NAME,
+    TRIAGE_DESTINATION_ROOT
 )
 from utils.logger import setup_logger
 from utils.finder_tags import apply_finder_tag
@@ -52,6 +54,81 @@ TRIAGE_FOLDER_TAGS = {
     "New": "Green"
 }
 
+def ensure_triage_tables(conn):
+    """Ensures triage_sessions and triage_session_assets tables exist in the DB."""
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS triage_sessions (
+            id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+            triage_id                   TEXT UNIQUE NOT NULL,
+            source_directory            TEXT NOT NULL,
+            destination_directory       TEXT NOT NULL,
+            status                      TEXT NOT NULL DEFAULT 'running',
+            total_files_scanned         INTEGER DEFAULT 0,
+            duplicates_count            INTEGER DEFAULT 0,
+            duplicates_bytes            INTEGER DEFAULT 0,
+            compressed_duplicates_count INTEGER DEFAULT 0,
+            compressed_duplicates_bytes INTEGER DEFAULT 0,
+            review_similar_count        INTEGER DEFAULT 0,
+            review_similar_bytes        INTEGER DEFAULT 0,
+            upgrade_candidates_count    INTEGER DEFAULT 0,
+            upgrade_candidates_bytes    INTEGER DEFAULT 0,
+            discard_sim_count           INTEGER DEFAULT 0,
+            discard_sim_bytes           INTEGER DEFAULT 0,
+            web_artifact_count          INTEGER DEFAULT 0,
+            web_artifact_bytes          INTEGER DEFAULT 0,
+            new_count                   INTEGER DEFAULT 0,
+            new_bytes                   INTEGER DEFAULT 0,
+            dry_run                     INTEGER DEFAULT 0,
+            started_at_utc              TEXT DEFAULT (datetime('now')),
+            completed_at_utc            TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS triage_session_assets (
+            id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+            triage_session_id           INTEGER NOT NULL REFERENCES triage_sessions(id),
+            triage_id                   TEXT NOT NULL,
+            original_rel_path           TEXT NOT NULL,
+            filename                    TEXT NOT NULL,
+            file_size_bytes             INTEGER NOT NULL,
+            category                    TEXT NOT NULL,
+            sub_type                    TEXT,
+            decision_reason             TEXT,
+            destination_path            TEXT,
+            created_at_utc              TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    conn.commit()
+
+def determine_triage_id(db_path, dest_root_dir, requested_id=None):
+    """
+    Determines the triage session ID.
+    If requested_id is provided, uses it.
+    Otherwise queries MAX(id) from DB and avoids collisions with existing folders on disk.
+    """
+    if requested_id:
+        return str(requested_id).strip()
+
+    next_num = 1
+    try:
+        conn = sqlite3.connect(db_path)
+        ensure_triage_tables(conn)
+        c = conn.cursor()
+        c.execute("SELECT COALESCE(MAX(id), 0) FROM triage_sessions")
+        row = c.fetchone()
+        if row and row[0]:
+            next_num = row[0] + 1
+        conn.close()
+    except Exception as e:
+        logger.warning(f"Could not determine next triage_id from DB: {e}")
+
+    # Ensure no folder collision on disk
+    while os.path.exists(os.path.join(dest_root_dir, str(next_num))):
+        next_num += 1
+
+    return str(next_num)
+
 def tag_triage_folders(target_dir):
     """
     Applies standard macOS Finder color tags to triage folders if they exist:
@@ -59,15 +136,34 @@ def tag_triage_folders(target_dir):
       - Review-Similar/                  -> Yellow (Index 3)
       - Review-Similar/Upgrade-Candidates -> Orange (Index 1)
       - New/                             -> Green (Index 6)
+    Supports tagging a single session folder or recursively checking session folders.
     """
     target_dir = os.path.abspath(target_dir)
     results = {}
+
+    # Check direct triage folders inside target_dir
+    found_direct = False
     for sub_rel, color in TRIAGE_FOLDER_TAGS.items():
         folder_path = os.path.join(target_dir, sub_rel)
         if os.path.exists(folder_path):
+            found_direct = True
             ok = apply_finder_tag(folder_path, color)
             results[sub_rel] = (color, ok)
             logger.info(f"🏷️  Tagged '{sub_rel}' as {color} in Finder.")
+
+    # If no direct triage folders found, check if target_dir contains session subfolders (e.g. TriageMediaIntake/1, 2)
+    if not found_direct and os.path.exists(target_dir):
+        for entry in sorted(os.listdir(target_dir)):
+            sub_entry = os.path.join(target_dir, entry)
+            if os.path.isdir(sub_entry) and not entry.startswith('.'):
+                for sub_rel, color in TRIAGE_FOLDER_TAGS.items():
+                    folder_path = os.path.join(sub_entry, sub_rel)
+                    if os.path.exists(folder_path):
+                        key = f"{entry}/{sub_rel}"
+                        ok = apply_finder_tag(folder_path, color)
+                        results[key] = (color, ok)
+                        logger.info(f"🏷️  Tagged '{key}' as {color} in Finder.")
+
     return results
 
 def format_size(bytes_val):
@@ -362,299 +458,448 @@ def clean_empty_directories(root_dir, protected_subdirs):
         except Exception as e:
             logger.debug(f"Could not remove directory {current_root}: {e}")
 
-def triage_intake_folder(target_dir, dry_run=False, clean_empty=True):
+def triage_intake_folder(target_dir, dest_root_dir=None, triage_id=None, dry_run=False, clean_empty=True):
     target_dir = os.path.abspath(target_dir)
-    logger.info(f"🚀 Starting Media Intake Triage for: {target_dir}")
+    dest_root_dir = os.path.abspath(dest_root_dir or TRIAGE_DESTINATION_ROOT)
+
+    triage_id = determine_triage_id(MEDIA_ORGANIZER_DB_PATH, dest_root_dir, requested_id=triage_id)
+
+    # Attach triage_id to the logger so all logs contain [Triage ID: <triage_id>]
+    setup_logger(TRIAGE_LOG_PATH, MODULE_TAG, extra_fields={"triage_id": triage_id})
+
+    session_dest_dir = os.path.join(dest_root_dir, triage_id)
+    duplicates_dir = os.path.join(session_dest_dir, "Duplicates")
+    review_dir = os.path.join(session_dest_dir, "Review-Similar")
+    new_dir = os.path.join(session_dest_dir, "New")
+
+    logger.info(f"🚀 Starting Media Intake Triage [Triage ID: {triage_id}]")
+    logger.info(f"   - Source Directory:      {target_dir}")
+    logger.info(f"   - Destination Directory: {session_dest_dir}")
     if dry_run:
-        logger.info("🔎 DRY RUN MODE: No files will be moved.")
+        logger.info("🔎 DRY RUN MODE: No files will be moved and DB will not be modified.")
 
     if not os.path.exists(target_dir):
         logger.error(f"❌ Target intake directory does not exist: {target_dir}")
         return
 
-    duplicates_dir = os.path.join(target_dir, "Duplicates")
-    review_dir = os.path.join(target_dir, "Review-Similar")
-    new_dir = os.path.join(target_dir, "New")
+    # Record session in DB as running
+    db_conn = None
+    db_session_pk = None
+    if not dry_run:
+        try:
+            db_conn = sqlite3.connect(MEDIA_ORGANIZER_DB_PATH)
+            ensure_triage_tables(db_conn)
+            cur = db_conn.cursor()
+            cur.execute("""
+                INSERT INTO triage_sessions (
+                    triage_id, source_directory, destination_directory, status, dry_run, started_at_utc
+                ) VALUES (?, ?, ?, 'running', 0, datetime('now'))
+            """, (triage_id, target_dir, session_dest_dir))
+            db_session_pk = cur.lastrowid
+            db_conn.commit()
+        except Exception as e:
+            logger.error(f"Failed to record triage session in DB: {e}")
 
-    # Load All-Media library catalog
-    index = LibraryIndex(MEDIA_ORGANIZER_DB_PATH)
-    index.load()
+    try:
+        # Load All-Media library catalog
+        index = LibraryIndex(MEDIA_ORGANIZER_DB_PATH)
+        index.load()
 
-    # Step 1: Discover all media files outside Duplicates/, Review-Similar/, and New/
-    candidate_files = []
-    ignored_special = {
-        "duplicates", "review-similar", "new",
-        ".ds_store", "thumbs.db", "$recycle.bin", ".spotlight-v100", ".trashes"
-    }
+        # Step 1: Discover all media files outside destination directories and special folders
+        candidate_files = []
+        ignored_special = {
+            "duplicates", "review-similar", "new", "triagemediaintake",
+            ".ds_store", "thumbs.db", "$recycle.bin", ".spotlight-v100", ".trashes"
+        }
 
-    for root, dirs, files in os.walk(target_dir):
-        rel_root = os.path.relpath(root, target_dir)
-        first_segment = rel_root.split(os.sep)[0].lower() if rel_root != '.' else ''
+        dest_root_abs = os.path.abspath(dest_root_dir)
 
-        if first_segment in ["duplicates", "review-similar", "new"]:
-            continue
-
-        for f in sorted(files):
-            if f.startswith('.') or f.lower() in ignored_special:
+        for root, dirs, files in os.walk(target_dir):
+            root_abs = os.path.abspath(root)
+            # Never scan inside destination root or any session directories
+            if root_abs == dest_root_abs or root_abs.startswith(dest_root_abs + os.sep):
                 continue
-            ext = os.path.splitext(f)[1].lower()
-            if ext not in MEDIA_EXTENSIONS:
+
+            rel_root = os.path.relpath(root, target_dir)
+            first_segment = rel_root.split(os.sep)[0].lower() if rel_root != '.' else ''
+
+            if first_segment in ignored_special:
                 continue
 
-            full_p = os.path.join(root, f)
-            rel_p = os.path.relpath(full_p, target_dir)
-            try:
-                sz = os.path.getsize(full_p)
-                candidate_files.append((full_p, rel_p, f, sz))
-            except OSError as e:
-                logger.warning(f"Could not stat {full_p}: {e}")
+            for f in sorted(files):
+                if f.startswith('.') or f.lower() in ignored_special:
+                    continue
+                ext = os.path.splitext(f)[1].lower()
+                if ext not in MEDIA_EXTENSIONS:
+                    continue
 
-    logger.info(f"📂 Found {len(candidate_files):,} candidate media files in intake directory.")
+                full_p = os.path.join(root, f)
+                rel_p = os.path.relpath(full_p, target_dir)
+                try:
+                    sz = os.path.getsize(full_p)
+                    candidate_files.append((full_p, rel_p, f, sz))
+                except OSError as e:
+                    logger.warning(f"Could not stat {full_p}: {e}")
 
-    if not candidate_files:
-        logger.info("✨ No media files found in intake directory to triage.")
-        return
+        logger.info(f"📂 Found {len(candidate_files):,} candidate media files in intake directory.")
 
-    # Step 2: Live Photo companion grouping
-    # Group by directory and base stem (e.g. ('photos/vacation', 'IMG_0001'))
-    grouped_by_stem = {}
-    for full_p, rel_p, f, sz in candidate_files:
-        dirname = os.path.dirname(rel_p)
-        stem, ext = os.path.splitext(f)
-        key = (dirname, stem.lower())
-        if key not in grouped_by_stem:
-            grouped_by_stem[key] = []
-        grouped_by_stem[key].append((full_p, rel_p, f, sz, ext.lower()))
+        if not candidate_files:
+            logger.info("✨ No media files found in intake directory to triage.")
+            if db_conn and db_session_pk:
+                cur = db_conn.cursor()
+                cur.execute("UPDATE triage_sessions SET status = 'completed', completed_at_utc = datetime('now') WHERE id = ?", (db_session_pk,))
+                db_conn.commit()
+                db_conn.close()
+            return
 
-    # Step 3: Evaluate and Triage into 3 Categories
-    duplicates_list = []
-    review_list = []
-    new_list = []
+        # Step 2: Live Photo companion grouping
+        grouped_by_stem = {}
+        for full_p, rel_p, f, sz in candidate_files:
+            dirname = os.path.dirname(rel_p)
+            stem, ext = os.path.splitext(f)
+            key = (dirname, stem.lower())
+            if key not in grouped_by_stem:
+                grouped_by_stem[key] = []
+            grouped_by_stem[key].append((full_p, rel_p, f, sz, ext.lower()))
 
-    # Sub-breakdowns for reporting
-    identical_dup_count = 0
-    identical_dup_bytes = 0
-    compressed_dup_count = 0
-    compressed_dup_bytes = 0
+        # Step 3: Evaluate and Triage into 3 Categories
+        duplicates_list = []
+        review_list = []
+        new_list = []
 
-    upgrade_count = 0
-    upgrade_bytes = 0
-    discard_sim_count = 0
-    discard_sim_bytes = 0
-    web_artifact_count = 0
-    web_artifact_bytes = 0
+        # Sub-breakdowns for reporting
+        identical_dup_count = 0
+        identical_dup_bytes = 0
+        compressed_dup_count = 0
+        compressed_dup_bytes = 0
 
-    total_dup_bytes = 0
-    total_review_bytes = 0
-    total_new_bytes = 0
+        upgrade_count = 0
+        upgrade_bytes = 0
+        discard_sim_count = 0
+        discard_sim_bytes = 0
+        web_artifact_count = 0
+        web_artifact_bytes = 0
 
-    for (dirname, stem_lower), file_group in grouped_by_stem.items():
-        primary_candidates = [item for item in file_group if item[4] not in ('.mov', '.mp4')]
-        video_candidates = [item for item in file_group if item[4] in ('.mov', '.mp4')]
+        total_dup_bytes = 0
+        total_review_bytes = 0
+        total_new_bytes = 0
 
-        if primary_candidates:
-            p_full, p_rel, p_f, p_sz, p_ext = primary_candidates[0]
-            cat, sub_type, reason, matched = index.evaluate_asset(p_full, p_rel, p_sz, p_f)
+        for (dirname, stem_lower), file_group in grouped_by_stem.items():
+            primary_candidates = [item for item in file_group if item[4] not in ('.mov', '.mp4')]
+            video_candidates = [item for item in file_group if item[4] in ('.mov', '.mp4')]
 
-            if cat == "duplicate":
-                if sub_type == "compressed":
-                    compressed_dup_count += len(file_group)
-                    compressed_dup_bytes += sum(it[3] for it in file_group)
-                else:
-                    identical_dup_count += len(file_group)
-                    identical_dup_bytes += sum(it[3] for it in file_group)
-
-                for item in primary_candidates:
-                    duplicates_list.append((item[0], item[1], item[2], item[3], reason))
-                    total_dup_bytes += item[3]
-                for v_item in video_candidates:
-                    v_reason = f"Companion Live Photo video to duplicate {p_f} ({reason})"
-                    duplicates_list.append((v_item[0], v_item[1], v_item[2], v_item[3], v_reason))
-                    total_dup_bytes += v_item[3]
-
-            elif cat == "review_similar":
-                if sub_type == "upgrade_candidate":
-                    upgrade_count += len(file_group)
-                    upgrade_bytes += sum(it[3] for it in file_group)
-                elif sub_type == "web_artifact":
-                    web_artifact_count += len(file_group)
-                    web_artifact_bytes += sum(it[3] for it in file_group)
-                else:
-                    discard_sim_count += len(file_group)
-                    discard_sim_bytes += sum(it[3] for it in file_group)
-
-                for item in primary_candidates:
-                    review_list.append((item[0], item[1], item[2], item[3], reason, sub_type))
-                    total_review_bytes += item[3]
-                for v_item in video_candidates:
-                    v_reason = f"Companion Live Photo video to review-similar asset {p_f} ({reason})"
-                    review_list.append((v_item[0], v_item[1], v_item[2], v_item[3], v_reason, sub_type))
-                    total_review_bytes += v_item[3]
-
-            else:
-                for item in primary_candidates:
-                    new_list.append((item[0], item[1], item[2], item[3], reason))
-                    total_new_bytes += item[3]
-                for v_item in video_candidates:
-                    v_reason = f"Companion Live Photo video to new asset {p_f}"
-                    new_list.append((v_item[0], v_item[1], v_item[2], v_item[3], v_reason))
-                    total_new_bytes += v_item[3]
-
-        else:
-            # Standalone videos
-            for v_item in video_candidates:
-                v_full, v_rel, v_f, v_sz, v_ext = v_item
-                cat, sub_type, reason, matched = index.evaluate_asset(v_full, v_rel, v_sz, v_f)
+            if primary_candidates:
+                p_full, p_rel, p_f, p_sz, p_ext = primary_candidates[0]
+                cat, sub_type, reason, matched = index.evaluate_asset(p_full, p_rel, p_sz, p_f)
 
                 if cat == "duplicate":
                     if sub_type == "compressed":
-                        compressed_dup_count += 1
-                        compressed_dup_bytes += v_sz
+                        compressed_dup_count += len(file_group)
+                        compressed_dup_bytes += sum(it[3] for it in file_group)
                     else:
-                        identical_dup_count += 1
-                        identical_dup_bytes += v_sz
-                    duplicates_list.append((v_full, v_rel, v_f, v_sz, reason))
-                    total_dup_bytes += v_sz
+                        identical_dup_count += len(file_group)
+                        identical_dup_bytes += sum(it[3] for it in file_group)
+
+                    for item in primary_candidates:
+                        duplicates_list.append((item[0], item[1], item[2], item[3], reason))
+                        total_dup_bytes += item[3]
+                    for v_item in video_candidates:
+                        v_reason = f"Companion Live Photo video to duplicate {p_f} ({reason})"
+                        duplicates_list.append((v_item[0], v_item[1], v_item[2], v_item[3], v_reason))
+                        total_dup_bytes += v_item[3]
+
                 elif cat == "review_similar":
                     if sub_type == "upgrade_candidate":
-                        upgrade_count += 1
-                        upgrade_bytes += v_sz
+                        upgrade_count += len(file_group)
+                        upgrade_bytes += sum(it[3] for it in file_group)
                     elif sub_type == "web_artifact":
-                        web_artifact_count += 1
-                        web_artifact_bytes += v_sz
+                        web_artifact_count += len(file_group)
+                        web_artifact_bytes += sum(it[3] for it in file_group)
                     else:
-                        discard_sim_count += 1
-                        discard_sim_bytes += v_sz
-                    review_list.append((v_full, v_rel, v_f, v_sz, reason, sub_type))
-                    total_review_bytes += v_sz
+                        discard_sim_count += len(file_group)
+                        discard_sim_bytes += sum(it[3] for it in file_group)
+
+                    for item in primary_candidates:
+                        review_list.append((item[0], item[1], item[2], item[3], reason, sub_type))
+                        total_review_bytes += item[3]
+                    for v_item in video_candidates:
+                        v_reason = f"Companion Live Photo video to review-similar asset {p_f} ({reason})"
+                        review_list.append((v_item[0], v_item[1], v_item[2], v_item[3], v_reason, sub_type))
+                        total_review_bytes += v_item[3]
+
                 else:
-                    new_list.append((v_full, v_rel, v_f, v_sz, reason))
-                    total_new_bytes += v_sz
+                    for item in primary_candidates:
+                        new_list.append((item[0], item[1], item[2], item[3], reason))
+                        total_new_bytes += item[3]
+                    for v_item in video_candidates:
+                        v_reason = f"Companion Live Photo video to new asset {p_f}"
+                        new_list.append((v_item[0], v_item[1], v_item[2], v_item[3], v_reason))
+                        total_new_bytes += v_item[3]
 
-    # Step 4: Summary Output & Detailed Logging
-    print("\n" + "=" * 78)
-    print("📊 MEDIA INTAKE 3-WAY TRIAGE SUMMARY (Quality & Size Aware)")
-    print("=" * 78)
-    print(f"Target Directory:    {target_dir}")
-    print(f"Total Files Scanned: {len(candidate_files):,}")
-    print("-" * 78)
-    print(f"1. Duplicates Total:                                {len(duplicates_list):>5,} assets ({format_size(total_dup_bytes):>10})")
-    print(f"   - Identical Matches:                             {identical_dup_count:>5,} assets ({format_size(identical_dup_bytes):>10})")
-    print(f"   - Compressed Copies (Library is Superior):      {compressed_dup_count:>5,} assets ({format_size(compressed_dup_bytes):>10})")
-    print("-" * 78)
-    print(f"2. Review-Similar Total:                            {len(review_list):>5,} assets ({format_size(total_review_bytes):>10})")
-    print(f"   - 🌟 Upgrade Candidates (Intake is Better):      {upgrade_count:>5,} assets ({format_size(upgrade_bytes):>10})")
-    print(f"   - Suspected Discard / Burst Siblings:           {discard_sim_count:>5,} assets ({format_size(discard_sim_bytes):>10})")
-    print(f"   - Web / UI Graphic Artifacts (<50KB):           {web_artifact_count:>5,} assets ({format_size(web_artifact_bytes):>10})")
-    print("-" * 78)
-    print(f"3. New (High-Confidence Clean Assets):              {len(new_list):>5,} assets ({format_size(total_new_bytes):>10})")
-    print("=" * 78 + "\n")
+            else:
+                # Standalone videos
+                for v_item in video_candidates:
+                    v_full, v_rel, v_f, v_sz, v_ext = v_item
+                    cat, sub_type, reason, matched = index.evaluate_asset(v_full, v_rel, v_sz, v_f)
 
-    logger.info(f"Triage result: {len(duplicates_list):,} Duplicates ({format_size(total_dup_bytes)}), {len(review_list):,} Review-Similar ({format_size(total_review_bytes)}), {len(new_list):,} New ({format_size(total_new_bytes)})")
+                    if cat == "duplicate":
+                        if sub_type == "compressed":
+                            compressed_dup_count += 1
+                            compressed_dup_bytes += v_sz
+                        else:
+                            identical_dup_count += 1
+                            identical_dup_bytes += v_sz
+                        duplicates_list.append((v_full, v_rel, v_f, v_sz, reason))
+                        total_dup_bytes += v_sz
+                    elif cat == "review_similar":
+                        if sub_type == "upgrade_candidate":
+                            upgrade_count += 1
+                            upgrade_bytes += v_sz
+                        elif sub_type == "web_artifact":
+                            web_artifact_count += 1
+                            web_artifact_bytes += v_sz
+                        else:
+                            discard_sim_count += 1
+                            discard_sim_bytes += v_sz
+                        review_list.append((v_full, v_rel, v_f, v_sz, reason, sub_type))
+                        total_review_bytes += v_sz
+                    else:
+                        new_list.append((v_full, v_rel, v_f, v_sz, reason))
+                        total_new_bytes += v_sz
 
-    # Log individual files
-    for src_full, rel_p, fname, sz, reason in duplicates_list:
-        logger.info(f"  [DUPLICATE]      {rel_p} ({format_size(sz)}) -> Duplicates/{rel_p} | Reason: {reason}")
-    for item in review_list:
-        src_full, rel_p, fname, sz, reason, sub_type = item
-        sub_folder = "Review-Similar/Upgrade-Candidates" if sub_type == "upgrade_candidate" else "Review-Similar"
-        logger.info(f"  [REVIEW-SIMILAR] {rel_p} ({format_size(sz)}) -> {sub_folder}/{rel_p} | Reason: {reason}")
-    for src_full, rel_p, fname, sz, reason in new_list:
-        logger.info(f"  [NEW]            {rel_p} ({format_size(sz)}) -> New/{rel_p} | Reason: {reason}")
+        # Step 4: Summary Output & Detailed Logging
+        print("\n" + "=" * 78)
+        print(f"📊 MEDIA INTAKE 3-WAY TRIAGE SUMMARY [Triage ID: {triage_id}]")
+        print("=" * 78)
+        print(f"Source Directory:      {target_dir}")
+        print(f"Destination Session:   {session_dest_dir}")
+        print(f"Total Files Scanned:   {len(candidate_files):,}")
+        print("-" * 78)
+        print(f"1. Duplicates Total:                                {len(duplicates_list):>5,} assets ({format_size(total_dup_bytes):>10})")
+        print(f"   - Identical Matches:                             {identical_dup_count:>5,} assets ({format_size(identical_dup_bytes):>10})")
+        print(f"   - Compressed Copies (Library is Superior):      {compressed_dup_count:>5,} assets ({format_size(compressed_dup_bytes):>10})")
+        print("-" * 78)
+        print(f"2. Review-Similar Total:                            {len(review_list):>5,} assets ({format_size(total_review_bytes):>10})")
+        print(f"   - 🌟 Upgrade Candidates (Intake is Better):      {upgrade_count:>5,} assets ({format_size(upgrade_bytes):>10})")
+        print(f"   - Suspected Discard / Burst Siblings:           {discard_sim_count:>5,} assets ({format_size(discard_sim_bytes):>10})")
+        print(f"   - Web / UI Graphic Artifacts (<50KB):           {web_artifact_count:>5,} assets ({format_size(web_artifact_bytes):>10})")
+        print("-" * 78)
+        print(f"3. New (High-Confidence Clean Assets):              {len(new_list):>5,} assets ({format_size(total_new_bytes):>10})")
+        print("=" * 78 + "\n")
 
-    if dry_run:
-        print(f"🔍 [DRY RUN] Would move:")
-        print(f"   - {len(duplicates_list):,} duplicates to 'Duplicates/'")
-        if upgrade_count > 0:
-            print(f"   - {upgrade_count:,} upgrade candidates to 'Review-Similar/Upgrade-Candidates/'")
-        print(f"   - {len(review_list) - upgrade_count:,} review items to 'Review-Similar/'")
-        print(f"   - {len(new_list):,} clean new assets to 'New/'")
-        print(f"🏷️  [DRY RUN] Would apply macOS Finder color tags:")
-        print(f"   - 'Duplicates/'                     -> Red 🔴")
-        print(f"   - 'Review-Similar/'                -> Yellow 🟡")
-        if upgrade_count > 0:
-            print(f"   - 'Review-Similar/Upgrade-Candidates/' -> Orange 🟠")
-        print(f"   - 'New/'                           -> Green 🟢")
-        print(f"📝 Logs written to: {TRIAGE_LOG_PATH}")
-        return
+        logger.info(f"Triage result: {len(duplicates_list):,} Duplicates ({format_size(total_dup_bytes)}), {len(review_list):,} Review-Similar ({format_size(total_review_bytes)}), {len(new_list):,} New ({format_size(total_new_bytes)})")
 
-    # Step 5: Moving files
-    logger.info("🚚 Moving triaged files into destination folders...")
-    moved_duplicates = 0
-    moved_review = 0
-    moved_new = 0
+        # Log individual files
+        for src_full, rel_p, fname, sz, reason in duplicates_list:
+            logger.info(f"  [DUPLICATE]      {rel_p} ({format_size(sz)}) -> {session_dest_dir}/Duplicates/{rel_p} | Reason: {reason}")
+        for item in review_list:
+            src_full, rel_p, fname, sz, reason, sub_type = item
+            sub_folder = "Review-Similar/Upgrade-Candidates" if sub_type == "upgrade_candidate" else "Review-Similar"
+            logger.info(f"  [REVIEW-SIMILAR] {rel_p} ({format_size(sz)}) -> {session_dest_dir}/{sub_folder}/{rel_p} | Reason: {reason}")
+        for src_full, rel_p, fname, sz, reason in new_list:
+            logger.info(f"  [NEW]            {rel_p} ({format_size(sz)}) -> {session_dest_dir}/New/{rel_p} | Reason: {reason}")
 
-    for src_full, rel_p, fname, sz, reason in duplicates_list:
-        dest_full = os.path.join(duplicates_dir, rel_p)
-        try:
-            safe_move(src_full, dest_full)
-            moved_duplicates += 1
-        except Exception as e:
-            logger.error(f"❌ Failed to move {src_full} to {dest_full}: {e}")
+        if dry_run:
+            print(f"🔍 [DRY RUN] Triage ID: {triage_id}")
+            print(f"   Destination Session: {session_dest_dir}")
+            print(f"   Would move:")
+            print(f"   - {len(duplicates_list):,} duplicates to '{duplicates_dir}/'")
+            if upgrade_count > 0:
+                print(f"   - {upgrade_count:,} upgrade candidates to '{review_dir}/Upgrade-Candidates/'")
+            print(f"   - {len(review_list) - upgrade_count:,} review items to '{review_dir}/'")
+            print(f"   - {len(new_list):,} clean new assets to '{new_dir}/'")
+            print(f"🏷️  [DRY RUN] Would apply macOS Finder color tags:")
+            print(f"   - '{duplicates_dir}'                     -> Red 🔴")
+            print(f"   - '{review_dir}'                -> Yellow 🟡")
+            if upgrade_count > 0:
+                print(f"   - '{review_dir}/Upgrade-Candidates' -> Orange 🟠")
+            print(f"   - '{new_dir}'                           -> Green 🟢")
+            print(f"📝 Logs appended to: {TRIAGE_LOG_PATH}")
+            return
 
-    for item in review_list:
-        src_full, rel_p, fname, sz, reason, sub_type = item
-        if sub_type == "upgrade_candidate":
-            dest_full = os.path.join(review_dir, "Upgrade-Candidates", rel_p)
-        else:
-            dest_full = os.path.join(review_dir, rel_p)
-        try:
-            safe_move(src_full, dest_full)
-            moved_review += 1
-        except Exception as e:
-            logger.error(f"❌ Failed to move {src_full} to {dest_full}: {e}")
+        # Step 5: Moving files
+        logger.info(f"🚚 Moving triaged files into destination session: {session_dest_dir} ...")
+        os.makedirs(session_dest_dir, exist_ok=True)
+        moved_duplicates = 0
+        moved_review = 0
+        moved_new = 0
 
-    for src_full, rel_p, fname, sz, reason in new_list:
-        dest_full = os.path.join(new_dir, rel_p)
-        try:
-            safe_move(src_full, dest_full)
-            moved_new += 1
-        except Exception as e:
-            logger.error(f"❌ Failed to move {src_full} to {dest_full}: {e}")
+        for src_full, rel_p, fname, sz, reason in duplicates_list:
+            dest_full = os.path.join(duplicates_dir, rel_p)
+            try:
+                safe_move(src_full, dest_full)
+                moved_duplicates += 1
+            except Exception as e:
+                logger.error(f"❌ Failed to move {src_full} to {dest_full}: {e}")
 
-    logger.info(f"✅ Moved {moved_duplicates:,} duplicates to {duplicates_dir}")
-    logger.info(f"✅ Moved {moved_review:,} review assets to {review_dir}")
-    logger.info(f"✅ Moved {moved_new:,} new assets to {new_dir}")
+        for item in review_list:
+            src_full, rel_p, fname, sz, reason, sub_type = item
+            if sub_type == "upgrade_candidate":
+                dest_full = os.path.join(review_dir, "Upgrade-Candidates", rel_p)
+            else:
+                dest_full = os.path.join(review_dir, rel_p)
+            try:
+                safe_move(src_full, dest_full)
+                moved_review += 1
+            except Exception as e:
+                logger.error(f"❌ Failed to move {src_full} to {dest_full}: {e}")
 
-    # Step 6: Clean empty directories left behind
-    if clean_empty:
-        logger.info("🧹 Cleaning empty source directories...")
-        clean_empty_directories(target_dir, protected_subdirs=[duplicates_dir, review_dir, new_dir])
+        for src_full, rel_p, fname, sz, reason in new_list:
+            dest_full = os.path.join(new_dir, rel_p)
+            try:
+                safe_move(src_full, dest_full)
+                moved_new += 1
+            except Exception as e:
+                logger.error(f"❌ Failed to move {src_full} to {dest_full}: {e}")
 
-    # Step 7: Apply macOS Finder color tags
-    logger.info("🏷️  Applying macOS Finder color tags to triage directories...")
-    tag_results = tag_triage_folders(target_dir)
+        logger.info(f"✅ Moved {moved_duplicates:,} duplicates to {duplicates_dir}")
+        logger.info(f"✅ Moved {moved_review:,} review assets to {review_dir}")
+        logger.info(f"✅ Moved {moved_new:,} new assets to {new_dir}")
 
-    print(f"✅ Triage Complete!")
-    print(f"   - {moved_duplicates:,} duplicates moved to 'Duplicates/'")
-    print(f"   - {moved_review:,} review assets moved to 'Review-Similar/'")
-    print(f"   - {moved_new:,} clean assets moved to 'New/'")
-    if tag_results:
-        print(f"🏷️  Finder Color Tags Applied:")
-        for folder_rel, (color, ok) in tag_results.items():
-            icon = "🔴" if color == "Red" else "🟡" if color == "Yellow" else "🟠" if color == "Orange" else "🟢"
-            status = "✅" if ok else "⚠️"
-            print(f"   {status} {folder_rel:<35} -> {color} {icon}")
-    print(f"📝 Full audit log: {TRIAGE_LOG_PATH}\n")
+        # Step 6: Clean empty directories left behind
+        if clean_empty:
+            logger.info("🧹 Cleaning empty source directories...")
+            clean_empty_directories(
+                target_dir,
+                protected_subdirs=[dest_root_dir, session_dest_dir, duplicates_dir, review_dir, new_dir]
+            )
+
+        # Step 7: Apply macOS Finder color tags
+        logger.info(f"🏷️  Applying macOS Finder color tags to triage folders in {session_dest_dir}...")
+        tag_results = tag_triage_folders(session_dest_dir)
+
+        # Step 8: Update database records
+        if db_conn and db_session_pk:
+            try:
+                cur = db_conn.cursor()
+                cur.execute("""
+                    UPDATE triage_sessions SET
+                        status = 'completed',
+                        total_files_scanned = ?,
+                        duplicates_count = ?,
+                        duplicates_bytes = ?,
+                        compressed_duplicates_count = ?,
+                        compressed_duplicates_bytes = ?,
+                        review_similar_count = ?,
+                        review_similar_bytes = ?,
+                        upgrade_candidates_count = ?,
+                        upgrade_candidates_bytes = ?,
+                        discard_sim_count = ?,
+                        discard_sim_bytes = ?,
+                        web_artifact_count = ?,
+                        web_artifact_bytes = ?,
+                        new_count = ?,
+                        new_bytes = ?,
+                        completed_at_utc = datetime('now')
+                    WHERE id = ?
+                """, (
+                    len(candidate_files),
+                    moved_duplicates, total_dup_bytes,
+                    compressed_dup_count, compressed_dup_bytes,
+                    moved_review, total_review_bytes,
+                    upgrade_count, upgrade_bytes,
+                    discard_sim_count, discard_sim_bytes,
+                    web_artifact_count, web_artifact_bytes,
+                    moved_new, total_new_bytes,
+                    db_session_pk
+                ))
+
+                asset_rows = []
+                for src_full, rel_p, fname, sz, reason in duplicates_list:
+                    sub_t = "compressed" if "Compressed duplicate" in reason else "identical"
+                    dest_p = os.path.join(duplicates_dir, rel_p)
+                    asset_rows.append((db_session_pk, triage_id, rel_p, fname, sz, "duplicate", sub_t, reason, dest_p))
+                for item in review_list:
+                    src_full, rel_p, fname, sz, reason, sub_t = item
+                    sub_f = "Upgrade-Candidates" if sub_t == "upgrade_candidate" else ""
+                    dest_p = os.path.join(review_dir, sub_f, rel_p) if sub_f else os.path.join(review_dir, rel_p)
+                    asset_rows.append((db_session_pk, triage_id, rel_p, fname, sz, "review_similar", sub_t, reason, dest_p))
+                for src_full, rel_p, fname, sz, reason in new_list:
+                    dest_p = os.path.join(new_dir, rel_p)
+                    asset_rows.append((db_session_pk, triage_id, rel_p, fname, sz, "new", "clean_media", reason, dest_p))
+
+                cur.executemany("""
+                    INSERT INTO triage_session_assets (
+                        triage_session_id, triage_id, original_rel_path, filename,
+                        file_size_bytes, category, sub_type, decision_reason, destination_path
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, asset_rows)
+                db_conn.commit()
+                logger.info(f"💾 Logged triage session '{triage_id}' and {len(asset_rows):,} asset movements in DB.")
+            except Exception as e:
+                logger.error(f"Failed to update triage session in DB: {e}")
+            finally:
+                db_conn.close()
+
+        print(f"✅ Triage Complete! [Triage ID: {triage_id}]")
+        print(f"   Destination Session: {session_dest_dir}")
+        print(f"   - {moved_duplicates:,} duplicates moved to '{duplicates_dir}/'")
+        print(f"   - {moved_review:,} review assets moved to '{review_dir}/'")
+        print(f"   - {moved_new:,} clean assets moved to '{new_dir}/'")
+        if tag_results:
+            print(f"🏷️  Finder Color Tags Applied:")
+            for folder_rel, (color, ok) in tag_results.items():
+                icon = "🔴" if color == "Red" else "🟡" if color == "Yellow" else "🟠" if color == "Orange" else "🟢"
+                status = "✅" if ok else "⚠️"
+                print(f"   {status} {folder_rel:<40} -> {color} {icon}")
+        print(f"📝 Full audit log: {TRIAGE_LOG_PATH}\n")
+
+    except Exception as e:
+        logger.error(f"❌ Triage session failed unexpectedly: {e}", exc_info=True)
+        if db_conn and db_session_pk:
+            try:
+                cur = db_conn.cursor()
+                cur.execute("UPDATE triage_sessions SET status = 'failed', completed_at_utc = datetime('now') WHERE id = ?", (db_session_pk,))
+                db_conn.commit()
+            except Exception:
+                pass
+            finally:
+                db_conn.close()
+        raise
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Triage media files in an intake folder into 'Duplicates', 'Review-Similar', and 'New' based on All-Media database with Quality & Size Comparison.")
-    parser.add_argument("target_dir", nargs="?", default=DEFAULT_MEDIA_PREPROCESSING_DIR, help=f"Directory to scan and triage (default: {DEFAULT_MEDIA_PREPROCESSING_DIR})")
-    parser.add_argument("--dry-run", action="store_true", help="Simulate the triage process without moving any files.")
-    parser.add_argument("--no-clean", action="store_true", help="Do not delete empty directories left behind in the intake folder.")
-    parser.add_argument("--tag-only", action="store_true", help="Apply macOS Finder color tags to existing triage folders without running triage scan.")
+    parser = argparse.ArgumentParser(
+        description="Triage media files from an intake folder into Duplicates, Review-Similar, and New folders under /Volumes/LaCie/Storage/Priority 4/Media Preprocessing/TriageMediaIntake/<triage_id>."
+    )
+    parser.add_argument("target_dir", nargs="?", default=DEFAULT_MEDIA_PREPROCESSING_DIR,
+                        help=f"Source intake directory to scan and triage (default: {DEFAULT_MEDIA_PREPROCESSING_DIR})")
+    parser.add_argument("--dest-dir", default=None,
+                        help=f"Base destination directory (default: {TRIAGE_DESTINATION_ROOT})")
+    parser.add_argument("--triage-id", default=None,
+                        help="Custom triage session ID (default: auto-increment integer ID from database)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Simulate the triage process without moving any files or modifying DB.")
+    parser.add_argument("--no-clean", action="store_true",
+                        help="Do not delete empty directories left behind in the intake folder.")
+    parser.add_argument("--tag-only", action="store_true",
+                        help="Apply macOS Finder color tags to existing triage folders without running triage scan.")
     return parser.parse_args()
 
 if __name__ == "__main__":
     args = parse_args()
     if args.tag_only:
-        print(f"🏷️  Applying macOS Finder tags to triage folders in: {args.target_dir}")
-        res = tag_triage_folders(args.target_dir)
+        dest_root = os.path.abspath(args.dest_dir or TRIAGE_DESTINATION_ROOT)
+        # If triage_id specified, tag that specific session folder
+        if args.triage_id:
+            tag_target = os.path.join(dest_root, str(args.triage_id))
+        elif os.path.exists(args.target_dir) and args.target_dir != DEFAULT_MEDIA_PREPROCESSING_DIR:
+            tag_target = args.target_dir
+        else:
+            tag_target = dest_root
+
+        print(f"🏷️  Applying macOS Finder tags to triage folders in: {tag_target}")
+        res = tag_triage_folders(tag_target)
         for folder_rel, (color, ok) in res.items():
             icon = "🔴" if color == "Red" else "🟡" if color == "Yellow" else "🟠" if color == "Orange" else "🟢"
             status = "✅" if ok else "⚠️"
-            print(f"   {status} {folder_rel:<35} -> {color} {icon}")
+            print(f"   {status} {folder_rel:<40} -> {color} {icon}")
         if not res:
             print("   ℹ️ No triage folders (Duplicates, Review-Similar, New) found to tag.")
     else:
-        triage_intake_folder(args.target_dir, dry_run=args.dry_run, clean_empty=not args.no_clean)
+        triage_intake_folder(
+            args.target_dir,
+            dest_root_dir=args.dest_dir,
+            triage_id=args.triage_id,
+            dry_run=args.dry_run,
+            clean_empty=not args.no_clean
+        )

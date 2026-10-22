@@ -28,6 +28,28 @@ An independent, time-based workflow for curating and publishing specific events/
 
 ---
 
+### 📥 Pre-Intake Triage Gateway (`triage_media_intake.py`)
+Acts as the intermediary between raw storage discovery (`drive-audit-cli` wizard) and Apple Photos ingestion (`All-Media.photoslibrary`).
+- **Scans**: An intake folder (defaults to `/Volumes/LaCie/Storage/Priority 4/Media Preprocessing`).
+- **Compares**: Compares every asset against all 212,000+ assets in `media_organizer.db` using exact byte size, original filename, and EXIF timestamp cascade, plus Live Photo companion pairing.
+- **Triages**: Moves assets preserving their relative subfolder structure into:
+  - `Duplicates/`: Assets already present in `All-Media.photoslibrary` (safe to archive or delete).
+  - `New/`: Assets NOT present in `All-Media.photoslibrary` (ready for clean Apple Photos import).
+- **Cleans**: Automatically prunes empty source directories so categorized assets bubble up cleanly.
+
+```bash
+# Preview triage without moving files
+python3 scripts/triage_media_intake.py --dry-run
+
+# Triage default folder (/Volumes/LaCie/Storage/Priority 4/Media Preprocessing)
+python3 scripts/triage_media_intake.py
+
+# Triage any custom intake directory
+python3 scripts/triage_media_intake.py "/path/to/intake/folder"
+```
+
+---
+
 ## 🛠️ Daily Workflow
 
 The pipeline is split into two phases: **Database Ingestion/Refresh** and **Interactive Planning & Execution**.

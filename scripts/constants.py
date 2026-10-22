@@ -14,6 +14,7 @@ BG_SERVICE_LOG_PATH = os.path.abspath(os.path.join(BASE_DIR, '../logs/bg_copy_db
 PUBLISHING_CANDIDATES_LOG_PATH = os.path.abspath(os.path.join(BASE_DIR, '../logs/publishing_candidates.log'))
 WEEKLY_MEMORY_LOG_PATH = PUBLISHING_CANDIDATES_LOG_PATH
 PUBLISHING_RECOMMENDATIONS_LOG_PATH = os.path.abspath(os.path.join(BASE_DIR, '../logs/publishing_recommendations.log'))
+TRIAGE_LOG_PATH = os.path.abspath(os.path.join(BASE_DIR, '../logs/triage_media_intake.log'))
 
 # Paths to the Apple Photos database and Media Organizer database
 # For safety - during DEV will use a copy of the All-Media DB 
@@ -24,6 +25,7 @@ CURATED_EXPORT_DIR = '/Volumes/LaCie/Media Organizer/Google Photos/02-AICurrateL
 TO_BE_CURATED_DIR = '/Volumes/LaCie/Media Organizer/ToBeCurated/'
 CURATED_LACIE_DIR = '/Volumes/LaCie/Media Organizer/Curated/'
 MOMENTS_EXPORT_DIR = TO_BE_CURATED_DIR
+DEFAULT_MEDIA_PREPROCESSING_DIR = '/Volumes/LaCie/Storage/Priority 4/Media Preprocessing'
 
 APPLE_PHOTOS_DB_COPY_PATH = "/Volumes/Macintosh HD/Users/nickolaycohen/Photos Library DB/All-Media-Extreme/database/Photos.sqlite"
 APPLE_PHOTOS_DB_MARKER = APPLE_PHOTOS_DB_COPY_PATH + ".lastcopy"

@@ -17,6 +17,7 @@ from constants import (
     DEFAULT_MEDIA_PREPROCESSING_DIR
 )
 from utils.logger import setup_logger
+from utils.finder_tags import apply_finder_tag
 
 try:
     import exifread
@@ -43,6 +44,31 @@ WEB_ARTIFACT_EXTS = {'.gif', '.png', '.ico', '.bmp', '.svg', '.webp'}
 WEB_ARTIFACT_MAX_SIZE = 50 * 1024  # 50 KB
 
 SEQ_REGEX = re.compile(r'^([a-zA-Z_-]+)(\d+)\.')
+
+TRIAGE_FOLDER_TAGS = {
+    "Duplicates": "Red",
+    "Review-Similar": "Yellow",
+    "Review-Similar/Upgrade-Candidates": "Orange",
+    "New": "Green"
+}
+
+def tag_triage_folders(target_dir):
+    """
+    Applies standard macOS Finder color tags to triage folders if they exist:
+      - Duplicates/                       -> Red (Index 2)
+      - Review-Similar/                  -> Yellow (Index 3)
+      - Review-Similar/Upgrade-Candidates -> Orange (Index 1)
+      - New/                             -> Green (Index 6)
+    """
+    target_dir = os.path.abspath(target_dir)
+    results = {}
+    for sub_rel, color in TRIAGE_FOLDER_TAGS.items():
+        folder_path = os.path.join(target_dir, sub_rel)
+        if os.path.exists(folder_path):
+            ok = apply_finder_tag(folder_path, color)
+            results[sub_rel] = (color, ok)
+            logger.info(f"🏷️  Tagged '{sub_rel}' as {color} in Finder.")
+    return results
 
 def format_size(bytes_val):
     for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
@@ -543,6 +569,12 @@ def triage_intake_folder(target_dir, dry_run=False, clean_empty=True):
             print(f"   - {upgrade_count:,} upgrade candidates to 'Review-Similar/Upgrade-Candidates/'")
         print(f"   - {len(review_list) - upgrade_count:,} review items to 'Review-Similar/'")
         print(f"   - {len(new_list):,} clean new assets to 'New/'")
+        print(f"🏷️  [DRY RUN] Would apply macOS Finder color tags:")
+        print(f"   - 'Duplicates/'                     -> Red 🔴")
+        print(f"   - 'Review-Similar/'                -> Yellow 🟡")
+        if upgrade_count > 0:
+            print(f"   - 'Review-Similar/Upgrade-Candidates/' -> Orange 🟠")
+        print(f"   - 'New/'                           -> Green 🟢")
         print(f"📝 Logs written to: {TRIAGE_LOG_PATH}")
         return
 
@@ -589,10 +621,20 @@ def triage_intake_folder(target_dir, dry_run=False, clean_empty=True):
         logger.info("🧹 Cleaning empty source directories...")
         clean_empty_directories(target_dir, protected_subdirs=[duplicates_dir, review_dir, new_dir])
 
+    # Step 7: Apply macOS Finder color tags
+    logger.info("🏷️  Applying macOS Finder color tags to triage directories...")
+    tag_results = tag_triage_folders(target_dir)
+
     print(f"✅ Triage Complete!")
     print(f"   - {moved_duplicates:,} duplicates moved to 'Duplicates/'")
     print(f"   - {moved_review:,} review assets moved to 'Review-Similar/'")
     print(f"   - {moved_new:,} clean assets moved to 'New/'")
+    if tag_results:
+        print(f"🏷️  Finder Color Tags Applied:")
+        for folder_rel, (color, ok) in tag_results.items():
+            icon = "🔴" if color == "Red" else "🟡" if color == "Yellow" else "🟠" if color == "Orange" else "🟢"
+            status = "✅" if ok else "⚠️"
+            print(f"   {status} {folder_rel:<35} -> {color} {icon}")
     print(f"📝 Full audit log: {TRIAGE_LOG_PATH}\n")
 
 def parse_args():
@@ -600,8 +642,19 @@ def parse_args():
     parser.add_argument("target_dir", nargs="?", default=DEFAULT_MEDIA_PREPROCESSING_DIR, help=f"Directory to scan and triage (default: {DEFAULT_MEDIA_PREPROCESSING_DIR})")
     parser.add_argument("--dry-run", action="store_true", help="Simulate the triage process without moving any files.")
     parser.add_argument("--no-clean", action="store_true", help="Do not delete empty directories left behind in the intake folder.")
+    parser.add_argument("--tag-only", action="store_true", help="Apply macOS Finder color tags to existing triage folders without running triage scan.")
     return parser.parse_args()
 
 if __name__ == "__main__":
     args = parse_args()
-    triage_intake_folder(args.target_dir, dry_run=args.dry_run, clean_empty=not args.no_clean)
+    if args.tag_only:
+        print(f"🏷️  Applying macOS Finder tags to triage folders in: {args.target_dir}")
+        res = tag_triage_folders(args.target_dir)
+        for folder_rel, (color, ok) in res.items():
+            icon = "🔴" if color == "Red" else "🟡" if color == "Yellow" else "🟠" if color == "Orange" else "🟢"
+            status = "✅" if ok else "⚠️"
+            print(f"   {status} {folder_rel:<35} -> {color} {icon}")
+        if not res:
+            print("   ℹ️ No triage folders (Duplicates, Review-Similar, New) found to tag.")
+    else:
+        triage_intake_folder(args.target_dir, dry_run=args.dry_run, clean_empty=not args.no_clean)

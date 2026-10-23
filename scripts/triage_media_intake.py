@@ -1,6 +1,7 @@
 import os
 import sys
 import shutil
+import subprocess
 import sqlite3
 import argparse
 import time
@@ -766,6 +767,24 @@ class LibraryIndex:
             reason += f" [Aligned with Moment: {visual_meta['matched_moment_name']}]"
         return "new", "clean_media", reason, None, visual_meta
 
+def unlock_path(path):
+    """
+    Clears macOS immutable flags (uchg, nouappnd) and Time Machine ACLs
+    (such as 'group:everyone deny delete,delete_child,writeattr') to allow moving/deleting files.
+    """
+    try:
+        os.chflags(path, 0)
+    except (AttributeError, OSError):
+        pass
+    try:
+        subprocess.run(["chmod", "-N", path], capture_output=True, check=False)
+    except Exception:
+        pass
+    try:
+        os.chmod(path, os.stat(path).st_mode | 0o200)
+    except OSError:
+        pass
+
 def safe_move(src, dest):
     dest_dir = os.path.dirname(dest)
     os.makedirs(dest_dir, exist_ok=True)
@@ -775,7 +794,12 @@ def safe_move(src, dest):
         dst_sz = os.path.getsize(dest)
         if src_sz == dst_sz:
             # Identical duplicate already at destination; remove source
-            os.remove(src)
+            try:
+                os.remove(src)
+            except (PermissionError, OSError):
+                unlock_path(os.path.dirname(src))
+                unlock_path(src)
+                os.remove(src)
             return dest
         # Disambiguate collision
         base, ext = os.path.splitext(dest)
@@ -784,7 +808,15 @@ def safe_move(src, dest):
             idx += 1
         dest = f"{base}_dup{idx}{ext}"
 
-    shutil.move(src, dest)
+    try:
+        shutil.move(src, dest)
+    except (PermissionError, OSError):
+        # Auto-unlock source, source parent directory, and destination if Time Machine ACLs or locks are present
+        unlock_path(os.path.dirname(src))
+        unlock_path(src)
+        unlock_path(dest_dir)
+        shutil.move(src, dest)
+
     return dest
 
 def clean_empty_directories(root_dir, protected_subdirs):
@@ -798,7 +830,12 @@ def clean_empty_directories(root_dir, protected_subdirs):
 
         try:
             if not os.listdir(current_root):
-                os.rmdir(current_root)
+                try:
+                    os.rmdir(current_root)
+                except (PermissionError, OSError):
+                    unlock_path(os.path.dirname(current_root))
+                    unlock_path(current_root)
+                    os.rmdir(current_root)
                 logger.debug(f"🧹 Cleaned empty directory: {current_root}")
         except Exception as e:
             logger.debug(f"Could not remove directory {current_root}: {e}")

@@ -860,7 +860,8 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
         index = LibraryIndex(MEDIA_ORGANIZER_DB_PATH)
         index.load()
 
-        # Step 1: Discover all media files outside destination directories and special system folders
+        logger.info(f"🔍 Scanning intake directory: {target_dir}")
+        print(f"🔍 Scanning intake directory: {target_dir}")
         candidate_files = []
         ignored_dir_names = {
             "triagemediaintake", "$recycle.bin", ".spotlight-v100", ".trashes", ".fseventsd"
@@ -871,6 +872,7 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
 
         lacie_dest_abs = os.path.abspath(lacie_dest_root)
         dell_dest_abs = os.path.abspath(dell_dest_root)
+        last_scan_time = time.time()
 
         for root, dirs, files in os.walk(target_dir):
             root_abs = os.path.abspath(root)
@@ -902,7 +904,18 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
                 except OSError as e:
                     logger.warning(f"Could not stat {full_p}: {e}")
 
+            now = time.time()
+            if len(candidate_files) > 0 and (now - last_scan_time) >= 1.0:
+                last_scan_time = now
+                sys.stdout.write(f"\r🔍 Found {len(candidate_files):,} candidate files so far...")
+                sys.stdout.flush()
+
+        if candidate_files:
+            sys.stdout.write("\r" + " " * 80 + "\r")
+            sys.stdout.flush()
+
         logger.info(f"📂 Found {len(candidate_files):,} candidate media files in intake directory.")
+        print(f"📂 Found {len(candidate_files):,} candidate media files in intake directory.")
 
         if not candidate_files:
             logger.info("✨ No media files found in intake directory to triage.")
@@ -955,14 +968,21 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
 
         for idx, ((dirname, stem_lower), file_group) in enumerate(grouped_by_stem.items(), 1):
             now = time.time()
+            pct = (idx / total_groups) * 100
             if idx == 1 or idx == total_groups or (now - last_progress_time) >= 0.5 or idx % 25 == 0:
                 last_progress_time = now
-                pct = (idx / total_groups) * 100
                 sys.stdout.write(
                     f"\r⏳ Evaluating intake assets: {idx:,}/{total_groups:,} ({pct:.1f}%) | "
                     f"Dups: {len(duplicates_list):,} | Review: {len(review_list):,} | New: {len(new_list):,}..."
                 )
                 sys.stdout.flush()
+
+            # Periodic progress log to file every 10% or at milestones
+            if idx == 1 or idx % max(1, total_groups // 10) == 0 or idx == total_groups:
+                logger.info(
+                    f"⏳ Evaluation Progress: {idx:,}/{total_groups:,} ({pct:.0f}%) | "
+                    f"Duplicates: {len(duplicates_list):,}, Review-Similar: {len(review_list):,}, New: {len(new_list):,}"
+                )
 
             primary_candidates = [item for item in file_group if item[4] not in ('.mov', '.mp4')]
             video_candidates = [item for item in file_group if item[4] in ('.mov', '.mp4')]
@@ -1146,10 +1166,25 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
             return
 
         # Step 5: Moving files
-        logger.info(f"🚚 Moving triaged files into destination folders on DELL1TB02 and LaCie...")
+        total_to_move = len(duplicates_list) + len(review_list) + len(new_list)
+        logger.info(f"🚚 Moving {total_to_move:,} triaged files into destination folders on DELL1TB02 and LaCie...")
+        print(f"🚚 Moving {total_to_move:,} triaged files into destination folders...")
         moved_duplicates = 0
         moved_review = 0
         moved_new = 0
+        moved_total = 0
+        last_move_time = time.time()
+
+        def report_move_progress():
+            nonlocal last_move_time
+            now = time.time()
+            pct = (moved_total / total_to_move) * 100 if total_to_move else 100.0
+            if moved_total == 1 or moved_total == total_to_move or (now - last_move_time) >= 0.5 or moved_total % 25 == 0:
+                last_move_time = now
+                sys.stdout.write(f"\r🚚 Transferring files: {moved_total:,}/{total_to_move:,} ({pct:.1f}%)...")
+                sys.stdout.flush()
+            if moved_total == 1 or moved_total % max(1, total_to_move // 10) == 0 or moved_total == total_to_move:
+                logger.info(f"🚚 Transfer Progress: {moved_total:,}/{total_to_move:,} ({pct:.0f}%)")
 
         for src_full, rel_p, fname, sz, reason, sub_t, vmeta in duplicates_list:
             dest_full = os.path.join(duplicates_dir, rel_p)
@@ -1158,6 +1193,8 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
                 moved_duplicates += 1
             except Exception as e:
                 logger.error(f"❌ Failed to move {src_full} to {dest_full}: {e}")
+            moved_total += 1
+            report_move_progress()
 
         for src_full, rel_p, fname, sz, reason, sub_t, vmeta in review_list:
             if sub_t == "upgrade_candidate":
@@ -1169,6 +1206,8 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
                 moved_review += 1
             except Exception as e:
                 logger.error(f"❌ Failed to move {src_full} to {dest_full}: {e}")
+            moved_total += 1
+            report_move_progress()
 
         for src_full, rel_p, fname, sz, reason, sub_t, vmeta in new_list:
             dest_full = os.path.join(new_dir, rel_p)
@@ -1177,10 +1216,19 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
                 moved_new += 1
             except Exception as e:
                 logger.error(f"❌ Failed to move {src_full} to {dest_full}: {e}")
+            moved_total += 1
+            report_move_progress()
+
+        if total_to_move > 0:
+            sys.stdout.write("\r" + " " * 80 + "\r")
+            sys.stdout.flush()
 
         logger.info(f"✅ Moved {moved_duplicates:,} duplicates to DELL1TB02: {duplicates_dir}")
         logger.info(f"✅ Moved {moved_review:,} review assets to LaCie: {review_dir}")
         logger.info(f"✅ Moved {moved_new:,} new assets to LaCie: {new_dir}")
+        print(f"✅ Moved {moved_duplicates:,} duplicates to DELL1TB02: {duplicates_dir}")
+        print(f"✅ Moved {moved_review:,} review assets to LaCie: {review_dir}")
+        print(f"✅ Moved {moved_new:,} new assets to LaCie: {new_dir}")
 
         # Step 6: Clean empty directories left behind
         if clean_empty:

@@ -25,9 +25,13 @@ from constants import (
 from utils.logger import setup_logger
 from utils.finder_tags import apply_finder_tag
 
+import warnings
+import logging
+
 try:
     import exifread
     HAS_EXIFREAD = True
+    logging.getLogger("exifread").setLevel(logging.ERROR)
 except ImportError:
     HAS_EXIFREAD = False
 
@@ -35,6 +39,9 @@ try:
     from PIL import Image
     import imagehash
     HAS_IMAGEHASH = True
+    Image.MAX_IMAGE_PIXELS = None
+    warnings.filterwarnings("ignore", category=Image.DecompressionBombWarning)
+    warnings.filterwarnings("ignore", category=UserWarning, module="PIL")
 except ImportError:
     HAS_IMAGEHASH = False
 
@@ -507,11 +514,18 @@ class LibraryIndex:
 
         # Check if intake file is a hashable image format
         is_image = ext in IMAGE_EXTENSIONS_FOR_HASH
-        intake_h_obj, intake_h_str = (None, None)
-        if is_image and HAS_IMAGEHASH:
-            intake_h_obj, intake_h_str = compute_phash(file_path)
-            if intake_h_str:
-                visual_meta["perceptual_hash"] = intake_h_str
+        _h_state = {"computed": False, "obj": None, "str": None}
+
+        def get_intake_hash():
+            if not _h_state["computed"]:
+                _h_state["computed"] = True
+                if is_image and HAS_IMAGEHASH:
+                    h_obj, h_str = compute_phash(file_path)
+                    _h_state["obj"] = h_obj
+                    _h_state["str"] = h_str
+                    if h_str:
+                        visual_meta["perceptual_hash"] = h_str
+            return _h_state["obj"], _h_state["str"]
 
         # ---------------------------------------------------------
         # TIER 1: Exact Byte-Level Duplicates
@@ -563,13 +577,15 @@ class LibraryIndex:
                     visual_meta["matched_moment_name"] = lib_entry["moment_name"]
 
                 # Compute visual similarity against library entry if possible
-                if intake_h_obj and self.has_originals:
-                    lib_h_obj, lib_h_str = self.get_library_asset_hash(lib_entry)
-                    if lib_h_obj:
-                        dist = intake_h_obj - lib_h_obj
-                        sim = max(0.0, 1.0 - (dist / 64.0)) * 100.0
-                        visual_meta["hamming_distance"] = dist
-                        visual_meta["visual_similarity_score"] = round(sim, 2)
+                if self.has_originals:
+                    intake_h_obj, _ = get_intake_hash()
+                    if intake_h_obj:
+                        lib_h_obj, lib_h_str = self.get_library_asset_hash(lib_entry)
+                        if lib_h_obj:
+                            dist = intake_h_obj - lib_h_obj
+                            sim = max(0.0, 1.0 - (dist / 64.0)) * 100.0
+                            visual_meta["hamming_distance"] = dist
+                            visual_meta["visual_similarity_score"] = round(sim, 2)
                 if visual_meta["visual_similarity_score"] is None:
                     visual_meta["visual_similarity_score"] = 100.0
                     visual_meta["hamming_distance"] = 0
@@ -595,7 +611,7 @@ class LibraryIndex:
         # TIER 2.5: Scoped Visual Similarity & Perceptual Hashing
         # (Detects duplicates or near-duplicates across different filenames)
         # ---------------------------------------------------------
-        if intake_h_obj and self.has_originals:
+        if is_image and self.has_originals:
             candidates = []
             if candidate_dates:
                 for d_chk in candidate_dates:
@@ -619,70 +635,73 @@ class LibraryIndex:
                     or os.path.splitext(c.get("original_filename", "").lower())[1] in IMAGE_EXTENSIONS_FOR_HASH
                 ]
 
-                # If timestamp available, sort candidates by time proximity
-                if exif_ts and len(cand_images) > 1:
-                    cand_images.sort(key=lambda c: abs((c.get("unix_ts") or 0) - exif_ts))
+                if cand_images:
+                    intake_h_obj, _ = get_intake_hash()
+                    if intake_h_obj:
+                        # If timestamp available, sort candidates by time proximity
+                        if exif_ts and len(cand_images) > 1:
+                            cand_images.sort(key=lambda c: abs((c.get("unix_ts") or 0) - exif_ts))
 
-                best_match = None
-                min_dist = None
-                best_sim = None
+                        best_match = None
+                        min_dist = None
+                        best_sim = None
 
-                # Test candidates (limit to closest 50 if huge set)
-                for cand in cand_images[:50]:
-                    cand_h_obj, cand_h_str = self.get_library_asset_hash(cand)
-                    if not cand_h_obj:
-                        continue
-                    dist = intake_h_obj - cand_h_obj
-                    sim = max(0.0, 1.0 - (dist / 64.0)) * 100.0
+                        # Test candidates (limit to closest 50 if huge set)
+                        for cand in cand_images[:50]:
+                            cand_h_obj, cand_h_str = self.get_library_asset_hash(cand)
+                            if not cand_h_obj:
+                                continue
+                            dist = intake_h_obj - cand_h_obj
+                            sim = max(0.0, 1.0 - (dist / 64.0)) * 100.0
 
-                    if min_dist is None or dist < min_dist:
-                        min_dist = dist
-                        best_match = cand
-                        best_sim = sim
+                            if min_dist is None or dist < min_dist:
+                                min_dist = dist
+                                best_match = cand
+                                best_sim = sim
 
-                    # Exact visual match found, stop checking
-                    if dist == 0:
-                        break
-                    # High confidence match found, break early
-                    if dist <= 3:
-                        break
+                            # Exact visual match found, stop checking
+                            if dist == 0:
+                                break
+                            # High confidence match found, break early
+                            if dist <= 3:
+                                break
 
-                if min_dist is not None:
-                    if min_dist <= 3:
-                        # High-Confidence Visual Duplicate (>=95.3% match)
-                        lib_sz = best_match.get("sz", 0)
-                        visual_meta["matched_asset_uuid"] = best_match["uuid"]
-                        if best_match.get("moment_name"):
-                            visual_meta["matched_moment_name"] = best_match["moment_name"]
-                        visual_meta["visual_similarity_score"] = round(best_sim, 2)
-                        visual_meta["hamming_distance"] = min_dist
+                        if min_dist is not None:
+                            if min_dist <= 3:
+                                # High-Confidence Visual Duplicate (>=95.3% match)
+                                lib_sz = best_match.get("sz", 0)
+                                visual_meta["matched_asset_uuid"] = best_match["uuid"]
+                                if best_match.get("moment_name"):
+                                    visual_meta["matched_moment_name"] = best_match["moment_name"]
+                                visual_meta["visual_similarity_score"] = round(best_sim, 2)
+                                visual_meta["hamming_distance"] = min_dist
 
-                        if file_size <= lib_sz * 1.02:
-                            # Library is superior or equal
-                            pct = ((file_size - lib_sz) / lib_sz * 100) if lib_sz else 0
-                            reason = f"Visual duplicate of All-Media asset {best_match['uuid']} ({best_match['original_filename']}) - {best_sim:.1f}% match (dist {min_dist}), {format_size(file_size)} vs {format_size(lib_sz)} in library ({pct:+.1f}%); Library is superior"
-                            if visual_meta.get("matched_moment_name"):
-                                reason += f" [Moment: {visual_meta['matched_moment_name']}]"
-                            return "duplicate", "visual_duplicate", reason, best_match, visual_meta
-                        else:
-                            # Intake file is higher quality / larger!
-                            pct = ((file_size - lib_sz) / lib_sz * 100) if lib_sz else 0
-                            reason = f"🌟 Visual Upgrade Candidate: Higher quality ({format_size(file_size)} vs {format_size(lib_sz)} in library, +{pct:.1f}%) matching asset {best_match['uuid']} ({best_match['original_filename']}) with {best_sim:.1f}% visual match (dist {min_dist})"
-                            if visual_meta.get("matched_moment_name"):
-                                reason += f" [Moment: {visual_meta['matched_moment_name']}]"
-                            return "review_similar", "upgrade_candidate", reason, best_match, visual_meta
+                                if file_size <= lib_sz * 1.02:
+                                    # Library is superior or equal
+                                    pct = ((file_size - lib_sz) / lib_sz * 100) if lib_sz else 0
+                                    reason = f"Visual duplicate of All-Media asset {best_match['uuid']} ({best_match['original_filename']}) - {best_sim:.1f}% match (dist {min_dist}), {format_size(file_size)} vs {format_size(lib_sz)} in library ({pct:+.1f}%); Library is superior"
+                                    if visual_meta.get("matched_moment_name"):
+                                        reason += f" [Moment: {visual_meta['matched_moment_name']}]"
+                                    return "duplicate", "visual_duplicate", reason, best_match, visual_meta
+                                else:
+                                    # Intake file is higher quality / larger!
+                                    pct = ((file_size - lib_sz) / lib_sz * 100) if lib_sz else 0
+                                    reason = f"🌟 Visual Upgrade Candidate: Higher quality ({format_size(file_size)} vs {format_size(lib_sz)} in library, +{pct:.1f}%) matching asset {best_match['uuid']} ({best_match['original_filename']}) with {best_sim:.1f}% visual match (dist {min_dist})"
+                                    if visual_meta.get("matched_moment_name"):
+                                        reason += f" [Moment: {visual_meta['matched_moment_name']}]"
+                                    return "review_similar", "upgrade_candidate", reason, best_match, visual_meta
 
-                    elif 4 <= min_dist <= 8:
-                        # Visually Similar Photo / Burst / Moment Sibling (87.5% - 93.8% match)
-                        visual_meta["matched_asset_uuid"] = best_match["uuid"]
-                        if best_match.get("moment_name"):
-                            visual_meta["matched_moment_name"] = best_match["moment_name"]
-                        visual_meta["visual_similarity_score"] = round(best_sim, 2)
-                        visual_meta["hamming_distance"] = min_dist
-                        reason = f"Visually similar photo to All-Media asset {best_match['uuid']} ({best_match['original_filename']}) - {best_sim:.1f}% match (dist {min_dist})"
-                        if visual_meta.get("matched_moment_name"):
-                            reason += f" [Moment: {visual_meta['matched_moment_name']}]"
-                        return "review_similar", "visual_similar", reason, best_match, visual_meta
+                            elif 4 <= min_dist <= 8:
+                                # Visually Similar Photo / Burst / Moment Sibling (87.5% - 93.8% match)
+                                visual_meta["matched_asset_uuid"] = best_match["uuid"]
+                                if best_match.get("moment_name"):
+                                    visual_meta["matched_moment_name"] = best_match["moment_name"]
+                                visual_meta["visual_similarity_score"] = round(best_sim, 2)
+                                visual_meta["hamming_distance"] = min_dist
+                                reason = f"Visually similar photo to All-Media asset {best_match['uuid']} ({best_match['original_filename']}) - {best_sim:.1f}% match (dist {min_dist})"
+                                if visual_meta.get("matched_moment_name"):
+                                    reason += f" [Moment: {visual_meta['matched_moment_name']}]"
+                                return "review_similar", "visual_similar", reason, best_match, visual_meta
 
         # ---------------------------------------------------------
         # TIER 3: Suspected Discards, Burst Siblings, or Web Junk
@@ -931,7 +950,20 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
         total_review_bytes = 0
         total_new_bytes = 0
 
-        for (dirname, stem_lower), file_group in grouped_by_stem.items():
+        total_groups = len(grouped_by_stem)
+        last_progress_time = time.time()
+
+        for idx, ((dirname, stem_lower), file_group) in enumerate(grouped_by_stem.items(), 1):
+            now = time.time()
+            if idx == 1 or idx == total_groups or (now - last_progress_time) >= 0.5 or idx % 25 == 0:
+                last_progress_time = now
+                pct = (idx / total_groups) * 100
+                sys.stdout.write(
+                    f"\r⏳ Evaluating intake assets: {idx:,}/{total_groups:,} ({pct:.1f}%) | "
+                    f"Dups: {len(duplicates_list):,} | Review: {len(review_list):,} | New: {len(new_list):,}..."
+                )
+                sys.stdout.flush()
+
             primary_candidates = [item for item in file_group if item[4] not in ('.mov', '.mp4')]
             video_candidates = [item for item in file_group if item[4] in ('.mov', '.mp4')]
 
@@ -1031,6 +1063,9 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
                     else:
                         new_list.append((v_full, v_rel, v_f, v_sz, reason, sub_type, visual_meta))
                         total_new_bytes += v_sz
+
+        sys.stdout.write("\r" + " " * 95 + "\r")
+        sys.stdout.flush()
 
         # Step 4: Summary Output & Detailed Logging
         print("\n" + "=" * 78)
@@ -1265,6 +1300,20 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
                 status = "✅" if ok else "⚠️"
                 print(f"   {status} {folder_rel:<45} -> {color} {icon}")
         print(f"📝 Full audit log: {TRIAGE_LOG_PATH}\n")
+
+    except KeyboardInterrupt:
+        logger.warning(f"\n⚠️ Triage session '{triage_id}' cancelled by user (KeyboardInterrupt).")
+        print(f"\n\n⚠️ Triage session '{triage_id}' cancelled by user (Ctrl-C). No files were moved.")
+        if db_conn and db_session_pk:
+            try:
+                cur = db_conn.cursor()
+                cur.execute("UPDATE triage_sessions SET status = 'cancelled', completed_at_utc = datetime('now') WHERE id = ?", (db_session_pk,))
+                db_conn.commit()
+            except Exception:
+                pass
+            finally:
+                db_conn.close()
+        return
 
     except Exception as e:
         logger.error(f"❌ Triage session failed unexpectedly: {e}", exc_info=True)

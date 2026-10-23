@@ -33,7 +33,8 @@ TRIAGE_INTAKE_FOLDER_NAME = 'TriageMediaIntake'
 TRIAGE_DESTINATION_ROOT = os.path.join(DEFAULT_MEDIA_PREPROCESSING_DIR, TRIAGE_INTAKE_FOLDER_NAME)
 
 # Multi-Drive Triage Roots
-# DELL1TB02: Disposable duplicates storage (can be deleted or unmounted without backup)
+# DELL1TB02: Non-backed up cold storage (Priority 3) and disposable duplicates (Priority 4)
+DELL_STORAGE_PRIORITY_3_DIR = '/Volumes/DELL1TB02/Storage/Priority 3'
 DELL_STORAGE_PREPROCESSING_DIR = '/Volumes/DELL1TB02/Storage/Priority 4/Media Preprocessing'
 TRIAGE_DELL_DESTINATION_ROOT = os.path.join(DELL_STORAGE_PREPROCESSING_DIR, TRIAGE_INTAKE_FOLDER_NAME)
 TRIAGE_DUPLICATES_ROOT = os.path.join(TRIAGE_DELL_DESTINATION_ROOT, 'Duplicates')

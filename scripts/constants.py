@@ -15,6 +15,7 @@ PUBLISHING_CANDIDATES_LOG_PATH = os.path.abspath(os.path.join(BASE_DIR, '../logs
 WEEKLY_MEMORY_LOG_PATH = PUBLISHING_CANDIDATES_LOG_PATH
 PUBLISHING_RECOMMENDATIONS_LOG_PATH = os.path.abspath(os.path.join(BASE_DIR, '../logs/publishing_recommendations.log'))
 TRIAGE_LOG_PATH = os.path.abspath(os.path.join(BASE_DIR, '../logs/triage_media_intake.log'))
+MERGE_LOG_PATH = os.path.abspath(os.path.join(BASE_DIR, '../logs/merge_directories.log'))
 
 # Paths to the Apple Photos database and Media Organizer database
 # For safety - during DEV will use a copy of the All-Media DB 

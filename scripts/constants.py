@@ -31,6 +31,17 @@ DEFAULT_MEDIA_PREPROCESSING_DIR = '/Volumes/LaCie/Storage/Priority 4/Media Prepr
 TRIAGE_INTAKE_FOLDER_NAME = 'TriageMediaIntake'
 TRIAGE_DESTINATION_ROOT = os.path.join(DEFAULT_MEDIA_PREPROCESSING_DIR, TRIAGE_INTAKE_FOLDER_NAME)
 
+# Multi-Drive Triage Roots
+# DELL1TB02: Disposable duplicates storage (can be deleted or unmounted without backup)
+DELL_STORAGE_PREPROCESSING_DIR = '/Volumes/DELL1TB02/Storage/Priority 4/Media Preprocessing'
+TRIAGE_DELL_DESTINATION_ROOT = os.path.join(DELL_STORAGE_PREPROCESSING_DIR, TRIAGE_INTAKE_FOLDER_NAME)
+TRIAGE_DUPLICATES_ROOT = os.path.join(TRIAGE_DELL_DESTINATION_ROOT, 'Duplicates')
+
+# LaCie: Reliable active storage for review-similar and clean new media
+TRIAGE_LACIE_DESTINATION_ROOT = TRIAGE_DESTINATION_ROOT
+TRIAGE_REVIEW_ROOT = os.path.join(TRIAGE_LACIE_DESTINATION_ROOT, 'Review-Similar')
+TRIAGE_NEW_ROOT = os.path.join(TRIAGE_LACIE_DESTINATION_ROOT, 'New')
+
 APPLE_PHOTOS_DB_COPY_PATH = "/Volumes/Macintosh HD/Users/nickolaycohen/Photos Library DB/All-Media-Extreme/database/Photos.sqlite"
 APPLE_PHOTOS_DB_MARKER = APPLE_PHOTOS_DB_COPY_PATH + ".lastcopy"
 APPLE_PHOTOS_DB_LOCK_PATH = APPLE_PHOTOS_DB_COPY_PATH + ".lock"

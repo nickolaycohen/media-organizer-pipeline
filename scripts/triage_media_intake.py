@@ -18,6 +18,8 @@ from constants import (
     DEFAULT_MEDIA_PREPROCESSING_DIR,
     TRIAGE_INTAKE_FOLDER_NAME,
     TRIAGE_DESTINATION_ROOT,
+    TRIAGE_LACIE_DESTINATION_ROOT,
+    TRIAGE_DELL_DESTINATION_ROOT,
     APPLE_PHOTOS_ORIGINALS_PATH
 )
 from utils.logger import setup_logger
@@ -150,14 +152,17 @@ def ensure_triage_tables(conn):
 
     conn.commit()
 
-def determine_triage_id(db_path, dest_root_dir, requested_id=None):
+def determine_triage_id(db_path, lacie_dest_root=None, dell_dest_root=None, requested_id=None):
     """
     Determines the triage session ID.
     If requested_id is provided, uses it.
-    Otherwise queries MAX(id) from DB and avoids collisions with existing folders on disk.
+    Otherwise queries MAX(id) from DB and avoids collisions with existing folders across DELL1TB02 and LaCie.
     """
     if requested_id:
         return str(requested_id).strip()
+
+    lacie_dest_root = lacie_dest_root or TRIAGE_LACIE_DESTINATION_ROOT
+    dell_dest_root = dell_dest_root or TRIAGE_DELL_DESTINATION_ROOT
 
     next_num = 1
     try:
@@ -172,13 +177,15 @@ def determine_triage_id(db_path, dest_root_dir, requested_id=None):
     except Exception as e:
         logger.warning(f"Could not determine next triage_id from DB: {e}")
 
-    # Ensure no folder collision under Duplicates, Review-Similar, or New
+    # Ensure no folder collision across DELL1TB02 (Duplicates) and LaCie (Review-Similar, New)
     def session_exists(num):
         s_id = str(num)
-        for cat in ["Duplicates", "Review-Similar", "New"]:
-            if os.path.exists(os.path.join(dest_root_dir, cat, s_id)):
+        if os.path.exists(os.path.join(dell_dest_root, "Duplicates", s_id)):
+            return True
+        for cat in ["Review-Similar", "New"]:
+            if os.path.exists(os.path.join(lacie_dest_root, cat, s_id)):
                 return True
-        if os.path.exists(os.path.join(dest_root_dir, s_id)):
+        if os.path.exists(os.path.join(lacie_dest_root, "Duplicates", s_id)):
             return True
         return False
 
@@ -187,35 +194,41 @@ def determine_triage_id(db_path, dest_root_dir, requested_id=None):
 
     return str(next_num)
 
-def tag_triage_folders(dest_root_dir, triage_id=None):
+def tag_triage_folders(lacie_dest_root=None, dell_dest_root=None, triage_id=None):
     """
-    Applies standard macOS Finder color tags to triage folders:
-      - Duplicates/                       -> Red (Index 2)
-      - Review-Similar/                  -> Yellow (Index 3)
-      - Review-Similar/Upgrade-Candidates -> Orange (Index 1)
-      - New/                             -> Green (Index 6)
-    Tags both the top-level 3 category folders and any session subfolders.
+    Applies standard macOS Finder color tags to triage folders across both drives:
+      - DELL1TB02:
+          Duplicates/                       -> Red (Index 2)
+          Duplicates/<triage_id>            -> Red (Index 2)
+      - LaCie:
+          Review-Similar/                  -> Yellow (Index 3)
+          Review-Similar/<triage_id>       -> Yellow (Index 3)
+          Review-Similar/.../Upgrade-Candidates -> Orange (Index 1)
+          New/                             -> Green (Index 6)
+          New/<triage_id>                  -> Green (Index 6)
     """
-    dest_root_dir = os.path.abspath(dest_root_dir)
+    lacie_dest_root = os.path.abspath(lacie_dest_root or TRIAGE_LACIE_DESTINATION_ROOT)
+    dell_dest_root = os.path.abspath(dell_dest_root or TRIAGE_DELL_DESTINATION_ROOT)
     results = {}
 
-    category_colors = {
-        "Duplicates": "Red",
-        "Review-Similar": "Yellow",
-        "New": "Green"
+    folder_mapping = {
+        "Duplicates": (dell_dest_root, "Red"),
+        "Review-Similar": (lacie_dest_root, "Yellow"),
+        "New": (lacie_dest_root, "Green")
     }
 
     # 1. Tag top-level category folders if they exist
-    for cat_name, color in category_colors.items():
-        cat_path = os.path.join(dest_root_dir, cat_name)
+    for cat_name, (base_root, color) in folder_mapping.items():
+        cat_path = os.path.join(base_root, cat_name)
         if os.path.exists(cat_path):
             ok = apply_finder_tag(cat_path, color)
-            results[cat_name] = (color, ok)
-            logger.info(f"🏷️  Tagged top-level '{cat_name}' as {color} in Finder.")
+            drive_label = "DELL1TB02" if "DELL1TB02" in base_root else "LaCie"
+            results[f"{drive_label}: {cat_name}"] = (color, ok)
+            logger.info(f"🏷️  Tagged top-level '{cat_path}' as {color} in Finder.")
 
     # 2. Tag session subfolders (e.g. Duplicates/<id>, Review-Similar/<id>, New/<id>)
-    for cat_name, color in category_colors.items():
-        cat_path = os.path.join(dest_root_dir, cat_name)
+    for cat_name, (base_root, color) in folder_mapping.items():
+        cat_path = os.path.join(base_root, cat_name)
         if not os.path.exists(cat_path):
             continue
 
@@ -225,18 +238,19 @@ def tag_triage_folders(dest_root_dir, triage_id=None):
                 continue
             sess_path = os.path.join(cat_path, str(s_dir))
             if os.path.isdir(sess_path):
-                key = f"{cat_name}/{s_dir}"
+                drive_label = "DELL1TB02" if "DELL1TB02" in base_root else "LaCie"
+                key = f"{drive_label}: {cat_name}/{s_dir}"
                 ok = apply_finder_tag(sess_path, color)
                 results[key] = (color, ok)
-                logger.info(f"🏷️  Tagged session folder '{key}' as {color} in Finder.")
+                logger.info(f"🏷️  Tagged session folder '{sess_path}' as {color} in Finder.")
 
                 # If Upgrade-Candidates exists inside Review-Similar/<id>, tag it Orange
                 upg_path = os.path.join(sess_path, "Upgrade-Candidates")
                 if os.path.exists(upg_path):
-                    upg_key = f"{key}/Upgrade-Candidates"
+                    upg_key = f"{drive_label}: {cat_name}/{s_dir}/Upgrade-Candidates"
                     upg_ok = apply_finder_tag(upg_path, "Orange")
                     results[upg_key] = ("Orange", upg_ok)
-                    logger.info(f"🏷️  Tagged '{upg_key}' as Orange in Finder.")
+                    logger.info(f"🏷️  Tagged '{upg_path}' as Orange in Finder.")
 
     return results
 
@@ -770,30 +784,39 @@ def clean_empty_directories(root_dir, protected_subdirs):
         except Exception as e:
             logger.debug(f"Could not remove directory {current_root}: {e}")
 
-def triage_intake_folder(target_dir, dest_root_dir=None, triage_id=None, dry_run=False, clean_empty=True):
+def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, triage_id=None, dry_run=False, clean_empty=True):
     target_dir = os.path.abspath(target_dir)
-    dest_root_dir = os.path.abspath(dest_root_dir or TRIAGE_DESTINATION_ROOT)
+    lacie_dest_root = os.path.abspath(lacie_dest_root or TRIAGE_LACIE_DESTINATION_ROOT)
+    dell_dest_root = os.path.abspath(dell_dest_root or TRIAGE_DELL_DESTINATION_ROOT)
 
-    triage_id = determine_triage_id(MEDIA_ORGANIZER_DB_PATH, dest_root_dir, requested_id=triage_id)
+    triage_id = determine_triage_id(MEDIA_ORGANIZER_DB_PATH, lacie_dest_root, dell_dest_root, requested_id=triage_id)
 
     # Attach triage_id to the logger so all logs contain [Triage ID: <triage_id>]
     setup_logger(TRIAGE_LOG_PATH, MODULE_TAG, extra_fields={"triage_id": triage_id})
 
-    # Inverted hierarchy: TriageMediaIntake/[Category]/<triage_id>
-    duplicates_dir = os.path.join(dest_root_dir, "Duplicates", triage_id)
-    review_dir = os.path.join(dest_root_dir, "Review-Similar", triage_id)
-    new_dir = os.path.join(dest_root_dir, "New", triage_id)
-    session_dest_desc = f"{dest_root_dir}/[Duplicates|Review-Similar|New]/{triage_id}"
+    # Multi-Drive Destination Hierarchy:
+    # DELL1TB02: Duplicates/<triage_id>
+    # LaCie:     Review-Similar/<triage_id>, New/<triage_id>
+    duplicates_dir = os.path.join(dell_dest_root, "Duplicates", triage_id)
+    review_dir = os.path.join(lacie_dest_root, "Review-Similar", triage_id)
+    new_dir = os.path.join(lacie_dest_root, "New", triage_id)
+    session_dest_desc = f"DELL1TB02: Duplicates/{triage_id} | LaCie: [Review-Similar|New]/{triage_id}"
 
     logger.info(f"🚀 Starting Media Intake Triage [Triage ID: {triage_id}]")
-    logger.info(f"   - Source Directory:      {target_dir}")
-    logger.info(f"   - Destination Hierarchy: {session_dest_desc}")
+    logger.info(f"   - Source Directory:        {target_dir}")
+    logger.info(f"   - Duplicates Destination:  {duplicates_dir} (DELL1TB02)")
+    logger.info(f"   - Review & New (LaCie):    {lacie_dest_root}/[Review-Similar|New]/{triage_id}")
     if dry_run:
         logger.info("🔎 DRY RUN MODE: No files will be moved and DB will not be modified.")
 
     if not os.path.exists(target_dir):
         logger.error(f"❌ Target intake directory does not exist: {target_dir}")
         return
+
+    # Check DELL1TB02 availability
+    if not dry_run and not os.path.exists("/Volumes/DELL1TB02"):
+        logger.error("❌ DELL1TB02 drive is not mounted at /Volumes/DELL1TB02! Please connect DELL1TB02 to store disposable duplicates.")
+        raise FileNotFoundError("DELL1TB02 volume not mounted: /Volumes/DELL1TB02")
 
     # Record session in DB as running
     db_conn = None
@@ -827,12 +850,15 @@ def triage_intake_folder(target_dir, dest_root_dir=None, triage_id=None, dry_run
             ".ds_store", "thumbs.db", "desktop.ini"
         }
 
-        dest_root_abs = os.path.abspath(dest_root_dir)
+        lacie_dest_abs = os.path.abspath(lacie_dest_root)
+        dell_dest_abs = os.path.abspath(dell_dest_root)
 
         for root, dirs, files in os.walk(target_dir):
             root_abs = os.path.abspath(root)
-            # Never scan inside the destination root directory or any of its session subdirectories
-            if root_abs == dest_root_abs or root_abs.startswith(dest_root_abs + os.sep):
+            # Never scan inside destination root directories on either drive
+            if root_abs == lacie_dest_abs or root_abs.startswith(lacie_dest_abs + os.sep):
+                continue
+            if root_abs == dell_dest_abs or root_abs.startswith(dell_dest_abs + os.sep):
                 continue
 
             rel_root = os.path.relpath(root, target_dir)
@@ -1041,7 +1067,7 @@ def triage_intake_folder(target_dir, dest_root_dir=None, triage_id=None, dry_run
                 v_info = f" | Sim: {vmeta['visual_similarity_score']:.1f}% (dist {vmeta.get('hamming_distance')})"
             if vmeta and vmeta.get("matched_moment_name"):
                 v_info += f" | Moment: {vmeta['matched_moment_name']}"
-            logger.info(f"  [DUPLICATE]      {rel_p} ({format_size(sz)}) -> Duplicates/{triage_id}/{rel_p} | Reason: {reason}{v_info}")
+            logger.info(f"  [DUPLICATE]      {rel_p} ({format_size(sz)}) -> DELL1TB02: Duplicates/{triage_id}/{rel_p} | Reason: {reason}{v_info}")
 
         for src_full, rel_p, fname, sz, reason, sub_t, vmeta in review_list:
             sub_folder = f"Review-Similar/{triage_id}/Upgrade-Candidates" if sub_t == "upgrade_candidate" else f"Review-Similar/{triage_id}"
@@ -1050,40 +1076,42 @@ def triage_intake_folder(target_dir, dest_root_dir=None, triage_id=None, dry_run
                 v_info = f" | Sim: {vmeta['visual_similarity_score']:.1f}% (dist {vmeta.get('hamming_distance')})"
             if vmeta and vmeta.get("matched_moment_name"):
                 v_info += f" | Moment: {vmeta['matched_moment_name']}"
-            logger.info(f"  [REVIEW-SIMILAR] {rel_p} ({format_size(sz)}) -> {sub_folder}/{rel_p} | Reason: {reason}{v_info}")
+            logger.info(f"  [REVIEW-SIMILAR] {rel_p} ({format_size(sz)}) -> LaCie: {sub_folder}/{rel_p} | Reason: {reason}{v_info}")
 
         for src_full, rel_p, fname, sz, reason, sub_t, vmeta in new_list:
             v_info = ""
             if vmeta and vmeta.get("matched_moment_name"):
                 v_info += f" | Moment: {vmeta['matched_moment_name']}"
-            logger.info(f"  [NEW]            {rel_p} ({format_size(sz)}) -> New/{triage_id}/{rel_p} | Reason: {reason}{v_info}")
+            logger.info(f"  [NEW]            {rel_p} ({format_size(sz)}) -> LaCie: New/{triage_id}/{rel_p} | Reason: {reason}{v_info}")
 
         if dry_run:
             print(f"🔍 [DRY RUN] Triage ID: {triage_id}")
-            print(f"   Destination Hierarchy: {dest_root_dir}/[Category]/{triage_id}/")
+            print(f"   Destination Hierarchy:")
+            print(f"   - DELL1TB02: {dell_dest_root}/Duplicates/{triage_id}/")
+            print(f"   - LaCie:     {lacie_dest_root}/[Review-Similar|New]/{triage_id}/")
             print(f"   Would move:")
-            print(f"   - {len(duplicates_list):,} duplicates to '{duplicates_dir}/'")
+            print(f"   - {len(duplicates_list):,} duplicates to DELL1TB02: '{duplicates_dir}/'")
             if visual_dup_count > 0:
                 print(f"     └─ {visual_dup_count:,} visual duplicates (>=95% match, different filename)")
             if upgrade_count > 0:
-                print(f"   - {upgrade_count:,} upgrade candidates to '{review_dir}/Upgrade-Candidates/'")
+                print(f"   - {upgrade_count:,} upgrade candidates to LaCie: '{review_dir}/Upgrade-Candidates/'")
             if visual_sim_count > 0:
                 print(f"     └─ {visual_sim_count:,} visually similar photos (88-94% match)")
-            print(f"   - {len(review_list) - upgrade_count:,} review items to '{review_dir}/'")
-            print(f"   - {len(new_list):,} clean new assets to '{new_dir}/'")
+            print(f"   - {len(review_list) - upgrade_count:,} review items to LaCie: '{review_dir}/'")
+            print(f"   - {len(new_list):,} clean new assets to LaCie: '{new_dir}/'")
             if moment_matched_count > 0:
                 print(f"   📍 Apple Photos Moment Matches: {moment_matched_count:,} assets aligned with moments")
             print(f"🏷️  [DRY RUN] Would apply macOS Finder color tags to destination folders:")
-            print(f"   - '{dest_root_dir}/Duplicates' (and /{triage_id})                     -> Red 🔴")
-            print(f"   - '{dest_root_dir}/Review-Similar' (and /{triage_id})                -> Yellow 🟡")
+            print(f"   - DELL1TB02: '{dell_dest_root}/Duplicates' (and /{triage_id})         -> Red 🔴")
+            print(f"   - LaCie:     '{lacie_dest_root}/Review-Similar' (and /{triage_id})    -> Yellow 🟡")
             if upgrade_count > 0:
-                print(f"   - '{review_dir}/Upgrade-Candidates'                             -> Orange 🟠")
-            print(f"   - '{dest_root_dir}/New' (and /{triage_id})                           -> Green 🟢")
+                print(f"   - LaCie:     '{review_dir}/Upgrade-Candidates'                 -> Orange 🟠")
+            print(f"   - LaCie:     '{lacie_dest_root}/New' (and /{triage_id})               -> Green 🟢")
             print(f"📝 Logs appended to: {TRIAGE_LOG_PATH}")
             return
 
         # Step 5: Moving files
-        logger.info(f"🚚 Moving triaged files into destination folders under {dest_root_dir}...")
+        logger.info(f"🚚 Moving triaged files into destination folders on DELL1TB02 and LaCie...")
         moved_duplicates = 0
         moved_review = 0
         moved_new = 0
@@ -1115,9 +1143,9 @@ def triage_intake_folder(target_dir, dest_root_dir=None, triage_id=None, dry_run
             except Exception as e:
                 logger.error(f"❌ Failed to move {src_full} to {dest_full}: {e}")
 
-        logger.info(f"✅ Moved {moved_duplicates:,} duplicates to {duplicates_dir}")
-        logger.info(f"✅ Moved {moved_review:,} review assets to {review_dir}")
-        logger.info(f"✅ Moved {moved_new:,} new assets to {new_dir}")
+        logger.info(f"✅ Moved {moved_duplicates:,} duplicates to DELL1TB02: {duplicates_dir}")
+        logger.info(f"✅ Moved {moved_review:,} review assets to LaCie: {review_dir}")
+        logger.info(f"✅ Moved {moved_new:,} new assets to LaCie: {new_dir}")
 
         # Step 6: Clean empty directories left behind
         if clean_empty:
@@ -1125,19 +1153,20 @@ def triage_intake_folder(target_dir, dest_root_dir=None, triage_id=None, dry_run
             clean_empty_directories(
                 target_dir,
                 protected_subdirs=[
-                    dest_root_dir,
-                    os.path.join(dest_root_dir, "Duplicates"),
-                    os.path.join(dest_root_dir, "Review-Similar"),
-                    os.path.join(dest_root_dir, "New"),
-                    duplicates_dir,
+                    lacie_dest_root,
+                    os.path.join(lacie_dest_root, "Review-Similar"),
+                    os.path.join(lacie_dest_root, "New"),
                     review_dir,
-                    new_dir
+                    new_dir,
+                    dell_dest_root,
+                    os.path.join(dell_dest_root, "Duplicates"),
+                    duplicates_dir
                 ]
             )
 
         # Step 7: Apply macOS Finder color tags
-        logger.info(f"🏷️  Applying macOS Finder color tags under {dest_root_dir}...")
-        tag_results = tag_triage_folders(dest_root_dir, triage_id=triage_id)
+        logger.info("🏷️  Applying macOS Finder color tags on DELL1TB02 and LaCie...")
+        tag_results = tag_triage_folders(lacie_dest_root=lacie_dest_root, dell_dest_root=dell_dest_root, triage_id=triage_id)
 
         # Step 8: Update database records
         if db_conn and db_session_pk:
@@ -1225,16 +1254,16 @@ def triage_intake_folder(target_dir, dest_root_dir=None, triage_id=None, dry_run
                 db_conn.close()
 
         print(f"✅ Triage Complete! [Triage ID: {triage_id}]")
-        print(f"   Destination Hierarchy: {dest_root_dir}/[Category]/{triage_id}/")
-        print(f"   - {moved_duplicates:,} duplicates moved to '{duplicates_dir}/'")
-        print(f"   - {moved_review:,} review assets moved to '{review_dir}/'")
-        print(f"   - {moved_new:,} clean assets moved to '{new_dir}/'")
+        print(f"   Destination Hierarchy: {session_dest_desc}")
+        print(f"   - {moved_duplicates:,} duplicates moved to DELL1TB02: '{duplicates_dir}/'")
+        print(f"   - {moved_review:,} review assets moved to LaCie: '{review_dir}/'")
+        print(f"   - {moved_new:,} clean assets moved to LaCie: '{new_dir}/'")
         if tag_results:
             print(f"🏷️  Finder Color Tags Applied:")
             for folder_rel, (color, ok) in tag_results.items():
                 icon = "🔴" if color == "Red" else "🟡" if color == "Yellow" else "🟠" if color == "Orange" else "🟢"
                 status = "✅" if ok else "⚠️"
-                print(f"   {status} {folder_rel:<40} -> {color} {icon}")
+                print(f"   {status} {folder_rel:<45} -> {color} {icon}")
         print(f"📝 Full audit log: {TRIAGE_LOG_PATH}\n")
 
     except Exception as e:
@@ -1252,12 +1281,19 @@ def triage_intake_folder(target_dir, dest_root_dir=None, triage_id=None, dry_run
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Triage media files from an intake folder into 3 top-level folders: /Volumes/LaCie/Storage/Priority 4/Media Preprocessing/TriageMediaIntake/[Duplicates|Review-Similar|New]/<triage_id>."
+        description=(
+            "Triage media files from an intake folder into 3 categories across 2 drives:\n"
+            "  - DELL1TB02: /Volumes/DELL1TB02/Storage/Priority 4/Media Preprocessing/TriageMediaIntake/Duplicates/<triage_id>\n"
+            "  - LaCie:     /Volumes/LaCie/Storage/Priority 4/Media Preprocessing/TriageMediaIntake/[Review-Similar|New]/<triage_id>"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("target_dir", nargs="?", default=DEFAULT_MEDIA_PREPROCESSING_DIR,
                         help=f"Source intake directory to scan and triage (default: {DEFAULT_MEDIA_PREPROCESSING_DIR})")
-    parser.add_argument("--dest-dir", default=None,
-                        help=f"Base destination directory (default: {TRIAGE_DESTINATION_ROOT})")
+    parser.add_argument("--lacie-dest-dir", "--dest-dir", dest="lacie_dest_dir", default=None,
+                        help=f"LaCie base destination directory for Review-Similar and New (default: {TRIAGE_LACIE_DESTINATION_ROOT})")
+    parser.add_argument("--dell-dest-dir", dest="dell_dest_dir", default=None,
+                        help=f"DELL1TB02 base destination directory for Duplicates (default: {TRIAGE_DELL_DESTINATION_ROOT})")
     parser.add_argument("--triage-id", default=None,
                         help="Custom triage session ID (default: auto-increment integer ID from database)")
     parser.add_argument("--dry-run", action="store_true",
@@ -1271,20 +1307,25 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
     if args.tag_only:
-        dest_root = os.path.abspath(args.dest_dir or TRIAGE_DESTINATION_ROOT)
-        print(f"🏷️  Applying macOS Finder tags to triage folders in: {dest_root}")
-        res = tag_triage_folders(dest_root, triage_id=args.triage_id)
+        lacie_root = os.path.abspath(args.lacie_dest_dir or TRIAGE_LACIE_DESTINATION_ROOT)
+        dell_root = os.path.abspath(args.dell_dest_dir or TRIAGE_DELL_DESTINATION_ROOT)
+        print(f"🏷️  Applying macOS Finder tags to triage folders:")
+        print(f"   - DELL1TB02: {dell_root}")
+        print(f"   - LaCie:     {lacie_root}")
+        res = tag_triage_folders(lacie_dest_root=lacie_root, dell_dest_root=dell_root, triage_id=args.triage_id)
         for folder_rel, (color, ok) in res.items():
             icon = "🔴" if color == "Red" else "🟡" if color == "Yellow" else "🟠" if color == "Orange" else "🟢"
             status = "✅" if ok else "⚠️"
-            print(f"   {status} {folder_rel:<40} -> {color} {icon}")
+            print(f"   {status} {folder_rel:<45} -> {color} {icon}")
         if not res:
             print("   ℹ️ No triage folders (Duplicates, Review-Similar, New) found to tag.")
     else:
         triage_intake_folder(
             args.target_dir,
-            dest_root_dir=args.dest_dir,
+            lacie_dest_root=args.lacie_dest_dir,
+            dell_dest_root=args.dell_dest_dir,
             triage_id=args.triage_id,
             dry_run=args.dry_run,
             clean_empty=not args.no_clean
         )
+

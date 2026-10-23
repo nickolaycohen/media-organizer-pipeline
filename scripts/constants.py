@@ -19,7 +19,9 @@ TRIAGE_LOG_PATH = os.path.abspath(os.path.join(BASE_DIR, '../logs/triage_media_i
 # Paths to the Apple Photos database and Media Organizer database
 # For safety - during DEV will use a copy of the All-Media DB 
 # Copy of the DB:
-APPLE_PHOTOS_DB_PATH = '/Volumes/Extreme Pro/Photos Library/All-Media.photoslibrary/database/Photos.sqlite'
+APPLE_PHOTOS_LIBRARY_PATH = '/Volumes/Extreme Pro/Photos Library/All-Media.photoslibrary'
+APPLE_PHOTOS_ORIGINALS_PATH = os.path.join(APPLE_PHOTOS_LIBRARY_PATH, 'originals')
+APPLE_PHOTOS_DB_PATH = os.path.join(APPLE_PHOTOS_LIBRARY_PATH, 'database/Photos.sqlite')
 STAGING_ROOT = '/Volumes/LaCie/Media Organizer/Google Photos/01-MonthlyExports/'
 CURATED_EXPORT_DIR = '/Volumes/LaCie/Media Organizer/Google Photos/02-AICurrateList/'
 TO_BE_CURATED_DIR = '/Volumes/LaCie/Media Organizer/ToBeCurated/'

@@ -6,17 +6,19 @@ import argparse
 import time
 import re
 import bisect
-from datetime import datetime
+from datetime import datetime, timedelta
 
-# Add project root to sys.path
+# Add project root and script dir to sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+sys.path.insert(0, os.path.dirname(__file__))
 
 from constants import (
     MEDIA_ORGANIZER_DB_PATH,
     TRIAGE_LOG_PATH,
     DEFAULT_MEDIA_PREPROCESSING_DIR,
     TRIAGE_INTAKE_FOLDER_NAME,
-    TRIAGE_DESTINATION_ROOT
+    TRIAGE_DESTINATION_ROOT,
+    APPLE_PHOTOS_ORIGINALS_PATH
 )
 from utils.logger import setup_logger
 from utils.finder_tags import apply_finder_tag
@@ -27,6 +29,20 @@ try:
 except ImportError:
     HAS_EXIFREAD = False
 
+try:
+    from PIL import Image
+    import imagehash
+    HAS_IMAGEHASH = True
+except ImportError:
+    HAS_IMAGEHASH = False
+
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+    HAS_HEIF = True
+except ImportError:
+    HAS_HEIF = False
+
 MODULE_TAG = "triage_media_intake"
 logger = setup_logger(TRIAGE_LOG_PATH, MODULE_TAG)
 
@@ -34,6 +50,10 @@ MEDIA_EXTENSIONS = {
     '.jpg', '.jpeg', '.png', '.heic', '.mov', '.mp4', '.m4v',
     '.avi', '.dng', '.cr2', '.cr3', '.raw', '.gif', '.tif',
     '.tiff', '.webp', '.3gp', '.bmp'
+}
+
+IMAGE_EXTENSIONS_FOR_HASH = {
+    '.jpg', '.jpeg', '.png', '.heic', '.tif', '.tiff', '.webp', '.bmp', '.dng'
 }
 
 DISCARD_FOLDER_KEYWORDS = {
@@ -55,7 +75,7 @@ TRIAGE_FOLDER_TAGS = {
 }
 
 def ensure_triage_tables(conn):
-    """Ensures triage_sessions and triage_session_assets tables exist in the DB."""
+    """Ensures triage_sessions and triage_session_assets tables exist in the DB with all required columns."""
     c = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS triage_sessions (
@@ -81,7 +101,9 @@ def ensure_triage_tables(conn):
             new_bytes                   INTEGER DEFAULT 0,
             dry_run                     INTEGER DEFAULT 0,
             started_at_utc              TEXT DEFAULT (datetime('now')),
-            completed_at_utc            TEXT
+            completed_at_utc            TEXT,
+            visual_duplicate_count      INTEGER DEFAULT 0,
+            moment_matched_count        INTEGER DEFAULT 0
         )
     """)
     c.execute("""
@@ -96,9 +118,36 @@ def ensure_triage_tables(conn):
             sub_type                    TEXT,
             decision_reason             TEXT,
             destination_path            TEXT,
-            created_at_utc              TEXT DEFAULT (datetime('now'))
+            created_at_utc              TEXT DEFAULT (datetime('now')),
+            matched_asset_uuid          TEXT,
+            matched_moment_name         TEXT,
+            visual_similarity_score     REAL,
+            hamming_distance            INTEGER,
+            perceptual_hash             TEXT
         )
     """)
+
+    # Safety migrations in case tables were previously created without these columns
+    c.execute("PRAGMA table_info(triage_sessions)")
+    ts_cols = {row[1] for row in c.fetchall()}
+    if "visual_duplicate_count" not in ts_cols:
+        c.execute("ALTER TABLE triage_sessions ADD COLUMN visual_duplicate_count INTEGER DEFAULT 0")
+    if "moment_matched_count" not in ts_cols:
+        c.execute("ALTER TABLE triage_sessions ADD COLUMN moment_matched_count INTEGER DEFAULT 0")
+
+    c.execute("PRAGMA table_info(triage_session_assets)")
+    tsa_cols = {row[1] for row in c.fetchall()}
+    if "matched_asset_uuid" not in tsa_cols:
+        c.execute("ALTER TABLE triage_session_assets ADD COLUMN matched_asset_uuid TEXT")
+    if "matched_moment_name" not in tsa_cols:
+        c.execute("ALTER TABLE triage_session_assets ADD COLUMN matched_moment_name TEXT")
+    if "visual_similarity_score" not in tsa_cols:
+        c.execute("ALTER TABLE triage_session_assets ADD COLUMN visual_similarity_score REAL")
+    if "hamming_distance" not in tsa_cols:
+        c.execute("ALTER TABLE triage_session_assets ADD COLUMN hamming_distance INTEGER")
+    if "perceptual_hash" not in tsa_cols:
+        c.execute("ALTER TABLE triage_session_assets ADD COLUMN perceptual_hash TEXT")
+
     conn.commit()
 
 def determine_triage_id(db_path, dest_root_dir, requested_id=None):
@@ -226,14 +275,34 @@ def extract_exif_data(file_path):
         pass
     return None, None
 
+def compute_phash(file_path):
+    """
+    Computes perceptual hash (64-bit pHash) of an image file using Pillow and imagehash.
+    Returns (imagehash.ImageHash, hex_str) or (None, None).
+    """
+    if not HAS_IMAGEHASH:
+        return None, None
+    try:
+        with Image.open(file_path) as img:
+            h = imagehash.phash(img)
+            return h, str(h)
+    except Exception:
+        return None, None
+
 class LibraryIndex:
-    def __init__(self, db_path):
+    def __init__(self, db_path, originals_dir=None):
         self.db_path = db_path
+        self.originals_dir = originals_dir or APPLE_PHOTOS_ORIGINALS_PATH
+        self.has_originals = os.path.isdir(self.originals_dir)
         self.size_name_map = {}
         self.size_date_map = {}
-        self.name_date_map = {}   # (filename_lower, ymd) -> list of entries
-        self.date_seq_map = {}    # date_ymd -> set of (prefix_lower, seq_num)
-        self.date_ts_map = {}     # date_ymd -> sorted list of unix_ts
+        self.name_date_map = {}      # (filename_lower, ymd) -> list of entries
+        self.date_seq_map = {}       # date_ymd -> set of (prefix_lower, seq_num)
+        self.date_ts_map = {}        # date_ymd -> sorted list of unix_ts
+        self.date_assets_map = {}    # date_ymd -> list of entries (for visual candidate lookup)
+        self.moment_assets_map = {}  # moment_name.lower() -> list of entries
+        self.date_moments_map = {}   # date_ymd -> set of moment names
+        self.lib_hash_cache = {}     # uuid -> (imagehash.ImageHash, hex_str)
         self.removed_assets_set = set() # (name_lower) of assets marked removed_from_source
         self.total_assets = 0
 
@@ -246,29 +315,35 @@ class LibraryIndex:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
-        # Query ZASSET and ZADDITIONALASSETATTRIBUTES for all assets
+        # Query ZASSET, ZADDITIONALASSETATTRIBUTES, and assets table for MomentsAlbumName
         query = """
             SELECT 
                 aaa.ZORIGINALFILESIZE, 
                 aaa.ZORIGINALFILENAME, 
                 a.ZFILENAME, 
                 a.ZUUID, 
+                a.ZDIRECTORY,
                 datetime(a.ZDATECREATED + 978307200, 'unixepoch') AS date_created,
-                (a.ZDATECREATED + 978307200) AS unix_ts
+                (a.ZDATECREATED + 978307200) AS unix_ts,
+                ast.MomentsAlbumName
             FROM ZASSET a 
             JOIN ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK
+            LEFT JOIN assets ast ON ast.asset_id = a.ZUUID
         """
         cursor.execute(query)
         rows = cursor.fetchall()
         self.total_assets = len(rows)
 
-        for sz, orig_name, cur_name, uuid, dt, unix_ts in rows:
+        for sz, orig_name, cur_name, uuid, zdir, dt, unix_ts, moment_name in rows:
             entry = {
                 "uuid": uuid,
                 "original_filename": orig_name or cur_name,
+                "cur_filename": cur_name,
+                "directory": zdir,
                 "date_created": dt,
                 "unix_ts": unix_ts,
-                "sz": sz or 0
+                "sz": sz or 0,
+                "moment_name": moment_name
             }
             fname = orig_name or cur_name or ''
 
@@ -290,6 +365,14 @@ class LibraryIndex:
                 if cur_name and cur_name != orig_name:
                     k2 = (cur_name.lower(), dt_ymd)
                     self.name_date_map.setdefault(k2, []).append(entry)
+
+            # Date -> Assets map & Moment index for scoped visual candidates
+            if dt and len(dt) >= 10:
+                dt_ymd = dt[:10]
+                self.date_assets_map.setdefault(dt_ymd, []).append(entry)
+                if moment_name:
+                    self.date_moments_map.setdefault(dt_ymd, set()).add(moment_name)
+                    self.moment_assets_map.setdefault(moment_name.lower(), []).append(entry)
 
             # Sequence parsing
             if dt and len(dt) >= 10 and fname:
@@ -324,36 +407,59 @@ class LibraryIndex:
         logger.info(f"✅ Loaded {self.total_assets:,} library assets in {load_time:.2f}s.")
         logger.info(f"   - Size+Name Index: {len(self.size_name_map):,} keys")
         logger.info(f"   - Name+Date Index: {len(self.name_date_map):,} keys")
-        logger.info(f"   - Dates Indexed for Sequence/Burst Proximity: {len(self.date_seq_map):,} dates")
+        logger.info(f"   - Date Clusters Indexed: {len(self.date_assets_map):,} dates")
+        logger.info(f"   - Apple Photos Moments Indexed: {len(self.moment_assets_map):,} moments")
+        if self.has_originals:
+            logger.info(f"   - Apple Photos Originals Root: {self.originals_dir}")
+        else:
+            logger.warning(f"   - ⚠️ Apple Photos Originals Root not found at: {self.originals_dir} (visual hashing disabled)")
+
+    def get_library_asset_hash(self, entry):
+        """
+        Retrieves or computes the perceptual hash for a library asset.
+        Uses in-memory cache to ensure each library asset is hashed at most once.
+        """
+        uuid = entry.get("uuid")
+        if uuid in self.lib_hash_cache:
+            return self.lib_hash_cache[uuid]
+
+        if not self.has_originals:
+            return None, None
+
+        zdir = entry.get("directory")
+        curname = entry.get("cur_filename")
+        if not zdir or not curname:
+            return None, None
+
+        lib_file_path = os.path.join(self.originals_dir, zdir, curname)
+        if not os.path.exists(lib_file_path):
+            self.lib_hash_cache[uuid] = (None, None)
+            return None, None
+
+        h_obj, h_str = compute_phash(lib_file_path)
+        self.lib_hash_cache[uuid] = (h_obj, h_str)
+        return h_obj, h_str
 
     def evaluate_asset(self, file_path, rel_path, file_size, filename):
         """
-        Multi-tier quality & duplicate evaluation:
-        Returns (category, sub_type, reason, matched_entry)
+        Multi-tier quality, duplicate & visual similarity evaluation:
+        Returns (category, sub_type, reason, matched_entry, visual_meta)
         Categories: 'duplicate', 'review_similar', 'new'
         """
         fname_lower = filename.lower()
         rel_lower = rel_path.lower()
         ext = os.path.splitext(fname_lower)[1]
 
-        # ---------------------------------------------------------
-        # TIER 1: Exact Byte-Level Duplicates
-        # ---------------------------------------------------------
-        key_name = (file_size, fname_lower)
-        if key_name in self.size_name_map:
-            matched = self.size_name_map[key_name]
-            reason = f"Exact byte match ({format_size(file_size)}) and filename ({matched['original_filename']}) match All-Media asset {matched['uuid']}"
-            return "duplicate", "identical", reason, matched
+        visual_meta = {
+            "matched_asset_uuid": None,
+            "matched_moment_name": None,
+            "visual_similarity_score": None,
+            "hamming_distance": None,
+            "perceptual_hash": None
+        }
 
+        # Extract capture date / timestamp from EXIF or fallback to path/filename
         exif_ymd, exif_ts = extract_exif_data(file_path)
-        if exif_ymd:
-            key_date = (file_size, exif_ymd)
-            if key_date in self.size_date_map:
-                matched = self.size_date_map[key_date]
-                reason = f"Exact byte match ({format_size(file_size)}) and EXIF date ({exif_ymd}) match All-Media asset {matched['uuid']} ({matched['original_filename']})"
-                return "duplicate", "identical", reason, matched
-
-        # Fallback date parsing from folder/filename if EXIF missing
         if not exif_ymd:
             date_match = re.search(r'20\d{2}[-_](0[1-9]|1[0-2])[-_](0[1-9]|[12]\d|3[01])', rel_path)
             if date_match:
@@ -368,27 +474,201 @@ class LibraryIndex:
                     except ValueError:
                         pass
 
+        # Determine candidate dates (handling UTC vs local time zone shifts of +-1 day)
+        candidate_dates = [exif_ymd] if exif_ymd else []
+        if exif_ymd:
+            try:
+                dt_base = datetime.strptime(exif_ymd, "%Y-%m-%d")
+                candidate_dates.append((dt_base + timedelta(days=1)).strftime("%Y-%m-%d"))
+                candidate_dates.append((dt_base - timedelta(days=1)).strftime("%Y-%m-%d"))
+            except ValueError:
+                pass
+
+        # Check if capture date aligns with any Apple Photos Moment
+        if candidate_dates:
+            for d_chk in candidate_dates:
+                if d_chk in self.date_moments_map:
+                    visual_meta["matched_moment_name"] = sorted(self.date_moments_map[d_chk])[0]
+                    break
+
+        # Check if intake file is a hashable image format
+        is_image = ext in IMAGE_EXTENSIONS_FOR_HASH
+        intake_h_obj, intake_h_str = (None, None)
+        if is_image and HAS_IMAGEHASH:
+            intake_h_obj, intake_h_str = compute_phash(file_path)
+            if intake_h_str:
+                visual_meta["perceptual_hash"] = intake_h_str
+
+        # ---------------------------------------------------------
+        # TIER 1: Exact Byte-Level Duplicates
+        # ---------------------------------------------------------
+        key_name = (file_size, fname_lower)
+        if key_name in self.size_name_map:
+            matched = self.size_name_map[key_name]
+            visual_meta["matched_asset_uuid"] = matched["uuid"]
+            if matched.get("moment_name"):
+                visual_meta["matched_moment_name"] = matched["moment_name"]
+            visual_meta["visual_similarity_score"] = 100.0
+            visual_meta["hamming_distance"] = 0
+            reason = f"Exact byte match ({format_size(file_size)}) and filename ({matched['original_filename']}) match All-Media asset {matched['uuid']}"
+            if visual_meta.get("matched_moment_name"):
+                reason += f" [Moment: {visual_meta['matched_moment_name']}]"
+            return "duplicate", "identical", reason, matched, visual_meta
+
+        if candidate_dates:
+            for d_chk in candidate_dates:
+                key_date = (file_size, d_chk)
+                if key_date in self.size_date_map:
+                    matched = self.size_date_map[key_date]
+                    visual_meta["matched_asset_uuid"] = matched["uuid"]
+                    if matched.get("moment_name"):
+                        visual_meta["matched_moment_name"] = matched["moment_name"]
+                    visual_meta["visual_similarity_score"] = 100.0
+                    visual_meta["hamming_distance"] = 0
+                    reason = f"Exact byte match ({format_size(file_size)}) and date ({d_chk}) match All-Media asset {matched['uuid']} ({matched['original_filename']})"
+                    if visual_meta.get("matched_moment_name"):
+                        reason += f" [Moment: {visual_meta['matched_moment_name']}]"
+                    return "duplicate", "identical", reason, matched, visual_meta
+
         # ---------------------------------------------------------
         # TIER 2: Quality & Size Comparison Against Same Photo
         # (Same filename & date, but different byte size)
         # ---------------------------------------------------------
-        if exif_ymd and (fname_lower, exif_ymd) in self.name_date_map:
-            matching_lib_entries = self.name_date_map[(fname_lower, exif_ymd)]
-            lib_entry = matching_lib_entries[0]
-            lib_sz = lib_entry["sz"]
+        if candidate_dates:
+            matching_lib_entries = None
+            for d_chk in candidate_dates:
+                if (fname_lower, d_chk) in self.name_date_map:
+                    matching_lib_entries = self.name_date_map[(fname_lower, d_chk)]
+                    break
 
-            if lib_sz > 0:
-                diff = file_size - lib_sz
-                pct = (diff / lib_sz) * 100
+            if matching_lib_entries:
+                lib_entry = matching_lib_entries[0]
+                lib_sz = lib_entry["sz"]
+                visual_meta["matched_asset_uuid"] = lib_entry["uuid"]
+                if lib_entry.get("moment_name"):
+                    visual_meta["matched_moment_name"] = lib_entry["moment_name"]
 
-                if file_size <= lib_sz * 1.02:
-                    # Intake file is smaller or essentially equal -> Library holds superior master!
-                    reason = f"Compressed duplicate of All-Media asset {lib_entry['uuid']} ({format_size(file_size)} vs {format_size(lib_sz)} in library, {pct:.1f}%; Library is superior)"
-                    return "duplicate", "compressed", reason, lib_entry
-                else:
-                    # Intake file is significantly larger (>2%) -> Potential Upgrade Candidate!
-                    reason = f"🌟 Potential Upgrade: Incoming file is larger/higher quality ({format_size(file_size)} vs {format_size(lib_sz)} in All-Media, +{pct:.1f}%; Asset: {lib_entry['uuid']})"
-                    return "review_similar", "upgrade_candidate", reason, lib_entry
+                # Compute visual similarity against library entry if possible
+                if intake_h_obj and self.has_originals:
+                    lib_h_obj, lib_h_str = self.get_library_asset_hash(lib_entry)
+                    if lib_h_obj:
+                        dist = intake_h_obj - lib_h_obj
+                        sim = max(0.0, 1.0 - (dist / 64.0)) * 100.0
+                        visual_meta["hamming_distance"] = dist
+                        visual_meta["visual_similarity_score"] = round(sim, 2)
+                if visual_meta["visual_similarity_score"] is None:
+                    visual_meta["visual_similarity_score"] = 100.0
+                    visual_meta["hamming_distance"] = 0
+
+                if lib_sz > 0:
+                    diff = file_size - lib_sz
+                    pct = (diff / lib_sz) * 100
+
+                    if file_size <= lib_sz * 1.02:
+                        # Intake file is smaller or essentially equal -> Library holds superior master!
+                        reason = f"Compressed duplicate of All-Media asset {lib_entry['uuid']} ({format_size(file_size)} vs {format_size(lib_sz)} in library, {pct:.1f}%; Library is superior)"
+                        if visual_meta.get("matched_moment_name"):
+                            reason += f" [Moment: {visual_meta['matched_moment_name']}]"
+                        return "duplicate", "compressed", reason, lib_entry, visual_meta
+                    else:
+                        # Intake file is significantly larger (>2%) -> Potential Upgrade Candidate!
+                        reason = f"🌟 Potential Upgrade: Incoming file is larger/higher quality ({format_size(file_size)} vs {format_size(lib_sz)} in All-Media, +{pct:.1f}%; Asset: {lib_entry['uuid']})"
+                        if visual_meta.get("matched_moment_name"):
+                            reason += f" [Moment: {visual_meta['matched_moment_name']}]"
+                        return "review_similar", "upgrade_candidate", reason, lib_entry, visual_meta
+
+        # ---------------------------------------------------------
+        # TIER 2.5: Scoped Visual Similarity & Perceptual Hashing
+        # (Detects duplicates or near-duplicates across different filenames)
+        # ---------------------------------------------------------
+        if intake_h_obj and self.has_originals:
+            candidates = []
+            if candidate_dates:
+                for d_chk in candidate_dates:
+                    if d_chk in self.date_assets_map:
+                        for entry in self.date_assets_map[d_chk]:
+                            if entry not in candidates:
+                                candidates.append(entry)
+
+            # Also check if any Moment name is mentioned in the path
+            for m_lower, m_entries in self.moment_assets_map.items():
+                if len(m_lower) > 3 and m_lower in rel_lower:
+                    for me in m_entries:
+                        if me not in candidates:
+                            candidates.append(me)
+
+            if candidates:
+                # Filter candidates to image extensions
+                cand_images = [
+                    c for c in candidates 
+                    if os.path.splitext(c.get("cur_filename", "").lower())[1] in IMAGE_EXTENSIONS_FOR_HASH
+                    or os.path.splitext(c.get("original_filename", "").lower())[1] in IMAGE_EXTENSIONS_FOR_HASH
+                ]
+
+                # If timestamp available, sort candidates by time proximity
+                if exif_ts and len(cand_images) > 1:
+                    cand_images.sort(key=lambda c: abs((c.get("unix_ts") or 0) - exif_ts))
+
+                best_match = None
+                min_dist = None
+                best_sim = None
+
+                # Test candidates (limit to closest 50 if huge set)
+                for cand in cand_images[:50]:
+                    cand_h_obj, cand_h_str = self.get_library_asset_hash(cand)
+                    if not cand_h_obj:
+                        continue
+                    dist = intake_h_obj - cand_h_obj
+                    sim = max(0.0, 1.0 - (dist / 64.0)) * 100.0
+
+                    if min_dist is None or dist < min_dist:
+                        min_dist = dist
+                        best_match = cand
+                        best_sim = sim
+
+                    # Exact visual match found, stop checking
+                    if dist == 0:
+                        break
+                    # High confidence match found, break early
+                    if dist <= 3:
+                        break
+
+                if min_dist is not None:
+                    if min_dist <= 3:
+                        # High-Confidence Visual Duplicate (>=95.3% match)
+                        lib_sz = best_match.get("sz", 0)
+                        visual_meta["matched_asset_uuid"] = best_match["uuid"]
+                        if best_match.get("moment_name"):
+                            visual_meta["matched_moment_name"] = best_match["moment_name"]
+                        visual_meta["visual_similarity_score"] = round(best_sim, 2)
+                        visual_meta["hamming_distance"] = min_dist
+
+                        if file_size <= lib_sz * 1.02:
+                            # Library is superior or equal
+                            pct = ((file_size - lib_sz) / lib_sz * 100) if lib_sz else 0
+                            reason = f"Visual duplicate of All-Media asset {best_match['uuid']} ({best_match['original_filename']}) - {best_sim:.1f}% match (dist {min_dist}), {format_size(file_size)} vs {format_size(lib_sz)} in library ({pct:+.1f}%); Library is superior"
+                            if visual_meta.get("matched_moment_name"):
+                                reason += f" [Moment: {visual_meta['matched_moment_name']}]"
+                            return "duplicate", "visual_duplicate", reason, best_match, visual_meta
+                        else:
+                            # Intake file is higher quality / larger!
+                            pct = ((file_size - lib_sz) / lib_sz * 100) if lib_sz else 0
+                            reason = f"🌟 Visual Upgrade Candidate: Higher quality ({format_size(file_size)} vs {format_size(lib_sz)} in library, +{pct:.1f}%) matching asset {best_match['uuid']} ({best_match['original_filename']}) with {best_sim:.1f}% visual match (dist {min_dist})"
+                            if visual_meta.get("matched_moment_name"):
+                                reason += f" [Moment: {visual_meta['matched_moment_name']}]"
+                            return "review_similar", "upgrade_candidate", reason, best_match, visual_meta
+
+                    elif 4 <= min_dist <= 8:
+                        # Visually Similar Photo / Burst / Moment Sibling (87.5% - 93.8% match)
+                        visual_meta["matched_asset_uuid"] = best_match["uuid"]
+                        if best_match.get("moment_name"):
+                            visual_meta["matched_moment_name"] = best_match["moment_name"]
+                        visual_meta["visual_similarity_score"] = round(best_sim, 2)
+                        visual_meta["hamming_distance"] = min_dist
+                        reason = f"Visually similar photo to All-Media asset {best_match['uuid']} ({best_match['original_filename']}) - {best_sim:.1f}% match (dist {min_dist})"
+                        if visual_meta.get("matched_moment_name"):
+                            reason += f" [Moment: {visual_meta['matched_moment_name']}]"
+                        return "review_similar", "visual_similar", reason, best_match, visual_meta
 
         # ---------------------------------------------------------
         # TIER 3: Suspected Discards, Burst Siblings, or Web Junk
@@ -399,17 +679,17 @@ class LibraryIndex:
             for kw in DISCARD_FOLDER_KEYWORDS:
                 if kw in seg:
                     reason = f"Located inside folder marked for deletion ('{seg}')"
-                    return "review_similar", "discard_folder", reason, None
+                    return "review_similar", "discard_folder", reason, None, visual_meta
 
         # 3B: Previously removed from source
         if fname_lower in self.removed_assets_set:
             reason = "Matches an asset previously removed from Apple Photos library (marked removed_from_source in DB)"
-            return "review_similar", "previously_removed", reason, None
+            return "review_similar", "previously_removed", reason, None, visual_meta
 
         # 3C: Web graphic / UI snippet
         if ext in WEB_ARTIFACT_EXTS and file_size < WEB_ARTIFACT_MAX_SIZE:
             reason = f"Web graphic / UI snippet artifact ({ext}, {format_size(file_size)})"
-            return "review_similar", "web_artifact", reason, None
+            return "review_similar", "web_artifact", reason, None, visual_meta
 
         # 3D: Sequence burst sibling on same date
         if exif_ymd and exif_ymd in self.date_seq_map:
@@ -423,7 +703,9 @@ class LibraryIndex:
                     if min_diff <= 15:
                         closest_num = min(existing_nums, key=lambda n: abs(n - snum))
                         reason = f"Sequence burst sibling on {exif_ymd} ({pfx}{snum} is {min_diff} shots away from existing library asset {pfx}{closest_num})"
-                        return "review_similar", "sequence_burst", reason, None
+                        if visual_meta.get("matched_moment_name"):
+                            reason += f" [Moment: {visual_meta['matched_moment_name']}]"
+                        return "review_similar", "sequence_burst", reason, None, visual_meta
 
         # 3E: Temporal burst proximity within 30 seconds
         if exif_ymd and exif_ts and exif_ymd in self.date_ts_map:
@@ -439,12 +721,17 @@ class LibraryIndex:
                 diff = abs(c_ts - exif_ts)
                 if diff <= 30.0:
                     reason = f"Temporal burst proximity on {exif_ymd} ({diff:.1f}s away from an existing library photo)"
-                    return "review_similar", "temporal_burst", reason, None
+                    if visual_meta.get("matched_moment_name"):
+                        reason += f" [Moment: {visual_meta['matched_moment_name']}]"
+                    return "review_similar", "temporal_burst", reason, None, visual_meta
 
         # ---------------------------------------------------------
         # TIER 4: High-Confidence Clean New Media
         # ---------------------------------------------------------
-        return "new", "clean_media", "Confirmed new asset (not in library, clean sequence)", None
+        reason = "Confirmed new asset (not in library, clean sequence)"
+        if visual_meta.get("matched_moment_name"):
+            reason += f" [Aligned with Moment: {visual_meta['matched_moment_name']}]"
+        return "new", "clean_media", reason, None, visual_meta
 
 def safe_move(src, dest):
     dest_dir = os.path.dirname(dest)
@@ -601,13 +888,18 @@ def triage_intake_folder(target_dir, dest_root_dir=None, triage_id=None, dry_run
         identical_dup_bytes = 0
         compressed_dup_count = 0
         compressed_dup_bytes = 0
+        visual_dup_count = 0
+        visual_dup_bytes = 0
 
         upgrade_count = 0
         upgrade_bytes = 0
+        visual_sim_count = 0
+        visual_sim_bytes = 0
         discard_sim_count = 0
         discard_sim_bytes = 0
         web_artifact_count = 0
         web_artifact_bytes = 0
+        moment_matched_count = 0
 
         total_dup_bytes = 0
         total_review_bytes = 0
@@ -619,10 +911,16 @@ def triage_intake_folder(target_dir, dest_root_dir=None, triage_id=None, dry_run
 
             if primary_candidates:
                 p_full, p_rel, p_f, p_sz, p_ext = primary_candidates[0]
-                cat, sub_type, reason, matched = index.evaluate_asset(p_full, p_rel, p_sz, p_f)
+                cat, sub_type, reason, matched, visual_meta = index.evaluate_asset(p_full, p_rel, p_sz, p_f)
+
+                if visual_meta and visual_meta.get("matched_moment_name"):
+                    moment_matched_count += len(file_group)
 
                 if cat == "duplicate":
-                    if sub_type == "compressed":
+                    if sub_type == "visual_duplicate":
+                        visual_dup_count += len(file_group)
+                        visual_dup_bytes += sum(it[3] for it in file_group)
+                    elif sub_type == "compressed":
                         compressed_dup_count += len(file_group)
                         compressed_dup_bytes += sum(it[3] for it in file_group)
                     else:
@@ -630,17 +928,22 @@ def triage_intake_folder(target_dir, dest_root_dir=None, triage_id=None, dry_run
                         identical_dup_bytes += sum(it[3] for it in file_group)
 
                     for item in primary_candidates:
-                        duplicates_list.append((item[0], item[1], item[2], item[3], reason))
+                        duplicates_list.append((item[0], item[1], item[2], item[3], reason, sub_type, visual_meta))
                         total_dup_bytes += item[3]
                     for v_item in video_candidates:
                         v_reason = f"Companion Live Photo video to duplicate {p_f} ({reason})"
-                        duplicates_list.append((v_item[0], v_item[1], v_item[2], v_item[3], v_reason))
+                        v_meta = visual_meta.copy() if visual_meta else {}
+                        v_meta["perceptual_hash"] = None
+                        duplicates_list.append((v_item[0], v_item[1], v_item[2], v_item[3], v_reason, sub_type, v_meta))
                         total_dup_bytes += v_item[3]
 
                 elif cat == "review_similar":
                     if sub_type == "upgrade_candidate":
                         upgrade_count += len(file_group)
                         upgrade_bytes += sum(it[3] for it in file_group)
+                    elif sub_type == "visual_similar":
+                        visual_sim_count += len(file_group)
+                        visual_sim_bytes += sum(it[3] for it in file_group)
                     elif sub_type == "web_artifact":
                         web_artifact_count += len(file_group)
                         web_artifact_bytes += sum(it[3] for it in file_group)
@@ -649,27 +952,34 @@ def triage_intake_folder(target_dir, dest_root_dir=None, triage_id=None, dry_run
                         discard_sim_bytes += sum(it[3] for it in file_group)
 
                     for item in primary_candidates:
-                        review_list.append((item[0], item[1], item[2], item[3], reason, sub_type))
+                        review_list.append((item[0], item[1], item[2], item[3], reason, sub_type, visual_meta))
                         total_review_bytes += item[3]
                     for v_item in video_candidates:
                         v_reason = f"Companion Live Photo video to review-similar asset {p_f} ({reason})"
-                        review_list.append((v_item[0], v_item[1], v_item[2], v_item[3], v_reason, sub_type))
+                        v_meta = visual_meta.copy() if visual_meta else {}
+                        v_meta["perceptual_hash"] = None
+                        review_list.append((v_item[0], v_item[1], v_item[2], v_item[3], v_reason, sub_type, v_meta))
                         total_review_bytes += v_item[3]
 
                 else:
                     for item in primary_candidates:
-                        new_list.append((item[0], item[1], item[2], item[3], reason))
+                        new_list.append((item[0], item[1], item[2], item[3], reason, sub_type, visual_meta))
                         total_new_bytes += item[3]
                     for v_item in video_candidates:
                         v_reason = f"Companion Live Photo video to new asset {p_f}"
-                        new_list.append((v_item[0], v_item[1], v_item[2], v_item[3], v_reason))
+                        v_meta = visual_meta.copy() if visual_meta else {}
+                        v_meta["perceptual_hash"] = None
+                        new_list.append((v_item[0], v_item[1], v_item[2], v_item[3], v_reason, sub_type, v_meta))
                         total_new_bytes += v_item[3]
 
             else:
                 # Standalone videos
                 for v_item in video_candidates:
                     v_full, v_rel, v_f, v_sz, v_ext = v_item
-                    cat, sub_type, reason, matched = index.evaluate_asset(v_full, v_rel, v_sz, v_f)
+                    cat, sub_type, reason, matched, visual_meta = index.evaluate_asset(v_full, v_rel, v_sz, v_f)
+
+                    if visual_meta and visual_meta.get("matched_moment_name"):
+                        moment_matched_count += 1
 
                     if cat == "duplicate":
                         if sub_type == "compressed":
@@ -678,7 +988,7 @@ def triage_intake_folder(target_dir, dest_root_dir=None, triage_id=None, dry_run
                         else:
                             identical_dup_count += 1
                             identical_dup_bytes += v_sz
-                        duplicates_list.append((v_full, v_rel, v_f, v_sz, reason))
+                        duplicates_list.append((v_full, v_rel, v_f, v_sz, reason, sub_type, visual_meta))
                         total_dup_bytes += v_sz
                     elif cat == "review_similar":
                         if sub_type == "upgrade_candidate":
@@ -690,10 +1000,10 @@ def triage_intake_folder(target_dir, dest_root_dir=None, triage_id=None, dry_run
                         else:
                             discard_sim_count += 1
                             discard_sim_bytes += v_sz
-                        review_list.append((v_full, v_rel, v_f, v_sz, reason, sub_type))
+                        review_list.append((v_full, v_rel, v_f, v_sz, reason, sub_type, visual_meta))
                         total_review_bytes += v_sz
                     else:
-                        new_list.append((v_full, v_rel, v_f, v_sz, reason))
+                        new_list.append((v_full, v_rel, v_f, v_sz, reason, sub_type, visual_meta))
                         total_new_bytes += v_sz
 
         # Step 4: Summary Output & Detailed Logging
@@ -707,36 +1017,62 @@ def triage_intake_folder(target_dir, dest_root_dir=None, triage_id=None, dry_run
         print(f"1. Duplicates Total:                                {len(duplicates_list):>5,} assets ({format_size(total_dup_bytes):>10})")
         print(f"   - Identical Matches:                             {identical_dup_count:>5,} assets ({format_size(identical_dup_bytes):>10})")
         print(f"   - Compressed Copies (Library is Superior):      {compressed_dup_count:>5,} assets ({format_size(compressed_dup_bytes):>10})")
+        if visual_dup_count > 0:
+            print(f"   - 👁️ Visual Duplicates (>=95% Match):             {visual_dup_count:>5,} assets ({format_size(visual_dup_bytes):>10})")
         print("-" * 78)
         print(f"2. Review-Similar Total:                            {len(review_list):>5,} assets ({format_size(total_review_bytes):>10})")
         print(f"   - 🌟 Upgrade Candidates (Intake is Better):      {upgrade_count:>5,} assets ({format_size(upgrade_bytes):>10})")
+        if visual_sim_count > 0:
+            print(f"   - 👁️ Visually Similar Photos (88-94% Match):      {visual_sim_count:>5,} assets ({format_size(visual_sim_bytes):>10})")
         print(f"   - Suspected Discard / Burst Siblings:           {discard_sim_count:>5,} assets ({format_size(discard_sim_bytes):>10})")
         print(f"   - Web / UI Graphic Artifacts (<50KB):           {web_artifact_count:>5,} assets ({format_size(web_artifact_bytes):>10})")
+        if moment_matched_count > 0:
+            print(f"   - 📍 Apple Photos Moment Matches:                 {moment_matched_count:>5,} assets")
         print("-" * 78)
         print(f"3. New (High-Confidence Clean Assets):              {len(new_list):>5,} assets ({format_size(total_new_bytes):>10})")
         print("=" * 78 + "\n")
 
-        logger.info(f"Triage result: {len(duplicates_list):,} Duplicates ({format_size(total_dup_bytes)}), {len(review_list):,} Review-Similar ({format_size(total_review_bytes)}), {len(new_list):,} New ({format_size(total_new_bytes)})")
+        logger.info(f"Triage result: {len(duplicates_list):,} Duplicates ({format_size(total_dup_bytes)}), {len(review_list):,} Review-Similar ({format_size(total_review_bytes)}), {len(new_list):,} New ({format_size(total_new_bytes)}) [Visual Dups: {visual_dup_count}, Moments: {moment_matched_count}]")
 
         # Log individual files
-        for src_full, rel_p, fname, sz, reason in duplicates_list:
-            logger.info(f"  [DUPLICATE]      {rel_p} ({format_size(sz)}) -> Duplicates/{triage_id}/{rel_p} | Reason: {reason}")
-        for item in review_list:
-            src_full, rel_p, fname, sz, reason, sub_type = item
-            sub_folder = f"Review-Similar/{triage_id}/Upgrade-Candidates" if sub_type == "upgrade_candidate" else f"Review-Similar/{triage_id}"
-            logger.info(f"  [REVIEW-SIMILAR] {rel_p} ({format_size(sz)}) -> {sub_folder}/{rel_p} | Reason: {reason}")
-        for src_full, rel_p, fname, sz, reason in new_list:
-            logger.info(f"  [NEW]            {rel_p} ({format_size(sz)}) -> New/{triage_id}/{rel_p} | Reason: {reason}")
+        for src_full, rel_p, fname, sz, reason, sub_t, vmeta in duplicates_list:
+            v_info = ""
+            if vmeta and vmeta.get("visual_similarity_score") is not None:
+                v_info = f" | Sim: {vmeta['visual_similarity_score']:.1f}% (dist {vmeta.get('hamming_distance')})"
+            if vmeta and vmeta.get("matched_moment_name"):
+                v_info += f" | Moment: {vmeta['matched_moment_name']}"
+            logger.info(f"  [DUPLICATE]      {rel_p} ({format_size(sz)}) -> Duplicates/{triage_id}/{rel_p} | Reason: {reason}{v_info}")
+
+        for src_full, rel_p, fname, sz, reason, sub_t, vmeta in review_list:
+            sub_folder = f"Review-Similar/{triage_id}/Upgrade-Candidates" if sub_t == "upgrade_candidate" else f"Review-Similar/{triage_id}"
+            v_info = ""
+            if vmeta and vmeta.get("visual_similarity_score") is not None:
+                v_info = f" | Sim: {vmeta['visual_similarity_score']:.1f}% (dist {vmeta.get('hamming_distance')})"
+            if vmeta and vmeta.get("matched_moment_name"):
+                v_info += f" | Moment: {vmeta['matched_moment_name']}"
+            logger.info(f"  [REVIEW-SIMILAR] {rel_p} ({format_size(sz)}) -> {sub_folder}/{rel_p} | Reason: {reason}{v_info}")
+
+        for src_full, rel_p, fname, sz, reason, sub_t, vmeta in new_list:
+            v_info = ""
+            if vmeta and vmeta.get("matched_moment_name"):
+                v_info += f" | Moment: {vmeta['matched_moment_name']}"
+            logger.info(f"  [NEW]            {rel_p} ({format_size(sz)}) -> New/{triage_id}/{rel_p} | Reason: {reason}{v_info}")
 
         if dry_run:
             print(f"🔍 [DRY RUN] Triage ID: {triage_id}")
             print(f"   Destination Hierarchy: {dest_root_dir}/[Category]/{triage_id}/")
             print(f"   Would move:")
             print(f"   - {len(duplicates_list):,} duplicates to '{duplicates_dir}/'")
+            if visual_dup_count > 0:
+                print(f"     └─ {visual_dup_count:,} visual duplicates (>=95% match, different filename)")
             if upgrade_count > 0:
                 print(f"   - {upgrade_count:,} upgrade candidates to '{review_dir}/Upgrade-Candidates/'")
+            if visual_sim_count > 0:
+                print(f"     └─ {visual_sim_count:,} visually similar photos (88-94% match)")
             print(f"   - {len(review_list) - upgrade_count:,} review items to '{review_dir}/'")
             print(f"   - {len(new_list):,} clean new assets to '{new_dir}/'")
+            if moment_matched_count > 0:
+                print(f"   📍 Apple Photos Moment Matches: {moment_matched_count:,} assets aligned with moments")
             print(f"🏷️  [DRY RUN] Would apply macOS Finder color tags to destination folders:")
             print(f"   - '{dest_root_dir}/Duplicates' (and /{triage_id})                     -> Red 🔴")
             print(f"   - '{dest_root_dir}/Review-Similar' (and /{triage_id})                -> Yellow 🟡")
@@ -752,7 +1088,7 @@ def triage_intake_folder(target_dir, dest_root_dir=None, triage_id=None, dry_run
         moved_review = 0
         moved_new = 0
 
-        for src_full, rel_p, fname, sz, reason in duplicates_list:
+        for src_full, rel_p, fname, sz, reason, sub_t, vmeta in duplicates_list:
             dest_full = os.path.join(duplicates_dir, rel_p)
             try:
                 safe_move(src_full, dest_full)
@@ -760,9 +1096,8 @@ def triage_intake_folder(target_dir, dest_root_dir=None, triage_id=None, dry_run
             except Exception as e:
                 logger.error(f"❌ Failed to move {src_full} to {dest_full}: {e}")
 
-        for item in review_list:
-            src_full, rel_p, fname, sz, reason, sub_type = item
-            if sub_type == "upgrade_candidate":
+        for src_full, rel_p, fname, sz, reason, sub_t, vmeta in review_list:
+            if sub_t == "upgrade_candidate":
                 dest_full = os.path.join(review_dir, "Upgrade-Candidates", rel_p)
             else:
                 dest_full = os.path.join(review_dir, rel_p)
@@ -772,7 +1107,7 @@ def triage_intake_folder(target_dir, dest_root_dir=None, triage_id=None, dry_run
             except Exception as e:
                 logger.error(f"❌ Failed to move {src_full} to {dest_full}: {e}")
 
-        for src_full, rel_p, fname, sz, reason in new_list:
+        for src_full, rel_p, fname, sz, reason, sub_t, vmeta in new_list:
             dest_full = os.path.join(new_dir, rel_p)
             try:
                 safe_move(src_full, dest_full)
@@ -826,6 +1161,8 @@ def triage_intake_folder(target_dir, dest_root_dir=None, triage_id=None, dry_run
                         web_artifact_bytes = ?,
                         new_count = ?,
                         new_bytes = ?,
+                        visual_duplicate_count = ?,
+                        moment_matched_count = ?,
                         completed_at_utc = datetime('now')
                     WHERE id = ?
                 """, (
@@ -837,28 +1174,48 @@ def triage_intake_folder(target_dir, dest_root_dir=None, triage_id=None, dry_run
                     discard_sim_count, discard_sim_bytes,
                     web_artifact_count, web_artifact_bytes,
                     moved_new, total_new_bytes,
+                    visual_dup_count,
+                    moment_matched_count,
                     db_session_pk
                 ))
 
                 asset_rows = []
-                for src_full, rel_p, fname, sz, reason in duplicates_list:
-                    sub_t = "compressed" if "Compressed duplicate" in reason else "identical"
+                for src_full, rel_p, fname, sz, reason, sub_t, vmeta in duplicates_list:
                     dest_p = os.path.join(duplicates_dir, rel_p)
-                    asset_rows.append((db_session_pk, triage_id, rel_p, fname, sz, "duplicate", sub_t, reason, dest_p))
-                for item in review_list:
-                    src_full, rel_p, fname, sz, reason, sub_t = item
+                    vmeta = vmeta or {}
+                    asset_rows.append((
+                        db_session_pk, triage_id, rel_p, fname, sz, "duplicate", sub_t, reason, dest_p,
+                        vmeta.get("matched_asset_uuid"), vmeta.get("matched_moment_name"),
+                        vmeta.get("visual_similarity_score"), vmeta.get("hamming_distance"),
+                        vmeta.get("perceptual_hash")
+                    ))
+                for src_full, rel_p, fname, sz, reason, sub_t, vmeta in review_list:
                     sub_f = "Upgrade-Candidates" if sub_t == "upgrade_candidate" else ""
                     dest_p = os.path.join(review_dir, sub_f, rel_p) if sub_f else os.path.join(review_dir, rel_p)
-                    asset_rows.append((db_session_pk, triage_id, rel_p, fname, sz, "review_similar", sub_t, reason, dest_p))
-                for src_full, rel_p, fname, sz, reason in new_list:
+                    vmeta = vmeta or {}
+                    asset_rows.append((
+                        db_session_pk, triage_id, rel_p, fname, sz, "review_similar", sub_t, reason, dest_p,
+                        vmeta.get("matched_asset_uuid"), vmeta.get("matched_moment_name"),
+                        vmeta.get("visual_similarity_score"), vmeta.get("hamming_distance"),
+                        vmeta.get("perceptual_hash")
+                    ))
+                for src_full, rel_p, fname, sz, reason, sub_t, vmeta in new_list:
                     dest_p = os.path.join(new_dir, rel_p)
-                    asset_rows.append((db_session_pk, triage_id, rel_p, fname, sz, "new", "clean_media", reason, dest_p))
+                    vmeta = vmeta or {}
+                    asset_rows.append((
+                        db_session_pk, triage_id, rel_p, fname, sz, "new", sub_t or "clean_media", reason, dest_p,
+                        vmeta.get("matched_asset_uuid"), vmeta.get("matched_moment_name"),
+                        vmeta.get("visual_similarity_score"), vmeta.get("hamming_distance"),
+                        vmeta.get("perceptual_hash")
+                    ))
 
                 cur.executemany("""
                     INSERT INTO triage_session_assets (
                         triage_session_id, triage_id, original_rel_path, filename,
-                        file_size_bytes, category, sub_type, decision_reason, destination_path
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        file_size_bytes, category, sub_type, decision_reason, destination_path,
+                        matched_asset_uuid, matched_moment_name, visual_similarity_score,
+                        hamming_distance, perceptual_hash
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, asset_rows)
                 db_conn.commit()
                 logger.info(f"💾 Logged triage session '{triage_id}' and {len(asset_rows):,} asset movements in DB.")

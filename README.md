@@ -65,6 +65,39 @@ Analyzes non-duplicate assets in `New` and `Review-Similar`, computing the close
 ### 🧭 Interactive Folder Decision Flow (`triage_folder_review.py`)
 Interactive review that surfaces top isolated assets and prompts to mark their parent folder as **Ignored** (skipping junk, web cache, disc rips) or **Scheduled** (tagging for library ingestion). Dynamically re-evaluates and bubbles up the next unreviewed folder after each decision!
 
+### 🚀 Unified Runner & CLI Gateway (`run.sh`)
+Launch the interactive terminal selector or execute any pipeline tool via fast subcommands:
+
+```bash
+# Open interactive terminal selector (auto-detects drives, categorizes all tools)
+./run.sh
+
+# Or launch any pipeline tool directly via subcommands:
+./run.sh planner              # Interactive Pipeline Planner (menu, batch mgmt, curation)
+./run.sh refresh              # Background database refresh service and metadata sync
+./run.sh executor             # Execute planned batch operations
+
+./run.sh triage               # Intake Triage Gateway on default preprocessing folder
+./run.sh triage /path/to/dir  # Intake Triage on custom directory
+./run.sh photos /path/to/lib  # Triage Photos Library (--ignore-duplicates, restore filenames)
+./run.sh reconcile --triage-id 37 # Reconcile Live Photo companion MOVs against master library
+
+./run.sh review               # Interactive Folder Review (Ignore junk or Schedule for library)
+./run.sh decisions            # List all recorded Ignored and Scheduled folders
+
+./run.sh isolated --top 30    # Bubble up most temporally isolated intake media
+./run.sh triage-report        # Audit deduplication volume across all triage intake sessions
+./run.sh duplicates           # Master library yearly asset distribution & duplicate clusters
+
+./run.sh merge /src /dst      # Production recursive directory merger and deduplicator
+```
+
+---
+
+### 💻 Direct Script Invocations
+
+You can also invoke any script directly using `python3`:
+
 ```bash
 # Preview standard intake triage without moving files (dry run)
 python3 scripts/triage_media_intake.py --dry-run

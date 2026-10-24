@@ -59,6 +59,9 @@ Generates comprehensive asset distribution and duplicate analysis across all 212
 ### 🛡️ Intake Triage Deduplication Report (`report_triage_deduplication.py`)
 Audits all intake triage sessions across external hard drives, reporting cumulative duplicate volume diverted, review-similar routed, novel media discovered, and individual per-session breakdowns.
 
+### ⏳ Triage Temporal Isolation Report (`report_triage_isolated_assets.py`)
+Analyzes non-duplicate assets in `New` and `Review-Similar`, computing the closest preceding and succeeding master library assets by date and bubbling up the most temporally isolated, unique media.
+
 ```bash
 # Preview standard intake triage without moving files (dry run)
 python3 scripts/triage_media_intake.py --dry-run
@@ -83,6 +86,10 @@ python3 scripts/report_library_duplicates.py --show-clusters 5
 # Generate Intake Triage deduplication summary & inspect specific session
 python3 scripts/report_triage_deduplication.py
 python3 scripts/report_triage_deduplication.py --session 41
+
+# Rank non-duplicate triage assets bubbling up the most temporally isolated/unique media
+python3 scripts/report_triage_isolated_assets.py --top 30
+python3 scripts/report_triage_isolated_assets.py --min-gap-days 7
 ```
 
 ---
@@ -475,6 +482,39 @@ python3 scripts/report_triage_deduplication.py --session 41
 
 # Output as GitHub Flavored Markdown
 python3 scripts/report_triage_deduplication.py --markdown
+```
+
+---
+
+### ⏳ Triage Intake Temporal Isolation & Uniqueness Report (`report_triage_isolated_assets.py`)
+
+Analyzes non-duplicate assets across both `New` and `Review-Similar` intake folders under `/Volumes/LaCie/Storage/Priority 4/Media Preprocessing/TriageMediaIntake/`.
+
+For every triage asset, it searches the master library catalog (`All-Media.photoslibrary`) for the closest preceding and succeeding assets by capture date, calculating the nearest-neighbor temporal isolation gap. Assets are stored in a temporary table and ranked with the furthest temporal distance bubbling up to the top, exposing the most distinct, unique, and unrepresented events.
+
+#### 🌟 Key Capabilities
+- **Binary Search Timeline Lookup**: Performs $O(\log N)$ nearest-neighbor lookups against 212,000+ cataloged assets in sub-second time.
+- **Nearest Neighbors Display**: Pinpoints both the closest preceding asset (`Closest Before: YYYY-MM-DD (filename) [-Nd]`) and closest succeeding asset (`Closest After: YYYY-MM-DD (filename) [+Nd]`).
+- **Isolation Distribution**: Automatically categorizes assets into:
+  - 🚀 **Ultra-Isolated (> 30 days gap)**: Completely distinct events/shoots with zero proximate library coverage.
+  - 🏖️ **Moderately Isolated (7–30 days)**: Gaps of 1 to 4 weeks.
+  - 📍 **Clustered (1–7 days)**: Media taken in the same general week.
+  - ⏱️ **Tight Neighbors (< 1 day)**: Captured alongside existing library shoots.
+- **Configurable Filters**: Filter by category (`--category {new, review_similar}`), minimum isolation days (`--min-gap-days D`), or session (`--session ID`).
+- **Export & Persistence**: Output as formatted terminal tables, GitHub-flavored Markdown (`--markdown`), CSV (`--csv <path>`), or save into a permanent database table (`--save-db-table <name>`).
+
+```bash
+# Show top 30 most temporally isolated assets across all intake sessions
+python3 scripts/report_triage_isolated_assets.py --top 30
+
+# Filter to assets with at least 14 days of temporal isolation from any master photo
+python3 scripts/report_triage_isolated_assets.py --min-gap-days 14
+
+# Filter only clean 'New' assets
+python3 scripts/report_triage_isolated_assets.py --category new --top 25
+
+# Export full ranking to CSV
+python3 scripts/report_triage_isolated_assets.py --csv triage_isolated_assets.csv
 ```
 
 ---

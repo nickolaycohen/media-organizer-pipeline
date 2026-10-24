@@ -187,22 +187,33 @@ def run_temporal_isolation_analysis(
     print(f"✅ Loaded {len(timeline):,} dated assets from All-Media catalog into timeline.")
 
     # 2. Fetch non-duplicate triage assets
-    query_conditions = ["category IN ('new', 'review_similar')"]
+    query_conditions = ["tsa.category IN ('new', 'review_similar')"]
     params = []
 
     if category_filter == "new":
-        query_conditions = ["category = 'new'"]
+        query_conditions = ["tsa.category = 'new'"]
     elif category_filter in ("review_similar", "review"):
-        query_conditions = ["category = 'review_similar'"]
+        query_conditions = ["tsa.category = 'review_similar'"]
 
     if session_filter:
-        query_conditions.append("triage_id = ?")
+        query_conditions.append("tsa.triage_id = ?")
         params.append(str(session_filter))
 
     where_clause = " AND ".join(query_conditions)
     cur.execute(f"""
-        SELECT id, triage_id, filename, category, sub_type, file_size_bytes, destination_path, decision_reason
-        FROM triage_session_assets
+        SELECT 
+            tsa.id, 
+            tsa.triage_id, 
+            tsa.filename, 
+            tsa.category, 
+            tsa.sub_type, 
+            tsa.file_size_bytes, 
+            tsa.destination_path, 
+            tsa.decision_reason,
+            ts.source_directory,
+            tsa.original_rel_path
+        FROM triage_session_assets tsa
+        LEFT JOIN triage_sessions ts ON ts.triage_id = tsa.triage_id OR ts.id = tsa.triage_session_id
         WHERE {where_clause}
     """, params)
     triage_rows = cur.fetchall()
@@ -221,6 +232,7 @@ def run_temporal_isolation_analysis(
             category TEXT,
             sub_type TEXT,
             filename TEXT,
+            source_folder TEXT,
             file_path TEXT,
             file_size_bytes INTEGER,
             date_created TEXT,
@@ -243,7 +255,7 @@ def run_temporal_isolation_analysis(
 
     insert_batch = []
     for row in triage_rows:
-        row_id, tid, fname, cat, sub_t, fsz, dest_p, reason = row
+        row_id, tid, fname, cat, sub_t, fsz, dest_p, reason, src_dir, orig_rel = row
         p = dest_p
         # If destination path doesn't point to actual file, check standard triage root
         if not p or not os.path.isfile(p):
@@ -251,6 +263,18 @@ def run_temporal_isolation_analysis(
             p_cand = os.path.join(triage_root, alt_cat, str(tid), fname)
             if os.path.isfile(p_cand):
                 p = p_cand
+
+        # Construct partial source folder representation
+        src_base = os.path.basename(src_dir.rstrip('/')) if src_dir else ''
+        rel_dir = os.path.dirname(orig_rel) if orig_rel else ''
+        if src_base and rel_dir:
+            src_partial = f"{src_base}/{rel_dir}"
+        elif src_base:
+            src_partial = src_base
+        elif rel_dir:
+            src_partial = rel_dir
+        else:
+            src_partial = "Triage Intake"
 
         dt = extract_creation_date(fname, p)
         if not dt:
@@ -274,7 +298,7 @@ def run_temporal_isolation_analysis(
         gap_display = format_days_gap(min_gap)
 
         insert_batch.append((
-            tid, cat, sub_t or 'clean_media', fname, p or '', fsz or 0, dt_str,
+            tid, cat, sub_t or 'clean_media', fname, src_partial, p or '', fsz or 0, dt_str,
             before[1] if before else None,
             before[3] if before else None,
             before[2] if before else None,
@@ -290,11 +314,11 @@ def run_temporal_isolation_analysis(
 
     mem_cur.executemany("""
         INSERT INTO temp_triage_isolated_assets (
-            triage_id, category, sub_type, filename, file_path, file_size_bytes, date_created,
+            triage_id, category, sub_type, filename, source_folder, file_path, file_size_bytes, date_created,
             closest_before_date, closest_before_name, closest_before_uuid, gap_before_days,
             closest_after_date, closest_after_name, closest_after_uuid, gap_after_days,
             min_gap_days, min_gap_display
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, insert_batch)
     mem_conn.commit()
 
@@ -318,7 +342,7 @@ def run_temporal_isolation_analysis(
     # 5. Query Bubbled Up Top Assets
     mem_cur.execute(f"""
         SELECT 
-            triage_id, category, sub_type, filename, file_size_bytes, date_created,
+            triage_id, category, sub_type, filename, source_folder, file_size_bytes, date_created,
             closest_before_date, closest_before_name, gap_before_days,
             closest_after_date, closest_after_name, gap_after_days,
             min_gap_days, min_gap_display
@@ -333,14 +357,14 @@ def run_temporal_isolation_analysis(
         with open(csv_path, "w", newline="", encoding="utf-8") as f_csv:
             writer = csv.writer(f_csv)
             writer.writerow([
-                "Triage ID", "Category", "Subtype", "Filename", "File Size Bytes", "Date Created",
+                "Triage ID", "Category", "Subtype", "Filename", "Source Folder", "File Size Bytes", "Date Created",
                 "Closest Before Date", "Closest Before Name", "Gap Before Days",
                 "Closest After Date", "Closest After Name", "Gap After Days",
                 "Min Gap Days", "Min Gap Formatted"
             ])
             mem_cur.execute("""
                 SELECT 
-                    triage_id, category, sub_type, filename, file_size_bytes, date_created,
+                    triage_id, category, sub_type, filename, source_folder, file_size_bytes, date_created,
                     closest_before_date, closest_before_name, gap_before_days,
                     closest_after_date, closest_after_name, gap_after_days,
                     min_gap_days, min_gap_display
@@ -363,6 +387,7 @@ def run_temporal_isolation_analysis(
                 category TEXT,
                 sub_type TEXT,
                 filename TEXT,
+                source_folder TEXT,
                 file_path TEXT,
                 file_size_bytes INTEGER,
                 date_created TEXT,
@@ -381,11 +406,17 @@ def run_temporal_isolation_analysis(
         mem_cur.execute("SELECT * FROM temp_triage_isolated_assets")
         all_temp = mem_cur.fetchall()
         write_cur.executemany(f"""
-            INSERT INTO {save_db_table} VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO {save_db_table} VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, all_temp)
         write_conn.commit()
         write_conn.close()
         print(f"💾 Saved {len(all_temp):,} records into permanent database table: '{save_db_table}' in {db_path}")
+
+    def truncate_middle(text, max_len=45):
+        if not text or len(text) <= max_len:
+            return text
+        part = (max_len - 3) // 2
+        return f"{text[:part]}...{text[-part:]}"
 
     # 6. Render Output
     if output_format == "markdown":
@@ -401,20 +432,21 @@ def run_temporal_isolation_analysis(
         print(f"- ⏱️ **Tight Neighbors (< 1 day)**: **{g_under_1 or 0:,}** assets *(Likely shot alongside existing library media)*\n")
 
         print(f"#### 🌟 Top {len(top_results)} Most Temporally Isolated Assets (Bubbled Up)")
-        print("| # | Min Gap | Triage | Category | Asset Filename | Date Created | Size | Closest Preceding Library Asset | Closest Succeeding Library Asset |")
-        print("| :-: | :---: | :-: | :---: | :--- | :---: | :---: | :--- | :--- |")
+        print("| # | Min Gap | Triage | Category | Asset Filename | Source Folder (Partial) | Date Created | Size | Closest Preceding Library Asset | Closest Succeeding Library Asset |")
+        print("| :-: | :---: | :-: | :---: | :--- | :--- | :---: | :---: | :--- | :--- |")
         for idx, r in enumerate(top_results, 1):
-            tid, cat, sub, fn, fsz, dt_c, b_dt, b_fn, b_gap, a_dt, a_fn, a_gap, m_gap, m_disp = r
+            tid, cat, sub, fn, src_f, fsz, dt_c, b_dt, b_fn, b_gap, a_dt, a_fn, a_gap, m_gap, m_disp = r
             b_desc = f"{b_dt[:10]} (`{b_fn}` -{b_gap:.1f}d)" if b_dt else "None (Start)"
             a_desc = f"{a_dt[:10]} (`{a_fn}` +{a_gap:.1f}d)" if a_dt else "None (End)"
-            print(f"| {idx} | **{m_disp}** | {tid} | `{cat}` | `{fn}` | {dt_c[:16]} | {format_size(fsz)} | {b_desc} | {a_desc} |")
+            disp_src = truncate_middle(src_f, 40)
+            print(f"| {idx} | **{m_disp}** | {tid} | `{cat}` | `{fn}` | `{disp_src}` | {dt_c[:16]} | {format_size(fsz)} | {b_desc} | {a_desc} |")
     else:
-        print("\n" + "=" * 96)
+        print("\n" + "=" * 100)
         print("⏳  TRIAGE INTAKE TEMPORAL ISOLATION & UNIQUENESS REPORT")
-        print("=" * 96)
+        print("=" * 100)
         print(f"Target Directory:      {triage_root}/[New | Review-Similar]")
         print(f"Total Assets Ranked:   {processed:,} (evaluated against 212,059 master library dates)")
-        print("-" * 96)
+        print("-" * 100)
         print("📊 Temporal Isolation Distribution:")
         print(f"   • 🚀 Ultra-Isolated (> 30 days gap):      {g_30 or 0:>6,} assets (Zero nearby media in All-Media)")
         print(f"   • 🏖️  Moderately Isolated (7 - 30 days):   {g_7_30 or 0:>6,} assets")
@@ -422,19 +454,20 @@ def run_temporal_isolation_analysis(
         print(f"   • ⏱️  Tight Neighbors (< 1 day):           {g_under_1 or 0:>6,} assets")
         print(f"   • 🌟 Maximum Isolation Gap:               {format_days_gap(max_gap)}")
         print(f"   • 📈 Average Nearest Neighbor Distance:   {avg_gap or 0:.1f} days")
-        print("=" * 96)
+        print("=" * 100)
 
         print(f"\n🌟 Top {len(top_results)} Most Temporally Isolated Assets (Bubbled Up to Top):")
-        print("-" * 96)
+        print("-" * 100)
         for idx, r in enumerate(top_results, 1):
-            tid, cat, sub, fn, fsz, dt_c, b_dt, b_fn, b_gap, a_dt, a_fn, a_gap, m_gap, m_disp = r
+            tid, cat, sub, fn, src_f, fsz, dt_c, b_dt, b_fn, b_gap, a_dt, a_fn, a_gap, m_gap, m_disp = r
             b_desc = f"{b_dt[:10]} ({b_fn}) [-{b_gap:.1f}d]" if b_dt else "None (Beginning of library)"
             a_desc = f"{a_dt[:10]} ({a_fn}) [+{a_gap:.1f}d]" if a_dt else "None (End of library)"
             badge = "🟢 NEW" if cat == "new" else "🟡 REVIEW"
             print(f"{idx:>2}. [{m_disp:<17}] {badge} [Triage {tid}] {fn:<26} ({format_size(fsz)}) | Captured: {dt_c}")
+            print(f"    📂 Source Folder:  {src_f}")
             print(f"    ⬅️  Closest Before: {b_desc}")
             print(f"    ➡️  Closest After:  {a_desc}")
-        print("=" * 96 + "\n")
+        print("=" * 100 + "\n")
 
     mem_conn.close()
 

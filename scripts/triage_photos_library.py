@@ -71,6 +71,121 @@ def resolve_library_media_root(library_path):
     return lib_abs
 
 
+def load_photos_library_metadata(library_path):
+    """
+    Attempts to read the internal Apple Photos SQLite database (Photos.sqlite or photos.db)
+    from the library package. Returns a dictionary mapping lower-cased UUIDs and internal
+    filenames to their original camera filenames (e.g. '0000609D...jpeg' -> 'IMG_4614.JPG').
+
+    To avoid slow seek latency on external mechanical HDDs, this function copies the
+    SQLite database to /tmp, queries the metadata tables, and cleans up the temp copy.
+    """
+    lib_abs = os.path.abspath(library_path)
+    db_candidates = [
+        os.path.join(lib_abs, "database", "Photos.sqlite"),
+        os.path.join(lib_abs, "database", "photos.db"),
+    ]
+    source_db = None
+    for cand in db_candidates:
+        if os.path.isfile(cand):
+            source_db = cand
+            break
+
+    if not source_db:
+        return {}
+
+    tmp_db = f"/tmp/photos_meta_{os.getpid()}_{int(time.time())}.sqlite"
+    name_map = {}
+
+    try:
+        logger.info(f"📚 Copying internal Photos database to local temporary storage for high-speed indexing: {source_db}")
+        sys.stdout.write("📚 Reading internal Photos SQLite database for original filenames...\n")
+        sys.stdout.flush()
+        shutil.copyfile(source_db, tmp_db)
+
+        conn = sqlite3.connect(f"file:{tmp_db}?mode=ro", uri=True)
+        cur = conn.cursor()
+
+        # Check existing tables
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        existing_tables = {r[0] for r in cur.fetchall()}
+
+        # 1. Modern macOS Photos (ZASSET or ZGENERICASSET + ZADDITIONALASSETATTRIBUTES)
+        asset_table = "ZASSET" if "ZASSET" in existing_tables else ("ZGENERICASSET" if "ZGENERICASSET" in existing_tables else None)
+        if asset_table and "ZADDITIONALASSETATTRIBUTES" in existing_tables:
+            cur.execute(f"SELECT Z_PK, ZUUID, ZFILENAME FROM {asset_table}")
+            asset_map = {}
+            for pk, uuid, fname in cur.fetchall():
+                asset_map[pk] = (uuid, fname)
+
+            cur.execute("SELECT ZASSET, ZORIGINALFILENAME FROM ZADDITIONALASSETATTRIBUTES WHERE ZORIGINALFILENAME IS NOT NULL")
+            for asset_pk, orig_fname in cur.fetchall():
+                if asset_pk in asset_map:
+                    uuid, fname = asset_map[asset_pk]
+                    if uuid:
+                        name_map[uuid.lower()] = orig_fname
+                    if fname:
+                        name_map[fname.lower()] = orig_fname
+                        stem = os.path.splitext(fname)[0]
+                        name_map[stem.lower()] = orig_fname
+
+        # 2. Older iPhoto / Aperture (RKMaster)
+        elif "RKMaster" in existing_tables:
+            cur.execute("SELECT uuid, fileName, originalFileName FROM RKMaster WHERE originalFileName IS NOT NULL")
+            for uuid, fname, orig_fname in cur.fetchall():
+                if uuid:
+                    name_map[uuid.lower()] = orig_fname
+                if fname:
+                    name_map[fname.lower()] = orig_fname
+                    stem = os.path.splitext(fname)[0]
+                    name_map[stem.lower()] = orig_fname
+
+        conn.close()
+        logger.info(f"✅ Indexed {len(name_map):,} original filename mappings from internal library database.")
+        print(f"✅ Indexed {len(name_map):,} original filename mappings from internal library database.")
+    except Exception as e:
+        logger.warning(f"Could not extract original filenames from Photos database: {e}")
+    finally:
+        if os.path.exists(tmp_db):
+            try:
+                os.remove(tmp_db)
+            except OSError:
+                pass
+
+    return name_map
+
+
+def resolve_asset_original_name(filename, original_names_map):
+    """
+    Resolves the original camera filename (e.g. IMG_4614.JPG) for a given
+    Apple Photos asset filename (e.g. 0000609D-6414-4E51-A7CF-83B6283E8632.jpeg or <UUID>_3.mov).
+    """
+    if not original_names_map:
+        return filename
+
+    f_lower = filename.lower()
+    if f_lower in original_names_map:
+        return original_names_map[f_lower]
+
+    stem, ext = os.path.splitext(filename)
+    stem_lower = stem.lower()
+    if stem_lower in original_names_map:
+        return original_names_map[stem_lower]
+
+    # Handle Live Photo companion video UUIDs (e.g. <UUID>_3.mov or <UUID>_1.mov)
+    clean_stem = re.sub(r'_\d+$', '', stem)
+    clean_lower = clean_stem.lower()
+    if clean_lower in original_names_map:
+        base_orig = original_names_map[clean_lower]
+        base_stem, _ = os.path.splitext(base_orig)
+        orig_ext = ext if ext.startswith('.') else f".{ext}"
+        if any(c.isupper() for c in base_orig):
+            orig_ext = orig_ext.upper()
+        return f"{base_stem}{orig_ext}"
+
+    return filename
+
+
 def triage_photos_library(library_path, lacie_dest_root=None, dell_dest_root=None, triage_id=None, dry_run=False, ignore_duplicates=False):
     library_path = os.path.abspath(library_path)
     media_root = resolve_library_media_root(library_path)
@@ -142,7 +257,12 @@ def triage_photos_library(library_path, lacie_dest_root=None, dell_dest_root=Non
         index = LibraryIndex(MEDIA_ORGANIZER_DB_PATH)
         index.load()
 
-        # Step 2: Discover candidate media files inside library originals/Masters
+        # Step 2: Index original filenames if internal Photos SQLite database is available
+        original_names_map = load_photos_library_metadata(library_path)
+        if original_names_map:
+            print("   ✨ Original camera filenames will be restored for all evaluated and exported assets.")
+
+        # Discover candidate media files inside library originals/Masters
         logger.info(f"🔍 Scanning library media directory: {media_root}")
         print(f"🔍 Scanning library media directory: {media_root}")
         candidate_files = []
@@ -167,7 +287,8 @@ def triage_photos_library(library_path, lacie_dest_root=None, dell_dest_root=Non
 
                 try:
                     sz = os.path.getsize(full_p)
-                    candidate_files.append((full_p, rel_p, f, sz))
+                    orig_f = resolve_asset_original_name(f, original_names_map)
+                    candidate_files.append((full_p, rel_p, f, orig_f, sz))
                 except OSError as e:
                     logger.warning(f"Could not stat {full_p}: {e}")
 
@@ -194,14 +315,14 @@ def triage_photos_library(library_path, lacie_dest_root=None, dell_dest_root=Non
                 db_conn.close()
             return
 
-        # Step 3: Live Photo companion grouping (normalizing <UUID>_3.mov stems)
+        # Step 3: Live Photo companion grouping (normalizing stems)
         grouped_by_stem = {}
-        for full_p, rel_p, f, sz in candidate_files:
+        for full_p, rel_p, f, orig_f, sz in candidate_files:
             dirname = os.path.dirname(rel_p)
-            stem, ext = os.path.splitext(f)
-            clean_stem = re.sub(r'_\d+$', '', stem) if re.match(r'^[0-9a-fA-F-]{36}_\d+$', stem) else stem
+            orig_stem, orig_ext = os.path.splitext(orig_f)
+            clean_stem = re.sub(r'_\d+$', '', orig_stem)
             key = (dirname, clean_stem.lower())
-            grouped_by_stem.setdefault(key, []).append((full_p, rel_p, f, sz, ext.lower()))
+            grouped_by_stem.setdefault(key, []).append((full_p, rel_p, f, orig_f, sz, orig_ext.lower()))
 
         # Step 4: Evaluate and classify assets
         duplicates_list = []
@@ -243,13 +364,13 @@ def triage_photos_library(library_path, lacie_dest_root=None, dell_dest_root=Non
                 )
                 sys.stdout.flush()
 
-            primary_candidates = [item for item in file_group if item[4] not in ('.mov', '.mp4')]
-            video_candidates = [item for item in file_group if item[4] in ('.mov', '.mp4')]
+            primary_candidates = [item for item in file_group if item[5] not in ('.mov', '.mp4')]
+            video_candidates = [item for item in file_group if item[5] in ('.mov', '.mp4')]
 
             if primary_candidates:
-                p_full, p_rel, p_f, p_sz, p_ext = primary_candidates[0]
+                p_full, p_rel, p_f, p_orig_f, p_sz, p_ext = primary_candidates[0]
                 cat, sub_type, reason, matched, visual_meta = index.evaluate_asset(
-                    p_full, p_rel, p_sz, p_f, is_photos_library=True
+                    p_full, p_rel, p_sz, p_orig_f, is_photos_library=True
                 )
 
                 if visual_meta and visual_meta.get("matched_moment_name"):
@@ -258,65 +379,65 @@ def triage_photos_library(library_path, lacie_dest_root=None, dell_dest_root=Non
                 if cat == "duplicate":
                     if sub_type == "visual_duplicate":
                         visual_dup_count += len(file_group)
-                        visual_dup_bytes += sum(it[3] for it in file_group)
+                        visual_dup_bytes += sum(it[4] for it in file_group)
                     elif sub_type == "compressed":
                         compressed_dup_count += len(file_group)
-                        compressed_dup_bytes += sum(it[3] for it in file_group)
+                        compressed_dup_bytes += sum(it[4] for it in file_group)
                     else:
                         identical_dup_count += len(file_group)
-                        identical_dup_bytes += sum(it[3] for it in file_group)
+                        identical_dup_bytes += sum(it[4] for it in file_group)
 
                     for item in primary_candidates:
-                        duplicates_list.append((item[0], item[1], item[2], item[3], reason, sub_type, visual_meta))
-                        total_dup_bytes += item[3]
+                        duplicates_list.append((item[0], item[1], item[3], item[4], reason, sub_type, visual_meta))
+                        total_dup_bytes += item[4]
                     for v_item in video_candidates:
-                        v_reason = f"Companion Live Photo video to duplicate {p_f} ({reason})"
+                        v_reason = f"Companion Live Photo video to duplicate {p_orig_f} ({reason})"
                         v_meta = visual_meta.copy() if visual_meta else {}
                         v_meta["perceptual_hash"] = None
-                        duplicates_list.append((v_item[0], v_item[1], v_item[2], v_item[3], v_reason, sub_type, v_meta))
-                        total_dup_bytes += v_item[3]
+                        duplicates_list.append((v_item[0], v_item[1], v_item[3], v_item[4], v_reason, sub_type, v_meta))
+                        total_dup_bytes += v_item[4]
 
                 elif cat == "review_similar":
                     if sub_type == "upgrade_candidate":
                         upgrade_count += len(file_group)
-                        upgrade_bytes += sum(it[3] for it in file_group)
+                        upgrade_bytes += sum(it[4] for it in file_group)
                     elif sub_type == "visual_similar":
                         visual_sim_count += len(file_group)
-                        visual_sim_bytes += sum(it[3] for it in file_group)
+                        visual_sim_bytes += sum(it[4] for it in file_group)
                     elif sub_type == "web_artifact":
                         web_artifact_count += len(file_group)
-                        web_artifact_bytes += sum(it[3] for it in file_group)
+                        web_artifact_bytes += sum(it[4] for it in file_group)
                     else:
                         discard_sim_count += len(file_group)
-                        discard_sim_bytes += sum(it[3] for it in file_group)
+                        discard_sim_bytes += sum(it[4] for it in file_group)
 
                     for item in primary_candidates:
-                        review_list.append((item[0], item[1], item[2], item[3], reason, sub_type, visual_meta))
-                        total_review_bytes += item[3]
+                        review_list.append((item[0], item[1], item[3], item[4], reason, sub_type, visual_meta))
+                        total_review_bytes += item[4]
                     for v_item in video_candidates:
-                        v_reason = f"Companion Live Photo video to review-similar asset {p_f} ({reason})"
+                        v_reason = f"Companion Live Photo video to review-similar asset {p_orig_f} ({reason})"
                         v_meta = visual_meta.copy() if visual_meta else {}
                         v_meta["perceptual_hash"] = None
-                        review_list.append((v_item[0], v_item[1], v_item[2], v_item[3], v_reason, sub_type, v_meta))
-                        total_review_bytes += v_item[3]
+                        review_list.append((v_item[0], v_item[1], v_item[3], v_item[4], v_reason, sub_type, v_meta))
+                        total_review_bytes += v_item[4]
 
                 else:
                     for item in primary_candidates:
-                        new_list.append((item[0], item[1], item[2], item[3], reason, sub_type, visual_meta))
-                        total_new_bytes += item[3]
+                        new_list.append((item[0], item[1], item[3], item[4], reason, sub_type, visual_meta))
+                        total_new_bytes += item[4]
                     for v_item in video_candidates:
-                        v_reason = f"Companion Live Photo video to new asset {p_f}"
+                        v_reason = f"Companion Live Photo video to new asset {p_orig_f}"
                         v_meta = visual_meta.copy() if visual_meta else {}
                         v_meta["perceptual_hash"] = None
-                        new_list.append((v_item[0], v_item[1], v_item[2], v_item[3], v_reason, sub_type, v_meta))
-                        total_new_bytes += v_item[3]
+                        new_list.append((v_item[0], v_item[1], v_item[3], v_item[4], v_reason, sub_type, v_meta))
+                        total_new_bytes += v_item[4]
 
             else:
                 # Standalone videos
                 for v_item in video_candidates:
-                    v_full, v_rel, v_f, v_sz, v_ext = v_item
+                    v_full, v_rel, v_f, v_orig_f, v_sz, v_ext = v_item
                     cat, sub_type, reason, matched, visual_meta = index.evaluate_asset(
-                        v_full, v_rel, v_sz, v_f, is_photos_library=True
+                        v_full, v_rel, v_sz, v_orig_f, is_photos_library=True
                     )
 
                     if visual_meta and visual_meta.get("matched_moment_name"):
@@ -329,7 +450,7 @@ def triage_photos_library(library_path, lacie_dest_root=None, dell_dest_root=Non
                         else:
                             identical_dup_count += 1
                             identical_dup_bytes += v_sz
-                        duplicates_list.append((v_full, v_rel, v_f, v_sz, reason, sub_type, visual_meta))
+                        duplicates_list.append((v_full, v_rel, v_orig_f, v_sz, reason, sub_type, visual_meta))
                         total_dup_bytes += v_sz
                     elif cat == "review_similar":
                         if sub_type == "upgrade_candidate":
@@ -341,10 +462,10 @@ def triage_photos_library(library_path, lacie_dest_root=None, dell_dest_root=Non
                         else:
                             discard_sim_count += 1
                             discard_sim_bytes += v_sz
-                        review_list.append((v_full, v_rel, v_f, v_sz, reason, sub_type, visual_meta))
+                        review_list.append((v_full, v_rel, v_orig_f, v_sz, reason, sub_type, visual_meta))
                         total_review_bytes += v_sz
                     else:
-                        new_list.append((v_full, v_rel, v_f, v_sz, reason, sub_type, visual_meta))
+                        new_list.append((v_full, v_rel, v_orig_f, v_sz, reason, sub_type, visual_meta))
                         total_new_bytes += v_sz
 
         sys.stdout.write("\r" + " " * 95 + "\r")
@@ -426,33 +547,33 @@ def triage_photos_library(library_path, lacie_dest_root=None, dell_dest_root=Non
                 logger.info(f"🚚 Replication Progress: {moved_total:,}/{total_to_move:,} ({pct:.0f}%)")
 
         if not ignore_duplicates:
-            for src_full, rel_p, fname, sz, reason, sub_t, vmeta in duplicates_list:
-                dest_full = os.path.join(duplicates_dir, rel_p)
+            for src_full, rel_p, orig_f, sz, reason, sub_t, vmeta in duplicates_list:
+                dest_full = os.path.join(duplicates_dir, orig_f)
                 try:
-                    safe_copy(src_full, dest_full)
+                    dest_full = safe_copy(src_full, dest_full)
                     replicated_duplicates += 1
                 except Exception as e:
                     logger.error(f"❌ Failed to copy duplicate {src_full} -> {dest_full}: {e}")
                 moved_total += 1
                 report_copy_progress()
 
-        for src_full, rel_p, fname, sz, reason, sub_t, vmeta in review_list:
+        for src_full, rel_p, orig_f, sz, reason, sub_t, vmeta in review_list:
             if sub_t == "upgrade_candidate":
-                dest_full = os.path.join(review_dir, "Upgrade-Candidates", rel_p)
+                dest_full = os.path.join(review_dir, "Upgrade-Candidates", orig_f)
             else:
-                dest_full = os.path.join(review_dir, rel_p)
+                dest_full = os.path.join(review_dir, orig_f)
             try:
-                safe_copy(src_full, dest_full)
+                dest_full = safe_copy(src_full, dest_full)
                 replicated_review += 1
             except Exception as e:
                 logger.error(f"❌ Failed to copy review asset {src_full} -> {dest_full}: {e}")
             moved_total += 1
             report_copy_progress()
 
-        for src_full, rel_p, fname, sz, reason, sub_t, vmeta in new_list:
-            dest_full = os.path.join(new_dir, rel_p)
+        for src_full, rel_p, orig_f, sz, reason, sub_t, vmeta in new_list:
+            dest_full = os.path.join(new_dir, orig_f)
             try:
-                safe_copy(src_full, dest_full)
+                dest_full = safe_copy(src_full, dest_full)
                 replicated_new += 1
             except Exception as e:
                 logger.error(f"❌ Failed to copy new asset {src_full} -> {dest_full}: {e}")
@@ -518,34 +639,35 @@ def triage_photos_library(library_path, lacie_dest_root=None, dell_dest_root=Non
                 ))
 
                 asset_rows = []
-                for src_full, rel_p, fname, sz, reason, sub_t, vmeta in duplicates_list:
-                    dest_p = "SKIPPED_DUPLICATE" if ignore_duplicates else os.path.join(duplicates_dir, rel_p)
+                for src_full, rel_p, orig_f, sz, reason, sub_t, vmeta in duplicates_list:
+                    dest_p = "SKIPPED_DUPLICATE" if ignore_duplicates else os.path.join(duplicates_dir, orig_f)
                     vmeta = vmeta or {}
                     asset_rows.append((
-                        db_session_pk, triage_id, rel_p, fname, sz, "duplicate", sub_t, reason, dest_p,
+                        db_session_pk, triage_id, rel_p, orig_f, sz, "duplicate", sub_t, reason, dest_p,
                         vmeta.get("matched_asset_uuid"), vmeta.get("matched_moment_name"),
                         vmeta.get("visual_similarity_score"), vmeta.get("hamming_distance"),
                         vmeta.get("perceptual_hash")
                     ))
-                for src_full, rel_p, fname, sz, reason, sub_t, vmeta in review_list:
+                for src_full, rel_p, orig_f, sz, reason, sub_t, vmeta in review_list:
                     sub_f = "Upgrade-Candidates" if sub_t == "upgrade_candidate" else ""
-                    dest_p = os.path.join(review_dir, sub_f, rel_p) if sub_f else os.path.join(review_dir, rel_p)
+                    dest_p = os.path.join(review_dir, sub_f, orig_f) if sub_f else os.path.join(review_dir, orig_f)
                     vmeta = vmeta or {}
                     asset_rows.append((
-                        db_session_pk, triage_id, rel_p, fname, sz, "review_similar", sub_t, reason, dest_p,
+                        db_session_pk, triage_id, rel_p, orig_f, sz, "review_similar", sub_t, reason, dest_p,
                         vmeta.get("matched_asset_uuid"), vmeta.get("matched_moment_name"),
                         vmeta.get("visual_similarity_score"), vmeta.get("hamming_distance"),
                         vmeta.get("perceptual_hash")
                     ))
-                for src_full, rel_p, fname, sz, reason, sub_t, vmeta in new_list:
-                    dest_p = os.path.join(new_dir, rel_p)
+                for src_full, rel_p, orig_f, sz, reason, sub_t, vmeta in new_list:
+                    dest_p = os.path.join(new_dir, orig_f)
                     vmeta = vmeta or {}
                     asset_rows.append((
-                        db_session_pk, triage_id, rel_p, fname, sz, "new", sub_t or "clean_media", reason, dest_p,
+                        db_session_pk, triage_id, rel_p, orig_f, sz, "new", sub_t or "clean_media", reason, dest_p,
                         vmeta.get("matched_asset_uuid"), vmeta.get("matched_moment_name"),
                         vmeta.get("visual_similarity_score"), vmeta.get("hamming_distance"),
                         vmeta.get("perceptual_hash")
                     ))
+
 
                 cur.executemany("""
                     INSERT INTO triage_session_assets (

@@ -44,8 +44,9 @@ Acts as the intermediary between raw storage discovery (`drive-audit-cli` wizard
 ### 🛡️ Apple Photos Library Triage Gateway (`triage_photos_library.py`)
 A dedicated standalone intake and deduplication utility specifically designed for Apple Photos Library packages (`.photoslibrary` / `.photolibrary`):
 - **100% Read-Only Full Replica Mode**: The source library bundle is strictly read-only (zero moves, zero deletions, zero modifications).
+- **Original Filename Restoration via SQLite**: Automatically extracts camera filenames (`IMG_1234.JPG`, `GOPR0012.JPG`, `<UUID>_3.mov` ➔ `IMG_1234.MOV`) directly from the source library's internal SQLite database (`Photos.sqlite`), ensuring exported novel and review media retain real camera filenames rather than opaque internal UUIDs.
 - **Targeted Traversal**: Automatically navigates internal `originals/` or `Masters/` while skipping internal thumbnail caches (`resources/`), face crops, and internal SQLite databases (`private/`, `database/`, `scopes/`).
-- **Resilient Matching**: Normalizes Apple Photos UUID companion video stems (`<UUID>_3.mov` ➔ `<UUID>`) and indexes exact byte sizes (`aaa.ZORIGINALFILESIZE`) across `All-Media.photoslibrary` to recognize standalone UUID assets.
+- **Resilient Matching**: Normalizes Apple Photos UUID companion video stems and evaluates assets against `All-Media.photoslibrary` catalog indexes for fast Tier 1/2 matching.
 - **Safe Replication & Ignore Duplicates**: Copies confirmed duplicates to DELL1TB02 (`Duplicates/<triage_id>`) and novel assets to LaCie (`New/<triage_id>`). Use `--ignore-duplicates` to skip copying duplicate files entirely, replicating only `Review-Similar` and `New` assets to LaCie.
 - **Action Alert**: Prompts user upon completion that the source library package remains untouched and can be manually reviewed or deleted.
 
@@ -340,6 +341,12 @@ A specialized, standalone intake and deduplication engine dedicated to processin
 - **100% Read-Only Source Guarantee**: The source `.photoslibrary` is strictly protected:
   - **Zero Moves or Deletions**: Files inside the package are never moved, deleted, renamed, or modified.
   - **Zero Bundle Mutation**: No empty folder pruning is performed within the source library tree.
+- **Original Filename Restoration via Internal Photos.sqlite**:
+  - Automatically queries the library's internal SQLite database (`database/Photos.sqlite`, `database/photos.db`, or `Photos.sqlite`) using an ephemeral local copy to bypass mechanical disk seek latency.
+  - Resolves internal UUID filenames (`0000609D-6414-4E51-A7CF-83B6283E8632.jpeg` ➔ `IMG_4614.JPG`) and Live Photo companion video suffixes (`<UUID>_3.mov` ➔ `IMG_4614.MOV`).
+  - Evaluates assets using their true camera filenames for instant Tier 1/2 catalog matching against `All-Media.photoslibrary`.
+  - Replicates novel (`New/`) and review (`Review-Similar/`) media with restored original filenames (with automatic collision disambiguation `_dup1`, `_dup2` if identical filenames occur across dates), while preserving original relative paths in `triage_session_assets` for full traceability.
+  - Falls back gracefully to internal filenames if the source package lacks an internal SQLite database.
 - **Intelligent Bundle Traversal**:
   - Automatically targets inner media storage (`originals/` or legacy `Masters/`).
   - Automatically excludes internal thumbnail caches (`resources/`), face crops, derivatives, and SQLite internal state (`private/`, `database/`, `scopes/`).

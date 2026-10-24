@@ -52,6 +52,9 @@ IGNORED_LIBRARY_SUBDIRS = {"resources", "private", "database", "scopes", "deriva
 IGNORED_FILE_NAMES = {".ds_store", "thumbs.db", "desktop.ini"}
 
 
+UUID_REGEX = re.compile(r'([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})')
+
+
 def resolve_library_media_root(library_path):
     """
     Given a path to a .photoslibrary or .photolibrary bundle,
@@ -74,8 +77,9 @@ def resolve_library_media_root(library_path):
 def load_photos_library_metadata(library_path):
     """
     Attempts to read the internal Apple Photos SQLite database (Photos.sqlite or photos.db)
-    from the library package. Returns a dictionary mapping lower-cased UUIDs and internal
-    filenames to their original camera filenames (e.g. '0000609D...jpeg' -> 'IMG_4614.JPG').
+    from the library package. Returns a tuple of:
+      - name_map: dictionary mapping lower-cased UUIDs and internal filenames to original camera filenames
+      - uuid_map: dictionary mapping lower-cased filenames and stems to their clean official UUID
 
     To avoid slow seek latency on external mechanical HDDs, this function copies the
     SQLite database to /tmp, queries the metadata tables, and cleans up the temp copy.
@@ -92,14 +96,15 @@ def load_photos_library_metadata(library_path):
             break
 
     if not source_db:
-        return {}
+        return {}, {}
 
     tmp_db = f"/tmp/photos_meta_{os.getpid()}_{int(time.time())}.sqlite"
     name_map = {}
+    uuid_map = {}
 
     try:
         logger.info(f"📚 Copying internal Photos database to local temporary storage for high-speed indexing: {source_db}")
-        sys.stdout.write("📚 Reading internal Photos SQLite database for original filenames...\n")
+        sys.stdout.write("📚 Reading internal Photos SQLite database for original filenames and UUID mappings...\n")
         sys.stdout.flush()
         shutil.copyfile(source_db, tmp_db)
 
@@ -112,39 +117,67 @@ def load_photos_library_metadata(library_path):
 
         # 1. Modern macOS Photos (ZASSET or ZGENERICASSET + ZADDITIONALASSETATTRIBUTES)
         asset_table = "ZASSET" if "ZASSET" in existing_tables else ("ZGENERICASSET" if "ZGENERICASSET" in existing_tables else None)
-        if asset_table and "ZADDITIONALASSETATTRIBUTES" in existing_tables:
+        if asset_table:
             cur.execute(f"SELECT Z_PK, ZUUID, ZFILENAME FROM {asset_table}")
             asset_map = {}
             for pk, uuid, fname in cur.fetchall():
                 asset_map[pk] = (uuid, fname)
-
-            cur.execute("SELECT ZASSET, ZORIGINALFILENAME FROM ZADDITIONALASSETATTRIBUTES WHERE ZORIGINALFILENAME IS NOT NULL")
-            for asset_pk, orig_fname in cur.fetchall():
-                if asset_pk in asset_map:
-                    uuid, fname = asset_map[asset_pk]
-                    if uuid:
-                        name_map[uuid.lower()] = orig_fname
+                if uuid:
+                    u_clean = uuid.upper()
+                    uuid_map[uuid.lower()] = u_clean
                     if fname:
-                        name_map[fname.lower()] = orig_fname
+                        uuid_map[fname.lower()] = u_clean
                         stem = os.path.splitext(fname)[0]
-                        name_map[stem.lower()] = orig_fname
+                        uuid_map[stem.lower()] = u_clean
+                        clean_stem = re.sub(r'_\d+$', '', stem)
+                        uuid_map[clean_stem.lower()] = u_clean
+
+            if "ZADDITIONALASSETATTRIBUTES" in existing_tables:
+                cur.execute("SELECT ZASSET, ZORIGINALFILENAME FROM ZADDITIONALASSETATTRIBUTES WHERE ZORIGINALFILENAME IS NOT NULL")
+                for asset_pk, orig_fname in cur.fetchall():
+                    if not orig_fname or not orig_fname.strip():
+                        continue
+                    orig_clean = orig_fname.strip()
+                    if asset_pk in asset_map:
+                        uuid, fname = asset_map[asset_pk]
+                        if uuid:
+                            name_map[uuid.lower()] = orig_clean
+                        if fname:
+                            name_map[fname.lower()] = orig_clean
+                            stem = os.path.splitext(fname)[0]
+                            name_map[stem.lower()] = orig_clean
+                            clean_stem = re.sub(r'_\d+$', '', stem)
+                            name_map[clean_stem.lower()] = orig_clean
 
         # 2. Older iPhoto / Aperture (RKMaster)
         elif "RKMaster" in existing_tables:
-            cur.execute("SELECT uuid, fileName, originalFileName FROM RKMaster WHERE originalFileName IS NOT NULL")
+            cur.execute("SELECT uuid, fileName, originalFileName FROM RKMaster")
             for uuid, fname, orig_fname in cur.fetchall():
                 if uuid:
-                    name_map[uuid.lower()] = orig_fname
-                if fname:
-                    name_map[fname.lower()] = orig_fname
-                    stem = os.path.splitext(fname)[0]
-                    name_map[stem.lower()] = orig_fname
+                    u_clean = uuid.upper()
+                    uuid_map[uuid.lower()] = u_clean
+                    if fname:
+                        uuid_map[fname.lower()] = u_clean
+                        stem = os.path.splitext(fname)[0]
+                        uuid_map[stem.lower()] = u_clean
+                        clean_stem = re.sub(r'_\d+$', '', stem)
+                        uuid_map[clean_stem.lower()] = u_clean
+                if orig_fname and orig_fname.strip():
+                    orig_clean = orig_fname.strip()
+                    if uuid:
+                        name_map[uuid.lower()] = orig_clean
+                    if fname:
+                        name_map[fname.lower()] = orig_clean
+                        stem = os.path.splitext(fname)[0]
+                        name_map[stem.lower()] = orig_clean
+                        clean_stem = re.sub(r'_\d+$', '', stem)
+                        name_map[clean_stem.lower()] = orig_clean
 
         conn.close()
-        logger.info(f"✅ Indexed {len(name_map):,} original filename mappings from internal library database.")
-        print(f"✅ Indexed {len(name_map):,} original filename mappings from internal library database.")
+        logger.info(f"✅ Indexed {len(name_map):,} original filename mappings and {len(uuid_map):,} UUID mappings.")
+        print(f"✅ Indexed {len(name_map):,} original filename mappings and {len(uuid_map):,} UUID mappings from internal database.")
     except Exception as e:
-        logger.warning(f"Could not extract original filenames from Photos database: {e}")
+        logger.warning(f"Could not extract metadata from Photos database: {e}")
     finally:
         if os.path.exists(tmp_db):
             try:
@@ -152,37 +185,62 @@ def load_photos_library_metadata(library_path):
             except OSError:
                 pass
 
-    return name_map
+    return name_map, uuid_map
 
 
-def resolve_asset_original_name(filename, original_names_map):
+def resolve_asset_original_name(filename, original_names_map=None, uuid_map=None, rel_p=None):
     """
-    Resolves the original camera filename (e.g. IMG_4614.JPG) for a given
-    Apple Photos asset filename (e.g. 0000609D-6414-4E51-A7CF-83B6283E8632.jpeg or <UUID>_3.mov).
+    Resolves the original camera filename (e.g. IMG_4614.JPG) for a given Apple Photos asset.
+    If extracting the original filename does not work, falls back on using/extracting the UUID
+    for the filename (e.g. 00A19CF2-EF7A-4744-B52F-B56C64C9A9E9.MOV or <UUID>.JPEG).
     """
-    if not original_names_map:
-        return filename
-
-    f_lower = filename.lower()
-    if f_lower in original_names_map:
-        return original_names_map[f_lower]
-
     stem, ext = os.path.splitext(filename)
+    f_lower = filename.lower()
     stem_lower = stem.lower()
-    if stem_lower in original_names_map:
-        return original_names_map[stem_lower]
-
-    # Handle Live Photo companion video UUIDs (e.g. <UUID>_3.mov or <UUID>_1.mov)
     clean_stem = re.sub(r'_\d+$', '', stem)
     clean_lower = clean_stem.lower()
-    if clean_lower in original_names_map:
-        base_orig = original_names_map[clean_lower]
-        base_stem, _ = os.path.splitext(base_orig)
-        orig_ext = ext if ext.startswith('.') else f".{ext}"
-        if any(c.isupper() for c in base_orig):
-            orig_ext = orig_ext.upper()
-        return f"{base_stem}{orig_ext}"
 
+    # Step 1: Attempt to resolve original camera filename from SQLite metadata
+    if original_names_map:
+        if f_lower in original_names_map:
+            return original_names_map[f_lower]
+        if stem_lower in original_names_map:
+            return original_names_map[stem_lower]
+        # Handle Live Photo companion video UUIDs (e.g. <UUID>_3.mov or <UUID>_1.mov)
+        if clean_lower in original_names_map:
+            base_orig = original_names_map[clean_lower]
+            base_stem, _ = os.path.splitext(base_orig)
+            orig_ext = ext if ext.startswith('.') else f".{ext}"
+            if any(c.isupper() for c in base_orig):
+                orig_ext = orig_ext.upper()
+            return f"{base_stem}{orig_ext}"
+
+    # Step 2: Fallback — Extract and use UUID for the filename
+    found_uuid = None
+    if uuid_map:
+        if f_lower in uuid_map:
+            found_uuid = uuid_map[f_lower]
+        elif stem_lower in uuid_map:
+            found_uuid = uuid_map[stem_lower]
+        elif clean_lower in uuid_map:
+            found_uuid = uuid_map[clean_lower]
+
+    if not found_uuid:
+        # Try extracting UUID directly from filename
+        m = UUID_REGEX.search(filename)
+        if m:
+            found_uuid = m.group(1).upper()
+        elif rel_p:
+            # Try extracting UUID from directory/relative path
+            m_rel = UUID_REGEX.search(rel_p)
+            if m_rel:
+                found_uuid = m_rel.group(1).upper()
+
+    if found_uuid:
+        orig_ext = ext if ext.startswith('.') else f".{ext}"
+        return f"{found_uuid}{orig_ext}"
+
+    # Step 3: Default fallback to existing filename
     return filename
 
 
@@ -257,10 +315,11 @@ def triage_photos_library(library_path, lacie_dest_root=None, dell_dest_root=Non
         index = LibraryIndex(MEDIA_ORGANIZER_DB_PATH)
         index.load()
 
-        # Step 2: Index original filenames if internal Photos SQLite database is available
-        original_names_map = load_photos_library_metadata(library_path)
+        # Step 2: Index original filenames and UUID mappings if internal Photos SQLite database is available
+        original_names_map, uuid_map = load_photos_library_metadata(library_path)
         if original_names_map:
             print("   ✨ Original camera filenames will be restored for all evaluated and exported assets.")
+        print("   ✨ Fallback policy: Any asset without an original filename will use its extracted UUID.")
 
         # Discover candidate media files inside library originals/Masters
         logger.info(f"🔍 Scanning library media directory: {media_root}")
@@ -287,7 +346,7 @@ def triage_photos_library(library_path, lacie_dest_root=None, dell_dest_root=Non
 
                 try:
                     sz = os.path.getsize(full_p)
-                    orig_f = resolve_asset_original_name(f, original_names_map)
+                    orig_f = resolve_asset_original_name(f, original_names_map, uuid_map=uuid_map, rel_p=rel_p)
                     candidate_files.append((full_p, rel_p, f, orig_f, sz))
                 except OSError as e:
                     logger.warning(f"Could not stat {full_p}: {e}")

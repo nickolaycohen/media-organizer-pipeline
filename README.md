@@ -36,23 +36,34 @@ Acts as the intermediary between raw storage discovery (`drive-audit-cli` wizard
   - `Duplicates/<session_id>` ➔ **DELL1TB02** (🟠 **Orange Tag**): 100% verified duplicate copies already cataloged in `All-Media.photoslibrary`. Routed to non-backed up disposable storage.
   - `Review-Similar/<session_id>` ➔ **LaCie** (🔴 **Red Tag**): Assets suspected of having been intentionally pruned or discarded from the library (deletion keywords, burst siblings within $\le 30$s, web thumbnails). Routed to primary storage for human review.
   - `New/<session_id>` ➔ **LaCie** (🟢 **Green Tag**): Pristine, high-confidence novel media not found in Apple Photos, ready for direct library import.
-- **🛡️ Apple Photos Library Read-Only Full Replica Mode (`--photos-library <PATH>`)**: Process Apple Photos libraries as explicit read-only sources. Assets are evaluated and replicated using non-destructive copies (`Duplicates` to DELL1TB02, `New` to LaCie) while leaving the source library 100% untouched. Source folder pruning is disabled and an end-of-run banner alert prompts manual library management.
-- **🔗 Live Photo & UUID Companion Pairing**: Pairs `.JPG` + `.MOV` companion files and normalizes Apple Photos UUID companion video stems (`<UUID>_3.mov` ➔ `<UUID>`) so companion videos correctly follow their duplicate still photo classifications. Also matches standalone UUID assets directly against `All-Media.photoslibrary` via exact byte size indexing.
-- **Cleans**: Automatically prunes empty source directories so categorized assets bubble up cleanly (strictly preserves `.photoslibrary` directory structures).
+- **🔗 Live Photo Companion Pairing**: Pairs `.JPG` + `.MOV` companion files so companion videos correctly follow their duplicate still photo classifications.
+- **Package Safeguards**: If an intake directory contains `.photoslibrary` bundles, assets inside them are never deleted; bundle structure is preserved and an end-of-run banner alert reminds the user to manually manage the library package.
+- **Cleans**: Automatically prunes empty source directories so categorized assets bubble up cleanly.
 - **Bypasses Locks**: Automatically unlocks macOS Time Machine ACLs (`chmod -N`) and immutable flags (`chflags 0`) on the fly.
-- **🔧 UUID Session Reconciler**: Companion utility `reconcile_triage_session_movs.py` is available to audit past triage sessions containing Apple Photos UUID files, verifying exact byte matches against `All-Media.photoslibrary` and relocating confirmed duplicates from `New/` to `Duplicates/`.
+
+### 🛡️ Apple Photos Library Triage Gateway (`triage_photos_library.py`)
+A dedicated standalone intake and deduplication utility specifically designed for Apple Photos Library packages (`.photoslibrary` / `.photolibrary`):
+- **100% Read-Only Full Replica Mode**: The source library bundle is strictly read-only (zero moves, zero deletions, zero modifications).
+- **Targeted Traversal**: Automatically navigates internal `originals/` or `Masters/` while skipping internal thumbnail caches (`resources/`), face crops, and internal SQLite databases (`private/`, `database/`, `scopes/`).
+- **Resilient Matching**: Normalizes Apple Photos UUID companion video stems (`<UUID>_3.mov` ➔ `<UUID>`) and indexes exact byte sizes (`aaa.ZORIGINALFILESIZE`) across `All-Media.photoslibrary` to recognize standalone UUID assets.
+- **Safe Replication**: Copies confirmed duplicates to DELL1TB02 (`Duplicates/<triage_id>`) and novel assets to LaCie (`New/<triage_id>`).
+- **Action Alert**: Prompts user upon completion that the source library package remains untouched and can be manually reviewed or deleted.
+
+### 🔧 UUID Session Reconciler (`reconcile_triage_session_movs.py`)
+Companion utility to audit past triage sessions containing Apple Photos UUID files, verifying exact byte matches against `All-Media.photoslibrary` and relocating confirmed duplicates from `New/` to `Duplicates/`.
 
 ```bash
-# Preview triage without moving files (dry run)
+# Preview standard intake triage without moving files (dry run)
 python3 scripts/triage_media_intake.py --dry-run
 
 # Triage default folder (/Volumes/LaCie/Storage/Priority 4/Media Preprocessing)
 python3 scripts/triage_media_intake.py
 
 # Triage an Apple Photos Library as an explicit read-only source (Full Replica mode)
-python3 scripts/triage_media_intake.py --photos-library "/Volumes/Extreme Pro/tmp/iPhone13ProMax Library.photoslibrary"
+python3 scripts/triage_photos_library.py "/Volumes/Extreme Pro/tmp/iPhone13ProMax Library.photoslibrary" --dry-run
+python3 scripts/triage_photos_library.py "/Volumes/Extreme Pro/tmp/iPhone13ProMax Library.photoslibrary"
 
-# Reconcile UUID assets from a previous Photos library intake session (e.g. session 37)
+# Reconcile UUID assets from a previous triage session (e.g. session 37)
 python3 scripts/reconcile_triage_session_movs.py --triage-id 37
 ```
 
@@ -280,26 +291,17 @@ To protect primary backed-up storage, assets are partitioned across physical dri
   - `Review-Similar/<triage_id>` (🔴 **Red Tag**): Assets suspected of having been intentionally pruned or discarded from the library (deletion keywords in folder names, burst/sequence siblings within $\le 30$s of library photos, low-res web thumbnails, or screenshot artifacts). Held for human review.
   - `New/<triage_id>` (🟢 **Green Tag**): Pristine, high-confidence novel media not found in Apple Photos, ready for direct library import.
 
-#### 🛡️ Apple Photos Library Package Safety & Full Replica Mode
-- **Use Case**: Ingesting legacy, unbundled, or un-openable Apple Photos libraries (e.g., recovered from Time Machine backups or older macOS systems that modern Apple Photos cannot open or repair) without risking bundle corruption.
-- **Explicit Library Source (`--photos-library <PATH>`, `-p <PATH>`)**: Direct intake pointing to a `.photoslibrary` or `.photolibrary` bundle. Automatically targets the internal media originals directory (`originals/` or `Masters/`) while ignoring thumbnail caches (`resources/`), face crops, derivatives, and internal databases (`private/`, `database/`).
-- **100% Read-Only Protection**: The source library is strictly read-only:
-  - **Zero Source Modifications**: No files inside the source `.photoslibrary` are moved, deleted, renamed, or altered in any way.
-  - **No Directory Pruning**: Empty directory cleaning is automatically disabled for the library tree to protect bundle structure.
-- **Non-Destructive Full Replication**:
-  - Confirmed duplicates are copied to DELL1TB02 (`Duplicates/<triage_id>/...`) using `shutil.copy2` (preserving timestamps and EXIF).
-  - Suspected discard/burst siblings or upgrade candidates are copied to LaCie (`Review-Similar/<triage_id>/...`).
-  - Truly net-new assets are safely copied to LaCie (`New/<triage_id>/...`), ready for clean import into your master library.
-- **Resilient UUID & Live Photo Matching**:
-  - Automatically pairs Live Photo companion videos (`<UUID>_*.mov`) with their companion still photos (`<UUID>.heic` / `.jpeg`), ensuring companion videos inherit the exact classification of their photo.
-  - Indexes all 212,000+ asset byte sizes (`aaa.ZORIGINALFILESIZE`) from `All-Media.photoslibrary`, allowing standalone videos and photos named with UUIDs to be identified as exact duplicates without requiring original camera filenames.
-- **Post-Scan Manual Action Alert**: Displays an explicit notification banner at session completion reminding the user that the source library package remains completely intact and can now be safely reviewed or deleted manually.
+#### 🛡️ Apple Photos Package Safeguards
+If a scanned intake folder contains an Apple Photos Library bundle (`.photoslibrary` / `.photolibrary`):
+- **Zero In-Place Deletions**: Files inside the package are safely copied rather than moved.
+- **Directory Protection**: The internal bundle structure is strictly preserved (never pruned).
+- **Session Alert**: A prominent completion banner notifies the user that a Photos Library package was encountered and should be manually reviewed or deleted.
+*(Note: To directly scan and process a `.photoslibrary` bundle itself, use the dedicated standalone utility [`triage_photos_library.py`](#%EF%B8%8F-apple-photos-library-intake--replication-gateway-triage_photos_librarypy) detailed below).*
 
 #### ⚙️ CLI Options & Help Reference
 | Flag / Argument | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `target_dir` | Positional | `/Volumes/LaCie/Storage/Priority 4/Media Preprocessing` | Source intake directory to scan and triage |
-| `--photos-library`, `-p` | Option | `None` | Process an Apple Photos Library bundle as an explicit read-only source in Full Replica mode |
 | `--dell-dest-dir` | Option | `/Volumes/DELL1TB02/Storage/Priority 4/Media Preprocessing/TriageMediaIntake` | Destination root on DELL1TB02 for `Duplicates` |
 | `--lacie-dest-dir`, `--dest-dir` | Option | `/Volumes/LaCie/Storage/Priority 4/Media Preprocessing/TriageMediaIntake` | Destination root on LaCie for `Review-Similar` and `New` |
 | `--triage-id` | Option | Auto-increment integer | Custom session ID for session subdirectories (recorded in `triage_sessions` DB table) |
@@ -315,20 +317,60 @@ python3 scripts/triage_media_intake.py --dry-run
 # 2. Triage default intake folder across DELL1TB02 and LaCie
 python3 scripts/triage_media_intake.py
 
-# 3. Triage an Apple Photos Library in Read-Only Full Replica mode (safe simulation)
-python3 scripts/triage_media_intake.py --photos-library "/Volumes/Extreme Pro/tmp/iPhone13ProMax Library.photoslibrary" --dry-run
-
-# 4. Triage an Apple Photos Library (replicates duplicates to DELL1TB02 and new assets to LaCie; source 100% untouched)
-python3 scripts/triage_media_intake.py --photos-library "/Volumes/Extreme Pro/tmp/iPhone13ProMax Library.photoslibrary"
-
-# 5. Triage a specific external hard drive or folder
+# 3. Triage a specific external hard drive or folder
 python3 scripts/triage_media_intake.py "/Volumes/DELL1TB02/Archive/Pictures Extra Sequence"
 
-# 6. Use a specific custom session ID
+# 4. Use a specific custom session ID
 python3 scripts/triage_media_intake.py "/path/to/media" --triage-id "2026-Batch-A"
 
-# 7. Re-apply Finder color tags to all existing triage session directories
+# 5. Re-apply Finder color tags to all existing triage session directories
 python3 scripts/triage_media_intake.py --tag-only
+```
+
+---
+
+### 🛡️ Apple Photos Library Intake & Replication Gateway (`triage_photos_library.py`)
+
+A specialized, standalone intake and deduplication engine dedicated to processing Apple Photos Library packages (`.photoslibrary` / `.photolibrary`). It enables safe ingestion of legacy, unbundled, or un-openable Apple Photos libraries (such as those recovered from Time Machine backups, older macOS versions, or iOS system extractions) in **100% Read-Only Full Replica mode**.
+
+#### 🌟 Key Capabilities & Safety Guarantees
+- **100% Read-Only Source Guarantee**: The source `.photoslibrary` is strictly protected:
+  - **Zero Moves or Deletions**: Files inside the package are never moved, deleted, renamed, or modified.
+  - **Zero Bundle Mutation**: No empty folder pruning is performed within the source library tree.
+- **Intelligent Bundle Traversal**:
+  - Automatically targets inner media storage (`originals/` or legacy `Masters/`).
+  - Automatically excludes internal thumbnail caches (`resources/`), face crops, derivatives, and SQLite internal state (`private/`, `database/`, `scopes/`).
+- **Non-Destructive Full Replication**:
+  - Confirmed duplicates are copied to DELL1TB02 (`Duplicates/<triage_id>/...`) using `shutil.copy2` (preserving metadata and EXIF).
+  - Suspected discard/burst siblings or upgrade candidates are copied to LaCie (`Review-Similar/<triage_id>/...`).
+  - Truly net-new assets are safely copied to LaCie (`New/<triage_id>/...`), ready for clean import into your master library.
+- **Live Photo Companion & UUID Normalization**:
+  - Automatically resolves Live Photo companion videos named with Apple Photos UUID patterns (`<UUID>_3.mov` ➔ `<UUID>`), ensuring companion videos inherit the exact classification of their still photo counterpart (`.heic` / `.jpeg`).
+  - Queries exact byte sizes (`aaa.ZORIGINALFILESIZE`) across all 212,000+ assets in `All-Media.photoslibrary` to recognize standalone UUID assets even when original camera filenames are unavailable.
+- **Finder Color Tagging & Audit Trail**:
+  - Automatically applies macOS Finder color tags (🟠 Orange on DELL1TB02, 🔴 Red and 🟢 Green on LaCie).
+  - Records session history and per-asset classifications in `triage_sessions` and `triage_session_assets` SQLite tables.
+- **Post-Scan Manual Action Alert**: Displays an explicit notification banner at session completion reminding the user that the source library package remains completely intact and can now be safely reviewed or deleted manually.
+
+#### ⚙️ CLI Options & Help Reference
+| Flag / Argument | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `library_path` | Positional | *(Required)* | Path to the Apple Photos Library bundle (`.photoslibrary` / `.photolibrary`) |
+| `--dell-dest-dir` | Option | `/Volumes/DELL1TB02/Storage/Priority 4/Media Preprocessing/TriageMediaIntake` | Destination root on DELL1TB02 for `Duplicates` |
+| `--lacie-dest-dir`, `--dest-dir` | Option | `/Volumes/LaCie/Storage/Priority 4/Media Preprocessing/TriageMediaIntake` | Destination root on LaCie for `Review-Similar` and `New` |
+| `--triage-id` | Option | Auto-increment integer | Custom session ID for session subdirectories (recorded in `triage_sessions` DB table) |
+| `--dry-run` | Flag | `False` | Simulates file classification, destination paths, and space calculations without copying files or modifying DB |
+
+#### 📋 Examples
+```bash
+# 1. Preview triage run on a Photos Library bundle (safe simulation)
+python3 scripts/triage_photos_library.py "/Volumes/Extreme Pro/tmp/iPhone13ProMax Library.photoslibrary" --dry-run
+
+# 2. Triage Photos Library in 100% Read-Only Full Replica mode
+python3 scripts/triage_photos_library.py "/Volumes/Extreme Pro/tmp/iPhone13ProMax Library.photoslibrary"
+
+# 3. Use custom session ID and verify destination paths
+python3 scripts/triage_photos_library.py "/Volumes/Backup/OldPhotos.photoslibrary" --triage-id "2026-iPhone-Intake"
 ```
 
 ---

@@ -1602,8 +1602,6 @@ def parse_args():
     )
     parser.add_argument("target_dir", nargs="?", default=DEFAULT_MEDIA_PREPROCESSING_DIR,
                         help=f"Source intake directory to scan and triage (default: {DEFAULT_MEDIA_PREPROCESSING_DIR})")
-    parser.add_argument("--photos-library", "-p", dest="photos_library", default=None,
-                        help="Specify an Apple Photos Library bundle (.photoslibrary) as an explicit read-only source in Full Replica mode. Evaluates assets and replicates to DELL1TB02 (Duplicates) and LaCie (New/Review) without modifying the source library.")
     parser.add_argument("--lacie-dest-dir", "--dest-dir", dest="lacie_dest_dir", default=None,
                         help=f"LaCie base destination directory for Review-Similar and New (default: {TRIAGE_LACIE_DESTINATION_ROOT})")
     parser.add_argument("--dell-dest-dir", dest="dell_dest_dir", default=None,
@@ -1634,32 +1632,12 @@ if __name__ == "__main__":
         if not res:
             print("   ℹ️ No triage folders (Duplicates, Review-Similar, New) found to tag.")
     else:
-        target = args.target_dir
-        lib_path = None
-        if args.photos_library:
-            lib_path = os.path.abspath(args.photos_library)
-            if not os.path.exists(lib_path):
-                print(f"❌ Error: Specified Photos Library does not exist: {lib_path}")
-                sys.exit(1)
-            if not (lib_path.lower().endswith('.photoslibrary') or lib_path.lower().endswith('.photolibrary') or os.path.isdir(lib_path)):
-                print(f"❌ Error: Path is not a valid Photos Library directory: {lib_path}")
-                sys.exit(1)
-
-            # Locate media originals folder within the library
-            if os.path.isdir(os.path.join(lib_path, "originals")):
-                target = os.path.join(lib_path, "originals")
-            elif os.path.isdir(os.path.join(lib_path, "Masters")):
-                target = os.path.join(lib_path, "Masters")
-            else:
-                target = lib_path
-
         triage_intake_folder(
-            target,
+            args.target_dir,
             lacie_dest_root=args.lacie_dest_dir,
             dell_dest_root=args.dell_dest_dir,
             triage_id=args.triage_id,
             dry_run=args.dry_run,
-            clean_empty=not args.no_clean,
-            photos_library=lib_path
+            clean_empty=not args.no_clean
         )
 

@@ -44,6 +44,16 @@ TRIAGE_LACIE_DESTINATION_ROOT = TRIAGE_DESTINATION_ROOT
 TRIAGE_REVIEW_ROOT = os.path.join(TRIAGE_LACIE_DESTINATION_ROOT, 'Review-Similar')
 TRIAGE_NEW_ROOT = os.path.join(TRIAGE_LACIE_DESTINATION_ROOT, 'New')
 
+# Recognized Media Extensions for Triage and Intake Processing
+MEDIA_EXTENSIONS = {
+    # Still Images & RAW Formats
+    '.jpg', '.jpeg', '.png', '.heic', '.tif', '.tiff', '.webp', '.bmp', '.gif',
+    '.dng', '.cr2', '.cr3', '.nef', '.arw', '.raw',
+    # Video Formats
+    '.mov', '.mp4', '.m4v', '.avi', '.mpg', '.mpeg', '.mkv', '.wmv',
+    '.mts', '.m2ts', '.vob', '.webm', '.flv', '.3gp', '.mod'
+}
+
 APPLE_PHOTOS_DB_COPY_PATH = "/Volumes/Macintosh HD/Users/nickolaycohen/Photos Library DB/All-Media-Extreme/database/Photos.sqlite"
 APPLE_PHOTOS_DB_MARKER = APPLE_PHOTOS_DB_COPY_PATH + ".lastcopy"
 APPLE_PHOTOS_DB_LOCK_PATH = APPLE_PHOTOS_DB_COPY_PATH + ".lock"

@@ -21,7 +21,8 @@ from constants import (
     TRIAGE_DESTINATION_ROOT,
     TRIAGE_LACIE_DESTINATION_ROOT,
     TRIAGE_DELL_DESTINATION_ROOT,
-    APPLE_PHOTOS_ORIGINALS_PATH
+    APPLE_PHOTOS_ORIGINALS_PATH,
+    MEDIA_EXTENSIONS
 )
 from utils.logger import setup_logger
 from utils.finder_tags import apply_finder_tag
@@ -56,11 +57,6 @@ except ImportError:
 MODULE_TAG = "triage_media_intake"
 logger = setup_logger(TRIAGE_LOG_PATH, MODULE_TAG)
 
-MEDIA_EXTENSIONS = {
-    '.jpg', '.jpeg', '.png', '.heic', '.mov', '.mp4', '.m4v',
-    '.avi', '.dng', '.cr2', '.cr3', '.raw', '.gif', '.tif',
-    '.tiff', '.webp', '.3gp', '.bmp'
-}
 
 IMAGE_EXTENSIONS_FOR_HASH = {
     '.jpg', '.jpeg', '.png', '.heic', '.tif', '.tiff', '.webp', '.bmp', '.dng'

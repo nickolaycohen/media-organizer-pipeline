@@ -23,6 +23,7 @@ import sqlite3
 import argparse
 import time
 import re
+import plistlib
 
 # Add project root and script dir to sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -74,10 +75,82 @@ def resolve_library_media_root(library_path):
     return lib_abs
 
 
+def load_photos_journal_metadata(library_path):
+    """
+    Reads Apple Photos Change Journals (resources/journals/Asset-snapshot.plj)
+    when database/Photos.sqlite is missing or corrupted.
+    Returns (name_map, uuid_map).
+    """
+    lib_abs = os.path.abspath(library_path)
+    journal_snapshot = os.path.join(lib_abs, "resources", "journals", "Asset-snapshot.plj")
+    if not os.path.isfile(journal_snapshot):
+        return {}, {}
+
+    name_map = {}
+    uuid_map = {}
+
+    try:
+        logger.info(f"📚 Reading Apple Photos journal snapshot: {journal_snapshot}")
+        sys.stdout.write("📚 Reading Apple Photos journal snapshot for original filenames...\n")
+        sys.stdout.flush()
+
+        with open(journal_snapshot, "rb") as f:
+            data = f.read()
+
+        data_len = len(data)
+        pos = 0
+
+        while pos < data_len:
+            bp_idx = data.find(b"bplist00", pos)
+            if bp_idx == -1:
+                break
+
+            next_bp = data.find(b"bplist00", bp_idx + 8)
+            search_end = next_bp if next_bp != -1 else data_len
+
+            # Binary plist trailer is within the last 100 bytes of the record
+            for t_end in range(search_end, max(bp_idx + 32, search_end - 100), -1):
+                try:
+                    pl = plistlib.loads(data[bp_idx:t_end])
+                    if isinstance(pl, dict):
+                        fname = pl.get("filename")
+                        orig = pl.get("originalFilename")
+                        uuid_val = pl.get("uuid") or pl.get("publicGlobalUUID")
+
+                        if fname and orig and orig.strip():
+                            orig_clean = orig.strip()
+                            name_map[fname.lower()] = orig_clean
+                            stem = os.path.splitext(fname)[0]
+                            name_map[stem.lower()] = orig_clean
+                            clean_stem = re.sub(r'_\d+$', '', stem)
+                            name_map[clean_stem.lower()] = orig_clean
+
+                        if fname and uuid_val:
+                            u_clean = str(uuid_val).upper()
+                            uuid_map[fname.lower()] = u_clean
+                            stem = os.path.splitext(fname)[0]
+                            uuid_map[stem.lower()] = u_clean
+                            clean_stem = re.sub(r'_\d+$', '', stem)
+                            uuid_map[clean_stem.lower()] = u_clean
+
+                        break
+                except Exception:
+                    pass
+
+            pos = search_end if next_bp != -1 else data_len
+
+        logger.info(f"✅ Indexed {len(name_map):,} original filename mappings and {len(uuid_map):,} UUID mappings from journal snapshot.")
+        print(f"✅ Indexed {len(name_map):,} original filename mappings and {len(uuid_map):,} UUID mappings from library journals.")
+    except Exception as e:
+        logger.warning(f"Could not extract metadata from Photos journal: {e}")
+
+    return name_map, uuid_map
+
+
 def load_photos_library_metadata(library_path):
     """
     Attempts to read the internal Apple Photos SQLite database (Photos.sqlite or photos.db)
-    from the library package. Returns a tuple of:
+    or journal snapshots (Asset-snapshot.plj) from the library package. Returns a tuple of:
       - name_map: dictionary mapping lower-cased UUIDs and internal filenames to original camera filenames
       - uuid_map: dictionary mapping lower-cased filenames and stems to their clean official UUID
 
@@ -96,7 +169,7 @@ def load_photos_library_metadata(library_path):
             break
 
     if not source_db:
-        return {}, {}
+        return load_photos_journal_metadata(library_path)
 
     tmp_db = f"/tmp/photos_meta_{os.getpid()}_{int(time.time())}.sqlite"
     name_map = {}
@@ -184,6 +257,12 @@ def load_photos_library_metadata(library_path):
                 os.remove(tmp_db)
             except OSError:
                 pass
+
+    if not name_map:
+        j_name_map, j_uuid_map = load_photos_journal_metadata(library_path)
+        if j_name_map:
+            name_map.update(j_name_map)
+            uuid_map.update(j_uuid_map)
 
     return name_map, uuid_map
 

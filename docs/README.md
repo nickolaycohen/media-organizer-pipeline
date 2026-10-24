@@ -281,13 +281,19 @@ To protect primary backed-up storage, assets are partitioned across physical dri
   - `New/<triage_id>` (🟢 **Green Tag**): Pristine, high-confidence novel media not found in Apple Photos, ready for direct library import.
 
 #### 🛡️ Apple Photos Library Package Safety & Full Replica Mode
-- **Explicit Library Source (`--photos-library <PATH>`)**: Point directly to an Apple Photos Library bundle. Automatically targets the inner originals directory (`originals/` or `Masters/`) while ignoring thumbnail caches, derivatives, and private databases.
-- **Full Replica Mode (100% Read-Only)**: The source library is strictly read-only:
-  - **Zero Modifications**: No source files are moved, deleted, or touched.
-  - **Non-Destructive Replication**: Copies duplicates to DELL1TB02 (`Duplicates/<triage_id>/...`) and novel assets to LaCie (`New/<triage_id>/...`) using `shutil.copy2`.
-  - **No Directory Pruning**: Empty directory cleaning is automatically disabled for the library.
-- **UUID & Companion Pairing**: Normalizes Apple Photos UUID companion video suffixes (`<UUID>_3.mov` -> `<UUID>`) so Live Photo companion videos reliably pair with companion still photos (`<UUID>.heic` / `.jpeg`), and matches standalone UUID assets directly against `All-Media.photoslibrary` via exact byte size indexing.
-- **Post-Scan Manual Action Alert**: An explicit notification banner is displayed at the end of the session reminding the user that the source library package remains intact and can now be manually reviewed or deleted.
+- **Use Case**: Ingesting legacy, unbundled, or un-openable Apple Photos libraries (e.g., recovered from Time Machine backups or older macOS systems that modern Apple Photos cannot open or repair) without risking bundle corruption.
+- **Explicit Library Source (`--photos-library <PATH>`, `-p <PATH>`)**: Direct intake pointing to a `.photoslibrary` or `.photolibrary` bundle. Automatically targets the internal media originals directory (`originals/` or `Masters/`) while ignoring thumbnail caches (`resources/`), face crops, derivatives, and internal databases (`private/`, `database/`).
+- **100% Read-Only Protection**: The source library is strictly read-only:
+  - **Zero Source Modifications**: No files inside the source `.photoslibrary` are moved, deleted, renamed, or altered in any way.
+  - **No Directory Pruning**: Empty directory cleaning is automatically disabled for the library tree to protect bundle structure.
+- **Non-Destructive Full Replication**:
+  - Confirmed duplicates are copied to DELL1TB02 (`Duplicates/<triage_id>/...`) using `shutil.copy2` (preserving timestamps and EXIF).
+  - Suspected discard/burst siblings or upgrade candidates are copied to LaCie (`Review-Similar/<triage_id>/...`).
+  - Truly net-new assets are safely copied to LaCie (`New/<triage_id>/...`), ready for clean import into your master library.
+- **Resilient UUID & Live Photo Matching**:
+  - Automatically pairs Live Photo companion videos (`<UUID>_*.mov`) with their companion still photos (`<UUID>.heic` / `.jpeg`), ensuring companion videos inherit the exact classification of their photo.
+  - Indexes all 212,000+ asset byte sizes (`aaa.ZORIGINALFILESIZE`) from `All-Media.photoslibrary`, allowing standalone videos and photos named with UUIDs to be identified as exact duplicates without requiring original camera filenames.
+- **Post-Scan Manual Action Alert**: Displays an explicit notification banner at session completion reminding the user that the source library package remains completely intact and can now be safely reviewed or deleted manually.
 
 #### ⚙️ CLI Options & Help Reference
 | Flag / Argument | Type | Default | Description |

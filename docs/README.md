@@ -32,21 +32,22 @@ An independent, time-based workflow for curating and publishing specific events/
 Acts as the intermediary between raw storage discovery (`drive-audit-cli` wizard) and Apple Photos ingestion (`All-Media.photoslibrary`).
 - **Scans**: An intake folder (defaults to `/Volumes/LaCie/Storage/Priority 4/Media Preprocessing`).
 - **Compares**: Compares every asset against all 212,000+ assets in `media_organizer.db` using exact byte size, original filename, and EXIF timestamp cascade, plus Live Photo companion pairing.
-- **Triages**: Moves assets preserving their relative subfolder structure into:
-  - `Duplicates/`: Assets 100% confirmed present in `All-Media.photoslibrary` (exact size + filename / EXIF date match).
-  - `Review-Similar/`: Assets suspected of having been intentionally discarded or deleted from Apple Photos (folder deletion keywords, sequence/burst siblings $\le 30$s from library photos, or web UI artifacts).
-  - `New/`: Pristine, high-confidence new media (clean sequence, not in library, ready for Apple Photos import).
+- **Multi-Drive Triage**: Partitions incoming files across physical drives based on confidence and backup policy:
+  - `Duplicates/<session_id>` ➔ **DELL1TB02** (🟠 **Orange Tag**): 100% verified duplicate copies already cataloged in `All-Media.photoslibrary`. Routed to non-backed up disposable storage.
+  - `Review-Similar/<session_id>` ➔ **LaCie** (🔴 **Red Tag**): Assets suspected of having been intentionally pruned or discarded from the library (deletion keywords, burst siblings within $\le 30$s, web thumbnails). Routed to primary storage for human review.
+  - `New/<session_id>` ➔ **LaCie** (🟢 **Green Tag**): Pristine, high-confidence novel media not found in Apple Photos, ready for direct library import.
 - **Cleans**: Automatically prunes empty source directories so categorized assets bubble up cleanly.
+- **Bypasses Locks**: Automatically unlocks macOS Time Machine ACLs (`chmod -N`) and immutable flags (`chflags 0`) on the fly.
 
 ```bash
-# Preview triage without moving files
+# Preview triage without moving files (dry run)
 python3 scripts/triage_media_intake.py --dry-run
 
 # Triage default folder (/Volumes/LaCie/Storage/Priority 4/Media Preprocessing)
 python3 scripts/triage_media_intake.py
 
-# Triage any custom intake directory
-python3 scripts/triage_media_intake.py "/path/to/intake/folder"
+# Triage any custom intake directory or external volume
+python3 scripts/triage_media_intake.py "/Volumes/DELL1TB02/Archive/Pictures Extra Sequence"
 ```
 
 ---
@@ -258,6 +259,94 @@ In the event of a catastrophic failure, corruption, or rebuild of the Apple Phot
   ```bash
   python3 scripts/reconstruct_apple_albums.py --verify --folder "Curated"
   ```
+
+---
+
+### 📥 Pre-Intake Media Triage Gateway (`triage_media_intake.py`)
+
+A high-performance, two-drive intake gateway bridging raw storage discovery (`drive-audit-cli`) and Apple Photos ingestion (`All-Media.photoslibrary`). It indexes all 212,000+ library assets into in-memory lookup hashes ($O(1)$ size + filename / EXIF cascade), pairs Live Photo companions (`.JPG` + `.MOV`), and routes uncurated files across physical drives with automatic macOS Finder color tagging.
+
+#### 🎯 Multi-Drive Destination Architecture
+To protect primary backed-up storage, assets are partitioned across physical drives based on confidence:
+- **DELL1TB02 (Non-backed up cold/disposable tier)**:
+  - `Duplicates/<triage_id>` (🟠 **Orange Tag**): 100% verified duplicate copies already cataloged in `All-Media.photoslibrary`. Safe to unmount, ignore from cloud backup, or delete in bulk.
+- **LaCie (Primary backed-up storage)**:
+  - `Review-Similar/<triage_id>` (🔴 **Red Tag**): Assets suspected of having been intentionally pruned or discarded from the library (deletion keywords in folder names, burst/sequence siblings within $\le 30$s of library photos, low-res web thumbnails, or screenshot artifacts). Held for human review.
+  - `New/<triage_id>` (🟢 **Green Tag**): Pristine, high-confidence novel media not found in Apple Photos, ready for direct library import.
+
+#### ⚙️ CLI Options & Help Reference
+| Flag / Argument | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `target_dir` | Positional | `/Volumes/LaCie/Storage/Priority 4/Media Preprocessing` | Source intake directory to scan and triage |
+| `--dell-dest-dir` | Option | `/Volumes/DELL1TB02/Storage/Priority 4/Media Preprocessing/TriageMediaIntake` | Destination root on DELL1TB02 for `Duplicates` |
+| `--lacie-dest-dir`, `--dest-dir` | Option | `/Volumes/LaCie/Storage/Priority 4/Media Preprocessing/TriageMediaIntake` | Destination root on LaCie for `Review-Similar` and `New` |
+| `--triage-id` | Option | Auto-increment integer | Custom session ID for session subdirectories (recorded in `triage_sessions` DB table) |
+| `--dry-run` | Flag | `False` | Simulates file classification, destination paths, and space calculations without moving files or modifying DB |
+| `--no-clean` | Flag | `False` | Prevents automatic pruning of empty source subdirectories after moving assets |
+| `--tag-only` | Flag | `False` | Re-applies macOS Finder color tags (🟠 Orange, 🔴 Red, 🟢 Green) to existing triage output folders without re-scanning |
+
+#### 📋 Examples
+```bash
+# 1. Preview triage run on default intake folder (safe simulation)
+python3 scripts/triage_media_intake.py --dry-run
+
+# 2. Triage default intake folder across DELL1TB02 and LaCie
+python3 scripts/triage_media_intake.py
+
+# 3. Triage a specific external hard drive or folder
+python3 scripts/triage_media_intake.py "/Volumes/DELL1TB02/Archive/Pictures Extra Sequence"
+
+# 4. Use a specific custom session ID
+python3 scripts/triage_media_intake.py "/path/to/media" --triage-id "2026-Batch-A"
+
+# 5. Re-apply Finder color tags to all existing triage session directories
+python3 scripts/triage_media_intake.py --tag-only
+```
+
+---
+
+### 📁 Recursive Directory Merger & Deduplication Utility (`merge_directories.py`)
+
+A production-grade directory consolidation and migration utility for macOS and Linux. It recursively merges all files from a source directory into a destination directory, preserving the nested relative folder hierarchy, deduplicating identical files, resolving collisions, and auto-bypassing macOS file locks and Time Machine ACLs.
+
+#### 🌟 Key Capabilities
+- **Move vs Copy Mode**: Default `--move` mode transfers files and prunes empty source folders; `--copy` mode replicates content without altering the source tree.
+- **Byte-by-Byte Chunk Deduplication**: Compares candidate collisions using 64KB chunk-based byte streams:
+  - In **Move Mode**: Safely removes the redundant source copy (safe deduplication without duplicating data).
+  - In **Copy Mode**: Skips re-copying existing identical files.
+- **Collision Strategies**: For non-identical files with matching relative paths, choose `--on-collision {rename,overwrite,skip,newer}` (defaults to non-destructive rename appending `_dup1`, `_dup2`).
+- **macOS Time Machine ACL & Lock Bypass**: Automatically removes immutable flags (`chflags 0`) and Time Machine deny ACLs (`chmod -N`) whenever a `PermissionError (Errno 13)` is encountered, ensuring smooth transfers even from locked system backup folders.
+- **Dynamic Progress & Audit Logging**: Real-time progress bar in the terminal plus structured audit logging to `logs/merge_directories.log`.
+- **Dry-Run Mode**: Full preview simulation reporting total file count, volume size, collision preview, and planned actions.
+
+#### ⚙️ CLI Options & Help Reference
+| Flag / Argument | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `source` | Positional | *(Required)* | Source directory containing files to merge |
+| `destination` | Positional | *(Required)* | Destination directory to merge into |
+| `--move` | Flag | Enabled (Default) | Moves files from source to destination and deletes emptied source folders |
+| `--copy` | Flag | `False` | Copies files from source to destination, leaving source files intact |
+| `--on-collision` | Choice | `rename` | Collision resolution for non-identical files: `rename` (`_dupX`), `overwrite`, `skip`, or `newer` |
+| `--dry-run` | Flag | `False` | Simulates file scanning, size totals, and collision outcomes without transferring files or altering directories |
+| `--no-clean` | Flag | `False` | In move mode, prevents deletion of empty source folders after files have been moved |
+
+#### 📋 Examples
+```bash
+# 1. Preview merge between two folders or drives (safe simulation)
+python3 scripts/merge_directories.py "/Volumes/LaCie/Storage/Priority 3" "/Volumes/DELL1TB02/Storage/Priority 3" --dry-run
+
+# 2. Move and merge files recursively (default move mode with auto-cleanup of empty source folders)
+python3 scripts/merge_directories.py "/Volumes/LaCie/Storage/Priority 3" "/Volumes/DELL1TB02/Storage/Priority 3"
+
+# 3. Copy files recursively without removing source files
+python3 scripts/merge_directories.py "/path/to/source" "/path/to/destination" --copy
+
+# 4. Overwrite conflicting files at the destination if different
+python3 scripts/merge_directories.py "/path/to/source" "/path/to/destination" --on-collision overwrite
+
+# 5. Skip non-identical files that already exist at destination
+python3 scripts/merge_directories.py "/path/to/source" "/path/to/destination" --on-collision skip
+```
 
 ---
 

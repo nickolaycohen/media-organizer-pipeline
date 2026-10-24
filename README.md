@@ -53,6 +53,12 @@ A dedicated standalone intake and deduplication utility specifically designed fo
 ### 🔧 UUID Session Reconciler (`reconcile_triage_session_movs.py`)
 Companion utility to audit past triage sessions containing Apple Photos UUID files, verifying exact byte matches against `All-Media.photoslibrary` and relocating confirmed duplicates from `New/` to `Duplicates/`.
 
+### 📊 Master Library Duplicates Report (`report_library_duplicates.py`)
+Generates comprehensive asset distribution and duplicate analysis across all 212,000+ assets in `All-Media.photoslibrary` by year (1969–2026), calculating duplicate percentages, unique counts, and wasted redundant storage.
+
+### 🛡️ Intake Triage Deduplication Report (`report_triage_deduplication.py`)
+Audits all intake triage sessions across external hard drives, reporting cumulative duplicate volume diverted, review-similar routed, novel media discovered, and individual per-session breakdowns.
+
 ```bash
 # Preview standard intake triage without moving files (dry run)
 python3 scripts/triage_media_intake.py --dry-run
@@ -69,6 +75,14 @@ python3 scripts/triage_photos_library.py "/path/to/Library.photoslibrary" --igno
 
 # Reconcile UUID assets from a previous triage session (e.g. session 37)
 python3 scripts/reconcile_triage_session_movs.py --triage-id 37
+
+# Generate Master Library yearly asset distribution & duplicate report
+python3 scripts/report_library_duplicates.py
+python3 scripts/report_library_duplicates.py --show-clusters 5
+
+# Generate Intake Triage deduplication summary & inspect specific session
+python3 scripts/report_triage_deduplication.py
+python3 scripts/report_triage_deduplication.py --session 41
 ```
 
 ---
@@ -414,6 +428,53 @@ python3 scripts/reconcile_triage_session_movs.py --triage-id 37 --dry-run
 
 # 2. Reconcile session 37, relocate duplicate MOV/media to DELL1TB02, and commit DB records
 python3 scripts/reconcile_triage_session_movs.py --triage-id 37
+```
+
+---
+
+### 📊 Master Catalog Duplicates & Distribution Report (`report_library_duplicates.py`)
+
+Generates comprehensive asset distribution and duplicate analysis for the primary master library (`All-Media.photoslibrary`) from `media_organizer.db`.
+
+#### 🌟 Key Capabilities
+- **Yearly Distribution**: Breaks down 212,000+ library assets by year (1969 to present), showing file counts, storage footprints, unique counts, and duplicate percentages.
+- **Configurable Match Criteria**: Detect duplicates by `--match-criteria name_size` (same exact byte size + camera filename, default) or `--match-criteria size_date` (same exact byte size + creation date).
+- **Cluster Metrics**: Identifies duplicate clusters, counts redundant extra copies, and calculates total reclaimable disk space.
+- **Deep Inspection**: View the top largest duplicate clusters with `--show-clusters N`.
+- **Markdown & CSV Export**: Outputs formatted terminal tables, GitHub-flavored Markdown (`--markdown`), or exports to CSV (`--csv <path>`).
+
+```bash
+# Default terminal report
+python3 scripts/report_library_duplicates.py
+
+# Inspect top 5 largest duplicate clusters with file names, sizes, and dates
+python3 scripts/report_library_duplicates.py --show-clusters 5
+
+# Export to CSV for spreadsheet analysis
+python3 scripts/report_library_duplicates.py --csv library_duplicates_report.csv
+```
+
+---
+
+### 🛡️ Intake Triage Deduplication Report (`report_triage_deduplication.py`)
+
+Audits all intake triage sessions across external hard drives, reporting cumulative duplicate volume diverted, review-similar routed, novel media discovered, and individual per-session breakdowns.
+
+#### 🌟 Key Capabilities
+- **Cumulative Intake Metrics**: Displays total scanned media files, confirmed duplicates diverted/skipped, review-similar assets, and high-confidence new media.
+- **Storage Savings**: Quantifies total redundant storage eliminated (GB saved) and overall deduplication efficiency percentage.
+- **Session Breakdown**: Lists every completed triage session with source folder, date, file counts, and duplicate rates.
+- **Deep-Dive Session Inspection**: Drill into any individual session with `--session <id>` to see its detailed classification breakdown (`identical`, `visual_duplicate`, `upgrade_candidate`, `temporal_burst`, `clean_media`) and sample file decision reasons.
+
+```bash
+# View cumulative triage metrics and all session breakdowns
+python3 scripts/report_triage_deduplication.py
+
+# Drill down into a specific triage session (e.g. Session 41)
+python3 scripts/report_triage_deduplication.py --session 41
+
+# Output as GitHub Flavored Markdown
+python3 scripts/report_triage_deduplication.py --markdown
 ```
 
 ---

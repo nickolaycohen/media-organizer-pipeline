@@ -314,6 +314,7 @@ class LibraryIndex:
         self.has_originals = os.path.isdir(self.originals_dir)
         self.size_name_map = {}
         self.size_date_map = {}
+        self.size_map = {}           # sz -> list of entries (for exact byte size match on UUID/library assets)
         self.name_date_map = {}      # (filename_lower, ymd) -> list of entries
         self.date_seq_map = {}       # date_ymd -> set of (prefix_lower, seq_num)
         self.date_ts_map = {}        # date_ymd -> sorted list of unix_ts
@@ -366,6 +367,7 @@ class LibraryIndex:
             fname = orig_name or cur_name or ''
 
             if sz:
+                self.size_map.setdefault(sz, []).append(entry)
                 if orig_name:
                     self.size_name_map[(sz, orig_name.lower())] = entry
                 if cur_name and cur_name != orig_name:
@@ -458,7 +460,7 @@ class LibraryIndex:
         self.lib_hash_cache[uuid] = (h_obj, h_str)
         return h_obj, h_str
 
-    def evaluate_asset(self, file_path, rel_path, file_size, filename):
+    def evaluate_asset(self, file_path, rel_path, file_size, filename, is_photos_library=False):
         """
         Multi-tier quality, duplicate & visual similarity evaluation:
         Returns (category, sub_type, reason, matched_entry, visual_meta)
@@ -554,6 +556,26 @@ class LibraryIndex:
                     if visual_meta.get("matched_moment_name"):
                         reason += f" [Moment: {visual_meta['matched_moment_name']}]"
                     return "duplicate", "identical", reason, matched, visual_meta
+
+        # TIER 1C: Standalone exact byte-size duplicate (Photos Library UUID intake or exact size match)
+        if (is_photos_library or re.match(r'^[0-9a-fA-F-]{36}', filename)) and file_size in self.size_map:
+            candidates = self.size_map[file_size]
+            matched = candidates[0]
+            if candidate_dates:
+                for c in candidates:
+                    c_dt = c.get("date_created") or ""
+                    if any(c_dt.startswith(d) for d in candidate_dates):
+                        matched = c
+                        break
+            visual_meta["matched_asset_uuid"] = matched["uuid"]
+            if matched.get("moment_name"):
+                visual_meta["matched_moment_name"] = matched["moment_name"]
+            visual_meta["visual_similarity_score"] = 100.0
+            visual_meta["hamming_distance"] = 0
+            reason = f"Exact byte match ({format_size(file_size)}) matches All-Media asset {matched['uuid']} ({matched['original_filename']})"
+            if visual_meta.get("matched_moment_name"):
+                reason += f" [Moment: {visual_meta['matched_moment_name']}]"
+            return "duplicate", "identical", reason, matched, visual_meta
 
         # ---------------------------------------------------------
         # TIER 2: Quality & Size Comparison Against Same Photo
@@ -815,6 +837,40 @@ def safe_move(src, dest):
 
     return dest
 
+def safe_copy(src, dest):
+    """
+    Safely copies a file to destination preserving timestamps and metadata (shutil.copy2).
+    Disambiguates name collisions by appending _dupX.
+    Leaves the source file 100% untouched (read-only mode).
+    """
+    dest_dir = os.path.dirname(dest)
+    os.makedirs(dest_dir, exist_ok=True)
+
+    if os.path.exists(dest):
+        try:
+            src_sz = os.path.getsize(src)
+            dst_sz = os.path.getsize(dest)
+            if src_sz == dst_sz:
+                # Identical duplicate already at destination; skip re-copy
+                return dest
+        except OSError:
+            pass
+
+        # Disambiguate collision
+        base, ext = os.path.splitext(dest)
+        idx = 1
+        while os.path.exists(f"{base}_dup{idx}{ext}"):
+            idx += 1
+        dest = f"{base}_dup{idx}{ext}"
+
+    try:
+        shutil.copy2(src, dest)
+    except (PermissionError, OSError):
+        unlock_path(dest_dir)
+        shutil.copy2(src, dest)
+
+    return dest
+
 def clean_empty_directories(root_dir, protected_subdirs):
     protected_paths = {os.path.abspath(p) for p in protected_subdirs}
     for current_root, dirs, files in os.walk(root_dir, topdown=False):
@@ -848,10 +904,13 @@ def find_photos_library_parent(path):
         cur = os.path.dirname(cur)
     return None
 
-def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, triage_id=None, dry_run=False, clean_empty=True):
+def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, triage_id=None, dry_run=False, clean_empty=True, photos_library=None):
     target_dir = os.path.abspath(target_dir)
     lacie_dest_root = os.path.abspath(lacie_dest_root or TRIAGE_LACIE_DESTINATION_ROOT)
     dell_dest_root = os.path.abspath(dell_dest_root or TRIAGE_DELL_DESTINATION_ROOT)
+    is_photos_library = bool(photos_library)
+    if is_photos_library:
+        clean_empty = False
 
     triage_id = determine_triage_id(MEDIA_ORGANIZER_DB_PATH, lacie_dest_root, dell_dest_root, requested_id=triage_id)
 
@@ -867,11 +926,16 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
     session_dest_desc = f"DELL1TB02: Duplicates/{triage_id} | LaCie: [Review-Similar|New]/{triage_id}"
 
     logger.info(f"🚀 Starting Media Intake Triage [Triage ID: {triage_id}]")
+    if is_photos_library:
+        logger.info(f"   - Mode:                     🛡️ READ-ONLY PHOTOS LIBRARY REPLICA MODE")
+        logger.info(f"   - Photos Library Package:   {photos_library}")
+        print(f"🛡️  Apple Photos Library Read-Only Mode Active: {photos_library}")
+        print(f"   Mode: Full Replica (Copy Net-New to LaCie & Duplicates to DELL1TB02; source 100% untouched)")
     logger.info(f"   - Source Directory:        {target_dir}")
     logger.info(f"   - Duplicates Destination:  {duplicates_dir} (DELL1TB02)")
     logger.info(f"   - Review & New (LaCie):    {lacie_dest_root}/[Review-Similar|New]/{triage_id}")
     if dry_run:
-        logger.info("🔎 DRY RUN MODE: No files will be moved and DB will not be modified.")
+        logger.info("🔎 DRY RUN MODE: No files will be moved/copied and DB will not be modified.")
 
     if not os.path.exists(target_dir):
         logger.error(f"❌ Target intake directory does not exist: {target_dir}")
@@ -915,6 +979,9 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
         ignored_file_names = {
             ".ds_store", "thumbs.db", "desktop.ini"
         }
+        ignored_library_subdirs = {
+            "resources", "private", "database", "scopes", "derivatives"
+        }
 
         lacie_dest_abs = os.path.abspath(lacie_dest_root)
         dell_dest_abs = os.path.abspath(dell_dest_root)
@@ -934,6 +1001,12 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
             # If scanning inside or around TriageMediaIntake, skip the destination folder itself
             if first_segment in ignored_dir_names:
                 continue
+
+            # If scanning inside an Apple Photos Library, ignore thumbnail caches, private, database, and scopes
+            if is_photos_library:
+                rel_parts = [p.lower() for p in rel_root.split(os.sep) if p and p != '.']
+                if rel_parts and rel_parts[0] in ignored_library_subdirs:
+                    continue
 
             for f in sorted(files):
                 if f.startswith('.') or f.lower() in ignored_file_names:
@@ -1044,7 +1117,7 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
 
             if primary_candidates:
                 p_full, p_rel, p_f, p_sz, p_ext = primary_candidates[0]
-                cat, sub_type, reason, matched, visual_meta = index.evaluate_asset(p_full, p_rel, p_sz, p_f)
+                cat, sub_type, reason, matched, visual_meta = index.evaluate_asset(p_full, p_rel, p_sz, p_f, is_photos_library=is_photos_library)
 
                 if visual_meta and visual_meta.get("matched_moment_name"):
                     moment_matched_count += len(file_group)
@@ -1109,7 +1182,7 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
                 # Standalone videos
                 for v_item in video_candidates:
                     v_full, v_rel, v_f, v_sz, v_ext = v_item
-                    cat, sub_type, reason, matched, visual_meta = index.evaluate_asset(v_full, v_rel, v_sz, v_f)
+                    cat, sub_type, reason, matched, visual_meta = index.evaluate_asset(v_full, v_rel, v_sz, v_f, is_photos_library=is_photos_library)
 
                     if visual_meta and visual_meta.get("matched_moment_name"):
                         moment_matched_count += 1
@@ -1199,7 +1272,8 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
             print(f"   Destination Hierarchy:")
             print(f"   - DELL1TB02: {dell_dest_root}/Duplicates/{triage_id}/")
             print(f"   - LaCie:     {lacie_dest_root}/[Review-Similar|New]/{triage_id}/")
-            print(f"   Would move:")
+            act_w = "replicate (copy)" if is_photos_library else "move"
+            print(f"   Would {act_w}:")
             print(f"   - {len(duplicates_list):,} duplicates to DELL1TB02: '{duplicates_dir}/'")
             if visual_dup_count > 0:
                 print(f"     └─ {visual_dup_count:,} visual duplicates (>=95% match, different filename)")
@@ -1220,10 +1294,11 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
             print(f"📝 Logs appended to: {TRIAGE_LOG_PATH}")
             return
 
-        # Step 5: Moving files
+        # Step 5: Moving / Replicating files
         total_to_move = len(duplicates_list) + len(review_list) + len(new_list)
-        logger.info(f"🚚 Moving {total_to_move:,} triaged files into destination folders on DELL1TB02 and LaCie...")
-        print(f"🚚 Moving {total_to_move:,} triaged files into destination folders...")
+        action_verb = "Replicating (Copying)" if is_photos_library else "Moving"
+        logger.info(f"🚚 {action_verb} {total_to_move:,} triaged files into destination folders on DELL1TB02 and LaCie...")
+        print(f"🚚 {action_verb} {total_to_move:,} triaged files into destination folders...")
         moved_duplicates = 0
         moved_review = 0
         moved_new = 0
@@ -1236,24 +1311,31 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
             pct = (moved_total / total_to_move) * 100 if total_to_move else 100.0
             if moved_total == 1 or moved_total == total_to_move or (now - last_move_time) >= 0.5 or moved_total % 25 == 0:
                 last_move_time = now
-                sys.stdout.write(f"\r🚚 Transferring files: {moved_total:,}/{total_to_move:,} ({pct:.1f}%)...")
+                sys.stdout.write(f"\r🚚 {action_verb} files: {moved_total:,}/{total_to_move:,} ({pct:.1f}%)...")
                 sys.stdout.flush()
             if moved_total == 1 or moved_total % max(1, total_to_move // 10) == 0 or moved_total == total_to_move:
-                logger.info(f"🚚 Transfer Progress: {moved_total:,}/{total_to_move:,} ({pct:.0f}%)")
+                logger.info(f"🚚 {action_verb} Progress: {moved_total:,}/{total_to_move:,} ({pct:.0f}%)")
 
         for src_full, rel_p, fname, sz, reason, sub_t, vmeta in duplicates_list:
             dest_full = os.path.join(duplicates_dir, rel_p)
-            is_in_library = bool(find_photos_library_parent(src_full))
-            if is_in_library:
-                # Do NOT move files out of a .photoslibrary bundle to protect package integrity
-                moved_duplicates += 1
-                logger.debug(f"  [PRESERVED IN LIBRARY] {src_full} -> Classified as Duplicate")
-            else:
+            if is_photos_library:
                 try:
-                    safe_move(src_full, dest_full)
+                    safe_copy(src_full, dest_full)
                     moved_duplicates += 1
                 except Exception as e:
-                    logger.error(f"❌ Failed to move {src_full} to {dest_full}: {e}")
+                    logger.error(f"❌ Failed to copy duplicate {src_full} to {dest_full}: {e}")
+            else:
+                is_in_library = bool(find_photos_library_parent(src_full))
+                if is_in_library:
+                    # Do NOT move files out of a .photoslibrary bundle to protect package integrity
+                    moved_duplicates += 1
+                    logger.debug(f"  [PRESERVED IN LIBRARY] {src_full} -> Classified as Duplicate")
+                else:
+                    try:
+                        safe_move(src_full, dest_full)
+                        moved_duplicates += 1
+                    except Exception as e:
+                        logger.error(f"❌ Failed to move {src_full} to {dest_full}: {e}")
             moved_total += 1
             report_move_progress()
 
@@ -1262,33 +1344,47 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
                 dest_full = os.path.join(review_dir, "Upgrade-Candidates", rel_p)
             else:
                 dest_full = os.path.join(review_dir, rel_p)
-            is_in_library = bool(find_photos_library_parent(src_full))
-            if is_in_library:
-                # Do NOT move files out of a .photoslibrary bundle to protect package integrity
-                moved_review += 1
-                logger.debug(f"  [PRESERVED IN LIBRARY] {src_full} -> Classified as Review-Similar")
-            else:
+            if is_photos_library:
                 try:
-                    safe_move(src_full, dest_full)
+                    safe_copy(src_full, dest_full)
                     moved_review += 1
                 except Exception as e:
-                    logger.error(f"❌ Failed to move {src_full} to {dest_full}: {e}")
+                    logger.error(f"❌ Failed to copy review asset {src_full} to {dest_full}: {e}")
+            else:
+                is_in_library = bool(find_photos_library_parent(src_full))
+                if is_in_library:
+                    # Do NOT move files out of a .photoslibrary bundle to protect package integrity
+                    moved_review += 1
+                    logger.debug(f"  [PRESERVED IN LIBRARY] {src_full} -> Classified as Review-Similar")
+                else:
+                    try:
+                        safe_move(src_full, dest_full)
+                        moved_review += 1
+                    except Exception as e:
+                        logger.error(f"❌ Failed to move {src_full} to {dest_full}: {e}")
             moved_total += 1
             report_move_progress()
 
         for src_full, rel_p, fname, sz, reason, sub_t, vmeta in new_list:
             dest_full = os.path.join(new_dir, rel_p)
-            is_in_library = bool(find_photos_library_parent(src_full))
-            if is_in_library:
-                # Do NOT move files out of a .photoslibrary bundle to protect package integrity
-                moved_new += 1
-                logger.debug(f"  [PRESERVED IN LIBRARY] {src_full} -> Classified as New")
-            else:
+            if is_photos_library:
                 try:
-                    safe_move(src_full, dest_full)
+                    safe_copy(src_full, dest_full)
                     moved_new += 1
                 except Exception as e:
-                    logger.error(f"❌ Failed to move {src_full} to {dest_full}: {e}")
+                    logger.error(f"❌ Failed to copy new asset {src_full} to {dest_full}: {e}")
+            else:
+                is_in_library = bool(find_photos_library_parent(src_full))
+                if is_in_library:
+                    # Do NOT move files out of a .photoslibrary bundle to protect package integrity
+                    moved_new += 1
+                    logger.debug(f"  [PRESERVED IN LIBRARY] {src_full} -> Classified as New")
+                else:
+                    try:
+                        safe_move(src_full, dest_full)
+                        moved_new += 1
+                    except Exception as e:
+                        logger.error(f"❌ Failed to move {src_full} to {dest_full}: {e}")
             moved_total += 1
             report_move_progress()
 
@@ -1296,15 +1392,16 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
             sys.stdout.write("\r" + " " * 80 + "\r")
             sys.stdout.flush()
 
-        logger.info(f"✅ Moved {moved_duplicates:,} duplicates to DELL1TB02: {duplicates_dir}")
-        logger.info(f"✅ Moved {moved_review:,} review assets to LaCie: {review_dir}")
-        logger.info(f"✅ Moved {moved_new:,} new assets to LaCie: {new_dir}")
-        print(f"✅ Moved {moved_duplicates:,} duplicates to DELL1TB02: {duplicates_dir}")
-        print(f"✅ Moved {moved_review:,} review assets to LaCie: {review_dir}")
-        print(f"✅ Moved {moved_new:,} new assets to LaCie: {new_dir}")
+        trans_verb = "Copied (Replicated)" if is_photos_library else "Moved"
+        logger.info(f"✅ {trans_verb} {moved_duplicates:,} duplicates to DELL1TB02: {duplicates_dir}")
+        logger.info(f"✅ {trans_verb} {moved_review:,} review assets to LaCie: {review_dir}")
+        logger.info(f"✅ {trans_verb} {moved_new:,} new assets to LaCie: {new_dir}")
+        print(f"✅ {trans_verb} {moved_duplicates:,} duplicates to DELL1TB02: {duplicates_dir}")
+        print(f"✅ {trans_verb} {moved_review:,} review assets to LaCie: {review_dir}")
+        print(f"✅ {trans_verb} {moved_new:,} new assets to LaCie: {new_dir}")
 
         # Step 6: Clean empty directories left behind
-        if clean_empty:
+        if clean_empty and not is_photos_library:
             logger.info("🧹 Cleaning empty source directories...")
             clean_empty_directories(
                 target_dir,
@@ -1412,7 +1509,11 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
 
         print(f"✅ Triage Complete! [Triage ID: {triage_id}]")
         print(f"   Destination Hierarchy: {session_dest_desc}")
-        if photos_libraries_detected:
+        if is_photos_library:
+            print(f"   - {moved_duplicates:,} duplicates replicated to DELL1TB02: '{duplicates_dir}/'")
+            print(f"   - {moved_review:,} review assets replicated to LaCie: '{review_dir}/'")
+            print(f"   - {moved_new:,} clean new assets replicated to LaCie: '{new_dir}/'")
+        elif photos_libraries_detected:
             print(f"   - {moved_duplicates:,} duplicates evaluated (Preserved inside Photos Library package)")
             print(f"   - {moved_review:,} review assets evaluated (Preserved inside Photos Library package)")
             print(f"   - {moved_new:,} clean assets evaluated (Preserved inside Photos Library package)")
@@ -1428,7 +1529,27 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
                 print(f"   {status} {folder_rel:<45} -> {color} {icon}")
         print(f"📝 Full audit log: {TRIAGE_LOG_PATH}")
 
-        if photos_libraries_detected:
+        if is_photos_library:
+            print("\n" + "=" * 80)
+            print("🛡️  PHOTOS MEDIA LIBRARY PROCESSED (READ-ONLY FULL REPLICA MODE)")
+            print("-" * 80)
+            print("The following Apple Photos Library package was processed as a read-only source:")
+            print(f"   📦 {photos_library}")
+            print("\nAll assets were evaluated and replicated:")
+            print(f"   • {moved_duplicates:,} duplicates copied to DELL1TB02: '{duplicates_dir}/'")
+            print(f"   • {moved_review:,} review assets copied to LaCie: '{review_dir}/'")
+            print(f"   • {moved_new:,} clean new assets copied to LaCie: '{new_dir}/'")
+            print("\nSource Library Protection:")
+            print("   ✅ 100% READ-ONLY: Source files and folders remain completely unmodified.")
+            print("\n👉 ACTION REQUIRED:")
+            print(f"   The source Photos Library package ({photos_library})")
+            print("   must now be MANUALLY PROCESSED or DELETED when you have verified the intake.")
+            print("=" * 80 + "\n")
+            logger.warning(
+                f"🛡️ Photos Media Library processed in Read-Only Full Replica Mode: {photos_library}. "
+                "Source files remain 100% untouched."
+            )
+        elif photos_libraries_detected:
             print("\n" + "=" * 80)
             print("⚠️  NOTICE: Photos Media Library Package(s) Detected & Processed:")
             for lib_p in sorted(photos_libraries_detected):
@@ -1481,6 +1602,8 @@ def parse_args():
     )
     parser.add_argument("target_dir", nargs="?", default=DEFAULT_MEDIA_PREPROCESSING_DIR,
                         help=f"Source intake directory to scan and triage (default: {DEFAULT_MEDIA_PREPROCESSING_DIR})")
+    parser.add_argument("--photos-library", "-p", dest="photos_library", default=None,
+                        help="Specify an Apple Photos Library bundle (.photoslibrary) as an explicit read-only source in Full Replica mode. Evaluates assets and replicates to DELL1TB02 (Duplicates) and LaCie (New/Review) without modifying the source library.")
     parser.add_argument("--lacie-dest-dir", "--dest-dir", dest="lacie_dest_dir", default=None,
                         help=f"LaCie base destination directory for Review-Similar and New (default: {TRIAGE_LACIE_DESTINATION_ROOT})")
     parser.add_argument("--dell-dest-dir", dest="dell_dest_dir", default=None,
@@ -1511,12 +1634,32 @@ if __name__ == "__main__":
         if not res:
             print("   ℹ️ No triage folders (Duplicates, Review-Similar, New) found to tag.")
     else:
+        target = args.target_dir
+        lib_path = None
+        if args.photos_library:
+            lib_path = os.path.abspath(args.photos_library)
+            if not os.path.exists(lib_path):
+                print(f"❌ Error: Specified Photos Library does not exist: {lib_path}")
+                sys.exit(1)
+            if not (lib_path.lower().endswith('.photoslibrary') or lib_path.lower().endswith('.photolibrary') or os.path.isdir(lib_path)):
+                print(f"❌ Error: Path is not a valid Photos Library directory: {lib_path}")
+                sys.exit(1)
+
+            # Locate media originals folder within the library
+            if os.path.isdir(os.path.join(lib_path, "originals")):
+                target = os.path.join(lib_path, "originals")
+            elif os.path.isdir(os.path.join(lib_path, "Masters")):
+                target = os.path.join(lib_path, "Masters")
+            else:
+                target = lib_path
+
         triage_intake_folder(
-            args.target_dir,
+            target,
             lacie_dest_root=args.lacie_dest_dir,
             dell_dest_root=args.dell_dest_dir,
             triage_id=args.triage_id,
             dry_run=args.dry_run,
-            clean_empty=not args.no_clean
+            clean_empty=not args.no_clean,
+            photos_library=lib_path
         )
 

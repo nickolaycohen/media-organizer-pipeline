@@ -836,6 +836,18 @@ def clean_empty_directories(root_dir, protected_subdirs):
         except Exception as e:
             logger.debug(f"Could not remove directory {current_root}: {e}")
 
+def find_photos_library_parent(path):
+    """
+    Returns the photoslibrary directory path if path is inside a .photoslibrary or .photolibrary bundle.
+    Returns None if path is a normal directory.
+    """
+    cur = os.path.abspath(path)
+    while cur and cur != os.path.dirname(cur):
+        if cur.lower().endswith('.photoslibrary') or cur.lower().endswith('.photolibrary'):
+            return cur
+        cur = os.path.dirname(cur)
+    return None
+
 def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, triage_id=None, dry_run=False, clean_empty=True):
     target_dir = os.path.abspath(target_dir)
     lacie_dest_root = os.path.abspath(lacie_dest_root or TRIAGE_LACIE_DESTINATION_ROOT)
@@ -896,6 +908,7 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
         logger.info(f"🔍 Scanning intake directory: {target_dir}")
         print(f"🔍 Scanning intake directory: {target_dir}")
         candidate_files = []
+        photos_libraries_detected = set()
         ignored_dir_names = {
             "triagemediaintake", "$recycle.bin", ".spotlight-v100", ".trashes", ".fseventsd"
         }
@@ -931,6 +944,12 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
 
                 full_p = os.path.join(root, f)
                 rel_p = os.path.relpath(full_p, target_dir)
+
+                # Check if file resides inside an Apple Photos Library package
+                lib_parent = find_photos_library_parent(full_p)
+                if lib_parent:
+                    photos_libraries_detected.add(lib_parent)
+
                 try:
                     sz = os.path.getsize(full_p)
                     candidate_files.append((full_p, rel_p, f, sz))
@@ -964,7 +983,10 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
         for full_p, rel_p, f, sz in candidate_files:
             dirname = os.path.dirname(rel_p)
             stem, ext = os.path.splitext(f)
-            key = (dirname, stem.lower())
+            # If filename is an Apple Photos UUID with an underscore suffix like <UUID>_3 or <UUID>_1,
+            # normalize to base UUID so Live Photo companion videos group with their still photo
+            clean_stem = re.sub(r'_\d+$', '', stem) if re.match(r'^[0-9a-fA-F-]{36}_\d+$', stem) else stem
+            key = (dirname, clean_stem.lower())
             if key not in grouped_by_stem:
                 grouped_by_stem[key] = []
             grouped_by_stem[key].append((full_p, rel_p, f, sz, ext.lower()))
@@ -1221,11 +1243,17 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
 
         for src_full, rel_p, fname, sz, reason, sub_t, vmeta in duplicates_list:
             dest_full = os.path.join(duplicates_dir, rel_p)
-            try:
-                safe_move(src_full, dest_full)
+            is_in_library = bool(find_photos_library_parent(src_full))
+            if is_in_library:
+                # Do NOT move files out of a .photoslibrary bundle to protect package integrity
                 moved_duplicates += 1
-            except Exception as e:
-                logger.error(f"❌ Failed to move {src_full} to {dest_full}: {e}")
+                logger.debug(f"  [PRESERVED IN LIBRARY] {src_full} -> Classified as Duplicate")
+            else:
+                try:
+                    safe_move(src_full, dest_full)
+                    moved_duplicates += 1
+                except Exception as e:
+                    logger.error(f"❌ Failed to move {src_full} to {dest_full}: {e}")
             moved_total += 1
             report_move_progress()
 
@@ -1234,21 +1262,33 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
                 dest_full = os.path.join(review_dir, "Upgrade-Candidates", rel_p)
             else:
                 dest_full = os.path.join(review_dir, rel_p)
-            try:
-                safe_move(src_full, dest_full)
+            is_in_library = bool(find_photos_library_parent(src_full))
+            if is_in_library:
+                # Do NOT move files out of a .photoslibrary bundle to protect package integrity
                 moved_review += 1
-            except Exception as e:
-                logger.error(f"❌ Failed to move {src_full} to {dest_full}: {e}")
+                logger.debug(f"  [PRESERVED IN LIBRARY] {src_full} -> Classified as Review-Similar")
+            else:
+                try:
+                    safe_move(src_full, dest_full)
+                    moved_review += 1
+                except Exception as e:
+                    logger.error(f"❌ Failed to move {src_full} to {dest_full}: {e}")
             moved_total += 1
             report_move_progress()
 
         for src_full, rel_p, fname, sz, reason, sub_t, vmeta in new_list:
             dest_full = os.path.join(new_dir, rel_p)
-            try:
-                safe_move(src_full, dest_full)
+            is_in_library = bool(find_photos_library_parent(src_full))
+            if is_in_library:
+                # Do NOT move files out of a .photoslibrary bundle to protect package integrity
                 moved_new += 1
-            except Exception as e:
-                logger.error(f"❌ Failed to move {src_full} to {dest_full}: {e}")
+                logger.debug(f"  [PRESERVED IN LIBRARY] {src_full} -> Classified as New")
+            else:
+                try:
+                    safe_move(src_full, dest_full)
+                    moved_new += 1
+                except Exception as e:
+                    logger.error(f"❌ Failed to move {src_full} to {dest_full}: {e}")
             moved_total += 1
             report_move_progress()
 
@@ -1276,7 +1316,8 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
                     new_dir,
                     dell_dest_root,
                     os.path.join(dell_dest_root, "Duplicates"),
-                    duplicates_dir
+                    duplicates_dir,
+                    *photos_libraries_detected
                 ]
             )
 
@@ -1371,16 +1412,36 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
 
         print(f"✅ Triage Complete! [Triage ID: {triage_id}]")
         print(f"   Destination Hierarchy: {session_dest_desc}")
-        print(f"   - {moved_duplicates:,} duplicates moved to DELL1TB02: '{duplicates_dir}/'")
-        print(f"   - {moved_review:,} review assets moved to LaCie: '{review_dir}/'")
-        print(f"   - {moved_new:,} clean assets moved to LaCie: '{new_dir}/'")
+        if photos_libraries_detected:
+            print(f"   - {moved_duplicates:,} duplicates evaluated (Preserved inside Photos Library package)")
+            print(f"   - {moved_review:,} review assets evaluated (Preserved inside Photos Library package)")
+            print(f"   - {moved_new:,} clean assets evaluated (Preserved inside Photos Library package)")
+        else:
+            print(f"   - {moved_duplicates:,} duplicates moved to DELL1TB02: '{duplicates_dir}/'")
+            print(f"   - {moved_review:,} review assets moved to LaCie: '{review_dir}/'")
+            print(f"   - {moved_new:,} clean assets moved to LaCie: '{new_dir}/'")
         if tag_results:
             print(f"🏷️  Finder Color Tags Applied:")
             for folder_rel, (color, ok) in tag_results.items():
                 icon = "🔴" if color == "Red" else "🟡" if color == "Yellow" else "🟠" if color == "Orange" else "🟢"
                 status = "✅" if ok else "⚠️"
                 print(f"   {status} {folder_rel:<45} -> {color} {icon}")
-        print(f"📝 Full audit log: {TRIAGE_LOG_PATH}\n")
+        print(f"📝 Full audit log: {TRIAGE_LOG_PATH}")
+
+        if photos_libraries_detected:
+            print("\n" + "=" * 80)
+            print("⚠️  NOTICE: Photos Media Library Package(s) Detected & Processed:")
+            for lib_p in sorted(photos_libraries_detected):
+                print(f"   📦 {lib_p}")
+            print("\n   To protect the Apple Photos package integrity and prevent bundle corruption,")
+            print("   assets inside .photoslibrary were evaluated and indexed in the database")
+            print("   WITHOUT moving or deleting files from the package.")
+            print("   👉 This Photos Media Library file needs to be MANUALLY processed or deleted.")
+            print("=" * 80 + "\n")
+            logger.warning(
+                f"⚠️ Photos Media Library package(s) detected: {sorted(photos_libraries_detected)}. "
+                "Files evaluated and indexed in DB without moving from the package."
+            )
 
     except KeyboardInterrupt:
         logger.warning(f"\n⚠️ Triage session '{triage_id}' cancelled by user (KeyboardInterrupt).")

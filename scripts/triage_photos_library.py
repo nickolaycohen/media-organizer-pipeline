@@ -502,6 +502,12 @@ def triage_photos_library(library_path, lacie_dest_root=None, dell_dest_root=Non
                 )
                 sys.stdout.flush()
 
+            if idx == 1 or idx % max(1, total_groups // 10) == 0 or idx == total_groups:
+                logger.info(
+                    f"⏳ Evaluation Progress: {idx:,}/{total_groups:,} ({pct:.0f}%) | "
+                    f"Dups: {len(duplicates_list):,} | Review: {len(review_list):,} | New: {len(new_list):,}"
+                )
+
             primary_candidates = [item for item in file_group if item[5] not in ('.mov', '.mp4')]
             video_candidates = [item for item in file_group if item[5] in ('.mov', '.mp4')]
 
@@ -536,6 +542,7 @@ def triage_photos_library(library_path, lacie_dest_root=None, dell_dest_root=Non
                         total_dup_bytes += v_item[4]
 
                 elif cat == "review_similar":
+                    logger.info(f"🔴 [REVIEW-SIMILAR] {p_orig_f} ({format_size(p_sz)}) -> {reason}")
                     if sub_type == "upgrade_candidate":
                         upgrade_count += len(file_group)
                         upgrade_bytes += sum(it[4] for it in file_group)
@@ -560,6 +567,7 @@ def triage_photos_library(library_path, lacie_dest_root=None, dell_dest_root=Non
                         total_review_bytes += v_item[4]
 
                 else:
+                    logger.info(f"🟢 [NEW] {p_orig_f} ({format_size(p_sz)}) -> Novel asset (not in All-Media)")
                     for item in primary_candidates:
                         new_list.append((item[0], item[1], item[3], item[4], reason, sub_type, visual_meta))
                         total_new_bytes += item[4]
@@ -591,6 +599,7 @@ def triage_photos_library(library_path, lacie_dest_root=None, dell_dest_root=Non
                         duplicates_list.append((v_full, v_rel, v_orig_f, v_sz, reason, sub_type, visual_meta))
                         total_dup_bytes += v_sz
                     elif cat == "review_similar":
+                        logger.info(f"🔴 [REVIEW-SIMILAR] {v_orig_f} ({format_size(v_sz)}) -> {reason}")
                         if sub_type == "upgrade_candidate":
                             upgrade_count += 1
                             upgrade_bytes += v_sz
@@ -603,6 +612,7 @@ def triage_photos_library(library_path, lacie_dest_root=None, dell_dest_root=Non
                         review_list.append((v_full, v_rel, v_orig_f, v_sz, reason, sub_type, visual_meta))
                         total_review_bytes += v_sz
                     else:
+                        logger.info(f"🟢 [NEW] {v_orig_f} ({format_size(v_sz)}) -> Novel video (not in All-Media)")
                         new_list.append((v_full, v_rel, v_orig_f, v_sz, reason, sub_type, visual_meta))
                         total_new_bytes += v_sz
 

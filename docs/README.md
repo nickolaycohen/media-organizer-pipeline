@@ -36,8 +36,11 @@ Acts as the intermediary between raw storage discovery (`drive-audit-cli` wizard
   - `Duplicates/<session_id>` ➔ **DELL1TB02** (🟠 **Orange Tag**): 100% verified duplicate copies already cataloged in `All-Media.photoslibrary`. Routed to non-backed up disposable storage.
   - `Review-Similar/<session_id>` ➔ **LaCie** (🔴 **Red Tag**): Assets suspected of having been intentionally pruned or discarded from the library (deletion keywords, burst siblings within $\le 30$s, web thumbnails). Routed to primary storage for human review.
   - `New/<session_id>` ➔ **LaCie** (🟢 **Green Tag**): Pristine, high-confidence novel media not found in Apple Photos, ready for direct library import.
-- **Cleans**: Automatically prunes empty source directories so categorized assets bubble up cleanly.
+- **🛡️ Apple Photos Library Package Safety**: Scans inside `.photoslibrary` and `.photolibrary` packages in-place. Assets are cataloged in the database without moving or deleting files from the package to prevent bundle corruption. An end-of-session banner alert notifies the user that the source library package requires manual deletion or review.
+- **🔗 Live Photo & UUID Companion Pairing**: Pairs `.JPG` + `.MOV` companion files and normalizes Apple Photos UUID companion video stems (`<UUID>_3.mov` ➔ `<UUID>`) so companion videos correctly follow their duplicate still photo classifications.
+- **Cleans**: Automatically prunes empty source directories so categorized assets bubble up cleanly (strictly preserves `.photoslibrary` directory structures).
 - **Bypasses Locks**: Automatically unlocks macOS Time Machine ACLs (`chmod -N`) and immutable flags (`chflags 0`) on the fly.
+- **🔧 UUID Session Reconciler**: Companion utility `reconcile_triage_session_movs.py` is available to audit past triage sessions containing Apple Photos UUID files, verifying exact byte matches against `All-Media.photoslibrary` and relocating confirmed duplicates from `New/` to `Duplicates/`.
 
 ```bash
 # Preview triage without moving files (dry run)
@@ -48,6 +51,9 @@ python3 scripts/triage_media_intake.py
 
 # Triage any custom intake directory or external volume
 python3 scripts/triage_media_intake.py "/Volumes/DELL1TB02/Archive/Pictures Extra Sequence"
+
+# Reconcile UUID assets from a previous Photos library intake session (e.g. session 37)
+python3 scripts/reconcile_triage_session_movs.py --triage-id 37
 ```
 
 ---

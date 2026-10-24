@@ -67,11 +67,28 @@ def unlock_path(path):
 
 def clean_empty_directories(root_dir):
     removed = 0
+    if not os.path.exists(root_dir):
+        return removed
+
     for current_root, dirs, files in os.walk(root_dir, topdown=False):
-        if os.path.abspath(current_root) == os.path.abspath(root_dir):
-            continue
+        # Ignore and remove solitary .DS_Store files
+        remaining_files = [f for f in files if f != ".DS_Store"]
+        if not remaining_files and ".DS_Store" in files:
+            try:
+                os.remove(os.path.join(current_root, ".DS_Store"))
+            except Exception:
+                pass
+
         try:
-            if not os.listdir(current_root):
+            entries = [e for e in os.listdir(current_root) if e != ".DS_Store"]
+            if not entries:
+                # Remove remaining .DS_Store if any
+                ds_path = os.path.join(current_root, ".DS_Store")
+                if os.path.exists(ds_path):
+                    try:
+                        os.remove(ds_path)
+                    except Exception:
+                        pass
                 try:
                     os.rmdir(current_root)
                 except (PermissionError, OSError):
@@ -137,31 +154,23 @@ def reconcile_session(triage_id, dry_run=False):
 
     print(f"   Indexed {len(library_size_map):,} unique asset sizes from All-Media library.")
 
-    # Step 3: Scan all files currently in New/<triage_id>
-    print(f"🔍 Scanning files in {new_dir}...")
-    target_files = []
-    for root, dirs, files in os.walk(new_dir):
-        rel_root = os.path.relpath(root, new_dir)
-        for f in files:
-            if f.startswith('.'):
-                continue
-            full_src = os.path.join(root, f)
-            rel_path = os.path.join(rel_root, f) if rel_root != '.' else f
-            try:
-                sz = os.path.getsize(full_src)
-                target_files.append((full_src, rel_path, f, sz))
-            except OSError as e:
-                logger.warning(f"Could not stat {full_src}: {e}")
-
-    total_scanned = len(target_files)
-    total_bytes = sum(sz for _, _, _, sz in target_files)
-    print(f"📂 Found {total_scanned:,} files ({format_size(total_bytes)}) in New/{triage_id_str}.")
+    # Step 3: Load all assets currently recorded as 'new' for this session
+    print(f"🔍 Loading session assets recorded as 'new' from database...")
+    c.execute(
+        "SELECT original_rel_path, filename, file_size_bytes FROM triage_session_assets "
+        "WHERE triage_id = ? AND category = 'new';",
+        (triage_id_str,)
+    )
+    new_db_assets = c.fetchall()
+    print(f"📂 Found {len(new_db_assets):,} assets recorded as 'new' in session {triage_id_str}.")
 
     # Step 4: Classify and plan actions
-    to_move_duplicates = []
+    to_reconcile_duplicates = []
     truly_new_files = []
 
-    for full_src, rel_path, filename, sz in target_files:
+    for rel_path, filename, sz in new_db_assets:
+        src_path = os.path.join(new_dir, rel_path)
+        dest_path = os.path.join(dup_dir, rel_path)
         m = UUID_REGEX.match(filename)
         base_uuid = m.group(1).upper() if m else None
 
@@ -169,8 +178,9 @@ def reconcile_session(triage_id, dry_run=False):
         if base_uuid and base_uuid in companion_photo_map:
             paired_photo_fn, photo_sz, matched_uuid, orig_reason = companion_photo_map[base_uuid]
             reason = f"Live Photo companion of duplicate photo {paired_photo_fn} (matched asset {matched_uuid})"
-            to_move_duplicates.append({
-                "full_src": full_src,
+            to_reconcile_duplicates.append({
+                "src_path": src_path,
+                "dest_path": dest_path,
                 "rel_path": rel_path,
                 "filename": filename,
                 "size": sz,
@@ -185,8 +195,9 @@ def reconcile_session(triage_id, dry_run=False):
             candidates = library_size_map[sz]
             matched_uuid, orig_fn, dt = candidates[0]
             reason = f"Exact byte match ({format_size(sz)}) match All-Media asset {matched_uuid} ({orig_fn})"
-            to_move_duplicates.append({
-                "full_src": full_src,
+            to_reconcile_duplicates.append({
+                "src_path": src_path,
+                "dest_path": dest_path,
                 "rel_path": rel_path,
                 "filename": filename,
                 "size": sz,
@@ -197,57 +208,55 @@ def reconcile_session(triage_id, dry_run=False):
             continue
 
         # Case C: Truly net new
-        truly_new_files.append((full_src, rel_path, filename, sz))
+        truly_new_files.append((src_path, rel_path, filename, sz))
 
-    dup_count = len(to_move_duplicates)
-    dup_bytes = sum(item["size"] for item in to_move_duplicates)
+    dup_count = len(to_reconcile_duplicates)
+    dup_bytes = sum(item["size"] for item in to_reconcile_duplicates)
     net_new_count = len(truly_new_files)
     net_new_bytes = sum(sz for _, _, _, sz in truly_new_files)
 
     print("-" * 80)
     print("📊 CLASSIFICATION RESULTS:")
-    print(f"   • Confirmed Duplicates to relocate:  {dup_count:>6,} ({format_size(dup_bytes)})")
-    print(f"       - Live Photo Companions:         {sum(1 for i in to_move_duplicates if i['match_type'] == 'companion_photo'):>6,}")
-    print(f"       - Standalone Exact Byte Matches: {sum(1 for i in to_move_duplicates if i['match_type'] == 'exact_size'):>6,}")
+    print(f"   • Confirmed Duplicates to reconcile: {dup_count:>6,} ({format_size(dup_bytes)})")
+    print(f"       - Live Photo Companions:         {sum(1 for i in to_reconcile_duplicates if i['match_type'] == 'companion_photo'):>6,}")
+    print(f"       - Standalone Exact Byte Matches: {sum(1 for i in to_reconcile_duplicates if i['match_type'] == 'exact_size'):>6,}")
     print(f"   • Truly Net New to preserve:         {net_new_count:>6,} ({format_size(net_new_bytes)})")
     print("-" * 80)
 
     if dup_count == 0:
-        print("✨ No duplicate assets to relocate. Everything in New is net new.")
+        print("✨ No duplicate assets to reconcile. Everything in New is net new.")
         conn.close()
         return True
 
-    # Step 5: Perform relocation
+    # Step 5: Perform relocation / verify existing transfer & update DB
     if dry_run:
-        print(f"🔎 DRY RUN COMPLETE — Would move {dup_count:,} files ({format_size(dup_bytes)}) to DELL1TB02.")
+        print(f"🔎 DRY RUN COMPLETE — Would reconcile {dup_count:,} files ({format_size(dup_bytes)}) to DELL1TB02.")
         conn.close()
         return True
 
-    print(f"🚚 Moving {dup_count:,} duplicate files to DELL1TB02 ({dup_dir})...")
-    moved_count = 0
-    moved_bytes = 0
+    print(f"🚚 Reconciling {dup_count:,} duplicate files to DELL1TB02 ({dup_dir})...")
+    reconciled_count = 0
+    reconciled_bytes = 0
     error_count = 0
     t0 = time.time()
     last_print = time.time()
 
-    for idx, item in enumerate(to_move_duplicates, 1):
-        src_path = item["full_src"]
-        rel_path = item["rel_path"]
-        target_dest = os.path.join(dup_dir, rel_path)
+    for idx, item in enumerate(to_reconcile_duplicates, 1):
+        src_path = item["src_path"]
+        target_dest = item["dest_path"]
         dest_parent = os.path.dirname(target_dest)
 
         try:
-            os.makedirs(dest_parent, exist_ok=True)
-            try:
-                shutil.move(src_path, target_dest)
-            except (PermissionError, OSError):
-                unlock_path(os.path.dirname(src_path))
-                unlock_path(src_path)
-                unlock_path(dest_parent)
-                shutil.move(src_path, target_dest)
-
-            moved_count += 1
-            moved_bytes += item["size"]
+            # If still in new_dir, move to target_dest
+            if os.path.exists(src_path) and not os.path.exists(target_dest):
+                os.makedirs(dest_parent, exist_ok=True)
+                try:
+                    shutil.move(src_path, target_dest)
+                except (PermissionError, OSError):
+                    unlock_path(os.path.dirname(src_path))
+                    unlock_path(src_path)
+                    unlock_path(dest_parent)
+                    shutil.move(src_path, target_dest)
 
             # Update database record for this asset
             c.execute(
@@ -263,35 +272,44 @@ def reconcile_session(triage_id, dry_run=False):
                 (item["reason"], target_dest, item["matched_uuid"], triage_id_str, item["filename"])
             )
 
+            reconciled_count += 1
+            reconciled_bytes += item["size"]
+
         except Exception as e:
             error_count += 1
-            logger.error(f"Failed to move {src_path} -> {target_dest}: {e}")
+            logger.error(f"Failed to reconcile {src_path} -> {target_dest}: {e}")
 
         now = time.time()
         if idx == 1 or idx == dup_count or (now - last_print) >= 0.5 or idx % 50 == 0:
             last_print = now
             pct = (idx / dup_count) * 100
-            sys.stdout.write(f"\r🚚 Relocating: {idx:,}/{dup_count:,} ({pct:.1f}%) | Moved: {moved_count:,} | Errors: {error_count}...")
+            sys.stdout.write(f"\r🚚 Reconciling: {idx:,}/{dup_count:,} ({pct:.1f}%) | Reconciled: {reconciled_count:,} | Errors: {error_count}...")
             sys.stdout.flush()
 
     sys.stdout.write("\r" + " " * 85 + "\r")
     sys.stdout.flush()
 
     # Step 6: Clean empty directories in New/<triage_id>
-    print("🧹 Cleaning empty subdirectories in New...")
     cleaned_dirs = clean_empty_directories(new_dir)
+    # If new_dir root is now empty, remove it as well
+    try:
+        if os.path.exists(new_dir) and not os.listdir(new_dir):
+            os.rmdir(new_dir)
+            cleaned_dirs += 1
+    except Exception:
+        pass
 
     # Step 7: Update triage_sessions summary row in database
     c.execute(
         """
         UPDATE triage_sessions
-        SET duplicate_count = duplicate_count + ?,
-            duplicate_bytes = duplicate_bytes + ?,
+        SET duplicates_count = duplicates_count + ?,
+            duplicates_bytes = duplicates_bytes + ?,
             new_count = new_count - ?,
             new_bytes = new_bytes - ?
         WHERE triage_id = ?;
         """,
-        (moved_count, moved_bytes, moved_count, moved_bytes, triage_id_str)
+        (reconciled_count, reconciled_bytes, reconciled_count, reconciled_bytes, triage_id_str)
     )
     conn.commit()
     conn.close()
@@ -301,15 +319,15 @@ def reconcile_session(triage_id, dry_run=False):
     print("🎉 RECONCILIATION COMPLETE")
     print("=" * 80)
     print(f"Elapsed Time:               {elapsed:.2f}s")
-    print(f"Files Relocated to DELL:    {moved_count:>6,} ({format_size(moved_bytes)})")
+    print(f"Files Reconciled to DELL:   {reconciled_count:>6,} ({format_size(reconciled_bytes)})")
     print(f"Assets Preserved in New:    {net_new_count:>6,} ({format_size(net_new_bytes)})")
     print(f"Empty Folders Cleaned:      {cleaned_dirs:>6,}")
     print(f"Errors Encountered:         {error_count:>6,}")
-    print(f"Space Freed on LaCie:       {format_size(moved_bytes)}")
+    print(f"Space Reconciled to DELL:   {format_size(reconciled_bytes)}")
     print("=" * 80)
 
     logger.info(
-        f"Reconcile finished for session {triage_id_str}: {moved_count:,} moved to Duplicates ({format_size(moved_bytes)}), "
+        f"Reconcile finished for session {triage_id_str}: {reconciled_count:,} moved to Duplicates ({format_size(reconciled_bytes)}), "
         f"{net_new_count:,} preserved in New, {error_count} errors."
     )
     return error_count == 0

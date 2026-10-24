@@ -274,6 +274,11 @@ To protect primary backed-up storage, assets are partitioned across physical dri
   - `Review-Similar/<triage_id>` (🔴 **Red Tag**): Assets suspected of having been intentionally pruned or discarded from the library (deletion keywords in folder names, burst/sequence siblings within $\le 30$s of library photos, low-res web thumbnails, or screenshot artifacts). Held for human review.
   - `New/<triage_id>` (🟢 **Green Tag**): Pristine, high-confidence novel media not found in Apple Photos, ready for direct library import.
 
+#### 🛡️ Apple Photos Library Package Safety
+- **In-Place Package Protection**: Scans inside `.photoslibrary` and `.photolibrary` bundles (including `originals/` or `Masters/`) without moving, deleting, or altering internal bundle assets to prevent library corruption.
+- **UUID Companion Pairing**: Normalizes Apple Photos UUID companion video suffixes (`<UUID>_3.mov` -> `<UUID>`) so Live Photo companion videos reliably pair with companion still photos (`<UUID>.heic` / `.jpeg`).
+- **Post-Scan Manual Action Alert**: If any files within an Apple Photos Library are processed, an explicit notification banner is displayed at the end of the session reminding the user to manually review or delete the source library package.
+
 #### ⚙️ CLI Options & Help Reference
 | Flag / Argument | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
@@ -301,6 +306,35 @@ python3 scripts/triage_media_intake.py "/path/to/media" --triage-id "2026-Batch-
 
 # 5. Re-apply Finder color tags to all existing triage session directories
 python3 scripts/triage_media_intake.py --tag-only
+```
+
+---
+
+### 🔧 Triage Session UUID Asset Reconciler (`reconcile_triage_session_movs.py`)
+
+A specialized post-triage remediation utility designed for intake runs where source folders were extracted from Apple Photos libraries (using internal UUID filenames like `<UUID>.mov`, `<UUID>_3.mov`, `<UUID>.heic` instead of original camera filenames). It cross-references assets categorized in `New/<triage_id>` against both the session's duplicate photo mapping and the global Apple Photos database (`ZORIGINALFILESIZE` in `All-Media.photoslibrary`).
+
+#### 🌟 Key Capabilities
+- **Live Photo Companion Resolution**: Automatically links `<UUID>_*.mov` companion videos to their counterpart `<UUID>.heic` / `<UUID>.jpeg` still photos that were already identified as duplicates in the same session, re-classifying them as identical duplicates.
+- **Exact Byte-Size Master Matching**: Queries `ZORIGINALFILESIZE` across all 212,000+ assets in `All-Media.photoslibrary` to identify standalone videos or photos with 100% exact byte matches against library originals.
+- **Physical Relocation & Space Recovery**: Safely moves confirmed duplicate assets from `/Volumes/LaCie/.../New/<session>` to `/Volumes/DELL1TB02/.../Duplicates/<session>`, freeing primary drive storage.
+- **Net-New Asset Preservation**: Keeps only verified, truly novel media in `New/<session>`.
+- **Atomic Database Updates**: Synchronizes `triage_session_assets` (updating categories, sub-types, and match reasons) and `triage_sessions` (updating `duplicates_count`, `duplicates_bytes`, `new_count`, `new_bytes`).
+- **Automatic Folder Cleanup**: Prunes empty directories in `New/<triage_id>` once duplicates are relocated.
+
+#### ⚙️ CLI Options & Help Reference
+| Flag / Argument | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--triage-id` | Option | `37` | Triage session identifier to audit and reconcile |
+| `--dry-run` | Flag | `False` | Analyzes assets, companion mappings, and byte-size matches without moving files or updating the database |
+
+#### 📋 Examples
+```bash
+# 1. Preview reconciliation for session 37 without moving files or altering DB
+python3 scripts/reconcile_triage_session_movs.py --triage-id 37 --dry-run
+
+# 2. Reconcile session 37, relocate duplicate MOV/media to DELL1TB02, and commit DB records
+python3 scripts/reconcile_triage_session_movs.py --triage-id 37
 ```
 
 ---

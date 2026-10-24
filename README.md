@@ -62,6 +62,9 @@ Audits all intake triage sessions across external hard drives, reporting cumulat
 ### ⏳ Triage Temporal Isolation Report (`report_triage_isolated_assets.py`)
 Analyzes non-duplicate assets in `New` and `Review-Similar`, computing the closest preceding and succeeding master library assets by date and bubbling up the most temporally isolated, unique media.
 
+### 🧭 Interactive Folder Decision Flow (`triage_folder_review.py`)
+Interactive review that surfaces top isolated assets and prompts to mark their parent folder as **Ignored** (skipping junk, web cache, disc rips) or **Scheduled** (tagging for library ingestion). Dynamically re-evaluates and bubbles up the next unreviewed folder after each decision!
+
 ```bash
 # Preview standard intake triage without moving files (dry run)
 python3 scripts/triage_media_intake.py --dry-run
@@ -90,6 +93,10 @@ python3 scripts/report_triage_deduplication.py --session 41
 # Rank non-duplicate triage assets bubbling up the most temporally isolated/unique media
 python3 scripts/report_triage_isolated_assets.py --top 30
 python3 scripts/report_triage_isolated_assets.py --min-gap-days 7
+
+# Run interactive folder review to Ignore junk or Schedule folders with dynamic re-evaluation
+python3 scripts/triage_folder_review.py
+python3 scripts/triage_folder_review.py --list
 ```
 
 ---
@@ -515,6 +522,41 @@ python3 scripts/report_triage_isolated_assets.py --category new --top 25
 
 # Export full ranking to CSV
 python3 scripts/report_triage_isolated_assets.py --csv triage_isolated_assets.csv
+```
+
+---
+
+### 🧭 Interactive Triage Folder Decision Flow (`triage_folder_review.py`)
+
+Interactive triage and decision tool that bubbles up the most temporally isolated assets, identifies their parent folders, and enables folder-level decision making with **dynamic re-evaluation**:
+
+#### 🌟 Key Capabilities
+- **Folder Impact Batching**: Displays the top bubbled-up candidate along with how many sibling assets live in that same folder (e.g. 40 assets in an old application UI folder or 981 assets in a Firefox thumbnail cache).
+- **Interactive Decision Menu**:
+  - `[I] Ignore Folder`: Flags the entire folder as **Ignored** in `media_organizer.db` (`triage_folder_decisions`). All sibling assets in that folder are immediately pruned from the review queue, and the pipeline automatically re-evaluates and bubbles up the NEXT most isolated unreviewed folder!
+  - `[S] Schedule Folder`: Flags the folder as **Scheduled** for library intake and curation.
+  - `[O] Open in Finder`: Uses macOS `open` to instantly reveal the physical folder in Finder so you can visually verify thumbnails before making a decision.
+  - `[N] Next / Skip`: Temporarily skips the folder for the current session.
+  - `[L] List Decisions`: Displays all currently ignored and scheduled folders and their affected asset counts.
+  - `[Q] Quit & Save`: Safely saves state and exits.
+- **Pattern Auto-Ignoring**: Supports `--auto-ignore-pattern "thumbnails|AppleDouble|Skype|Cache"` to automatically ignore batches of known junk folders in one step.
+- **Decision Management**: Inspect recorded folder decisions with `--list` or reset decisions with `--reset <folder_or_all>`.
+
+```bash
+# Launch interactive folder decision flow
+python3 scripts/triage_folder_review.py
+
+# Focus on 'New' candidate folders only
+python3 scripts/triage_folder_review.py --category new
+
+# View all recorded folder decisions
+python3 scripts/triage_folder_review.py --list
+
+# Auto-ignore browser caches and AppleDouble metadata folders
+python3 scripts/triage_folder_review.py --auto-ignore-pattern "thumbnails|\.AppleDouble|Cache"
+
+# Reset a folder decision if you change your mind
+python3 scripts/triage_folder_review.py --reset "Firefox"
 ```
 
 ---

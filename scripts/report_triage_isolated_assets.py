@@ -145,6 +145,7 @@ def run_temporal_isolation_analysis(
     session_filter=None,
     top_n=30,
     min_gap_days=0.0,
+    exclude_ignored=True,
     output_format="text",
     csv_path=None,
     save_db_table=None
@@ -217,6 +218,17 @@ def run_temporal_isolation_analysis(
         WHERE {where_clause}
     """, params)
     triage_rows = cur.fetchall()
+
+    # Load ignored folders if table exists
+    ignored_folders = set()
+    if exclude_ignored:
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='triage_folder_decisions'")
+        if cur.fetchone():
+            cur.execute("SELECT folder_key FROM triage_folder_decisions WHERE decision = 'ignored'")
+            ignored_folders = {r[0] for r in cur.fetchall()}
+            if ignored_folders:
+                print(f"🛡️  Excluding assets from {len(ignored_folders):,} folders marked as 'ignored'.")
+
     conn.close()
 
     print(f"📂 Analyzing {len(triage_rows):,} triage assets across 'New' and 'Review-Similar' categories...")
@@ -252,6 +264,7 @@ def run_temporal_isolation_analysis(
     # Process and populate temp table
     processed = 0
     skipped_no_date = 0
+    skipped_ignored = 0
 
     insert_batch = []
     for row in triage_rows:
@@ -275,6 +288,10 @@ def run_temporal_isolation_analysis(
             src_partial = rel_dir
         else:
             src_partial = "Triage Intake"
+
+        if exclude_ignored and src_partial in ignored_folders:
+            skipped_ignored += 1
+            continue
 
         dt = extract_creation_date(fname, p)
         if not dt:
@@ -525,6 +542,11 @@ def parse_args():
         metavar="TABLE_NAME",
         help="Persist the analyzed isolation table into SQLite database (e.g. triage_isolated_assets)"
     )
+    parser.add_argument(
+        "--include-ignored",
+        action="store_true",
+        help="Include assets from folders marked as 'ignored' in triage_folder_decisions (default: excluded)"
+    )
     return parser.parse_args()
 
 
@@ -538,6 +560,7 @@ if __name__ == "__main__":
         session_filter=args.session,
         top_n=args.top,
         min_gap_days=args.min_gap_days,
+        exclude_ignored=not args.include_ignored,
         output_format=fmt,
         csv_path=args.csv_path,
         save_db_table=args.save_db_table

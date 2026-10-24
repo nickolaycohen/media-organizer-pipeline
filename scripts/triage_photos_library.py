@@ -71,7 +71,7 @@ def resolve_library_media_root(library_path):
     return lib_abs
 
 
-def triage_photos_library(library_path, lacie_dest_root=None, dell_dest_root=None, triage_id=None, dry_run=False):
+def triage_photos_library(library_path, lacie_dest_root=None, dell_dest_root=None, triage_id=None, dry_run=False, ignore_duplicates=False):
     library_path = os.path.abspath(library_path)
     media_root = resolve_library_media_root(library_path)
     lacie_dest_root = os.path.abspath(lacie_dest_root or TRIAGE_LACIE_DESTINATION_ROOT)
@@ -85,7 +85,11 @@ def triage_photos_library(library_path, lacie_dest_root=None, dell_dest_root=Non
     duplicates_dir = os.path.join(dell_dest_root, "Duplicates", triage_id)
     review_dir = os.path.join(lacie_dest_root, "Review-Similar", triage_id)
     new_dir = os.path.join(lacie_dest_root, "New", triage_id)
-    session_dest_desc = f"DELL1TB02: Duplicates/{triage_id} | LaCie: [Review-Similar|New]/{triage_id}"
+    session_dest_desc = (
+        f"DELL1TB02: [Skipped Duplicates] | LaCie: [Review-Similar|New]/{triage_id}"
+        if ignore_duplicates
+        else f"DELL1TB02: Duplicates/{triage_id} | LaCie: [Review-Similar|New]/{triage_id}"
+    )
 
     print("=" * 80)
     print(f"🛡️  APPLE PHOTOS LIBRARY INTAKE TRIAGE [Session ID: {triage_id}]")
@@ -93,7 +97,10 @@ def triage_photos_library(library_path, lacie_dest_root=None, dell_dest_root=Non
     print(f"Source Library:         {library_path}")
     print(f"Resolved Media Root:    {media_root}")
     print(f"Destination Hierarchy:  {session_dest_desc}")
-    print(f"Mode:                   100% READ-ONLY FULL REPLICA (Source package completely untouched)")
+    mode_desc = "100% READ-ONLY NOVEL REPLICA (Duplicates Ignored/Skipped)" if ignore_duplicates else "100% READ-ONLY FULL REPLICA (Source package completely untouched)"
+    print(f"Mode:                   {mode_desc}")
+    if ignore_duplicates:
+        print(f"Duplicates Policy:      ⚡ IGNORE DUPLICATES (No duplicate files will be copied to DELL1TB02)")
     if dry_run:
         print(f"Operation:              🔎 DRY RUN SIMULATION (No files will be copied, DB unchanged)")
     print("-" * 80)
@@ -101,11 +108,14 @@ def triage_photos_library(library_path, lacie_dest_root=None, dell_dest_root=Non
     logger.info(f"🚀 Starting Photos Library Triage [Triage ID: {triage_id}]")
     logger.info(f"   - Library Package:         {library_path}")
     logger.info(f"   - Media Root:              {media_root}")
-    logger.info(f"   - Duplicates Destination:  {duplicates_dir} (DELL1TB02)")
+    if ignore_duplicates:
+        logger.info(f"   - Duplicates Destination:  SKIPPED (--ignore-duplicates active)")
+    else:
+        logger.info(f"   - Duplicates Destination:  {duplicates_dir} (DELL1TB02)")
     logger.info(f"   - Review & New (LaCie):    {lacie_dest_root}/[Review-Similar|New]/{triage_id}")
 
-    # Check DELL1TB02 availability
-    if not dry_run and not os.path.exists("/Volumes/DELL1TB02"):
+    # Check DELL1TB02 availability only if duplicates replication is active
+    if not dry_run and not ignore_duplicates and not os.path.exists("/Volumes/DELL1TB02"):
         logger.error("❌ DELL1TB02 drive is not mounted at /Volumes/DELL1TB02! Please connect DELL1TB02.")
         raise FileNotFoundError("DELL1TB02 volume not mounted: /Volumes/DELL1TB02")
 
@@ -374,10 +384,16 @@ def triage_photos_library(library_path, lacie_dest_root=None, dell_dest_root=Non
         if dry_run:
             print(f"🔍 [DRY RUN] Triage ID: {triage_id}")
             print(f"   Destination Hierarchy:")
-            print(f"   - DELL1TB02: {dell_dest_root}/Duplicates/{triage_id}/")
+            if ignore_duplicates:
+                print(f"   - DELL1TB02: [SKIPPED via --ignore-duplicates]")
+            else:
+                print(f"   - DELL1TB02: {dell_dest_root}/Duplicates/{triage_id}/")
             print(f"   - LaCie:     {lacie_dest_root}/[Review-Similar|New]/{triage_id}/")
             print(f"   Would replicate (copy):")
-            print(f"   - {len(duplicates_list):,} duplicates to DELL1TB02: '{duplicates_dir}/'")
+            if ignore_duplicates:
+                print(f"   - Duplicates: SKIPPED ({len(duplicates_list):,} duplicate assets will NOT be copied)")
+            else:
+                print(f"   - {len(duplicates_list):,} duplicates to DELL1TB02: '{duplicates_dir}/'")
             print(f"   - {len(review_list):,} review items to LaCie: '{review_dir}/'")
             print(f"   - {len(new_list):,} clean new assets to LaCie: '{new_dir}/'")
             print(f"\n   Source Protection: Source package {library_path} remains 100% UNTOUCHED.")
@@ -385,9 +401,13 @@ def triage_photos_library(library_path, lacie_dest_root=None, dell_dest_root=Non
             return
 
         # Step 6: Perform non-destructive replication (safe_copy)
-        total_to_move = len(duplicates_list) + len(review_list) + len(new_list)
-        logger.info(f"🚚 Replicating {total_to_move:,} triaged files from library to destination folders...")
-        print(f"🚚 Replicating (Copying) {total_to_move:,} files into destination folders...")
+        total_to_move = (0 if ignore_duplicates else len(duplicates_list)) + len(review_list) + len(new_list)
+        if ignore_duplicates:
+            logger.info(f"🚚 Replicating {total_to_move:,} novel/review files from library (skipping {len(duplicates_list):,} duplicates)...")
+            print(f"🚚 Replicating {total_to_move:,} files into destination folders (skipping {len(duplicates_list):,} duplicates)...")
+        else:
+            logger.info(f"🚚 Replicating {total_to_move:,} triaged files from library to destination folders...")
+            print(f"🚚 Replicating (Copying) {total_to_move:,} files into destination folders...")
         replicated_duplicates = 0
         replicated_review = 0
         replicated_new = 0
@@ -405,15 +425,16 @@ def triage_photos_library(library_path, lacie_dest_root=None, dell_dest_root=Non
             if moved_total == 1 or moved_total % max(1, total_to_move // 10) == 0 or moved_total == total_to_move:
                 logger.info(f"🚚 Replication Progress: {moved_total:,}/{total_to_move:,} ({pct:.0f}%)")
 
-        for src_full, rel_p, fname, sz, reason, sub_t, vmeta in duplicates_list:
-            dest_full = os.path.join(duplicates_dir, rel_p)
-            try:
-                safe_copy(src_full, dest_full)
-                replicated_duplicates += 1
-            except Exception as e:
-                logger.error(f"❌ Failed to copy duplicate {src_full} -> {dest_full}: {e}")
-            moved_total += 1
-            report_copy_progress()
+        if not ignore_duplicates:
+            for src_full, rel_p, fname, sz, reason, sub_t, vmeta in duplicates_list:
+                dest_full = os.path.join(duplicates_dir, rel_p)
+                try:
+                    safe_copy(src_full, dest_full)
+                    replicated_duplicates += 1
+                except Exception as e:
+                    logger.error(f"❌ Failed to copy duplicate {src_full} -> {dest_full}: {e}")
+                moved_total += 1
+                report_copy_progress()
 
         for src_full, rel_p, fname, sz, reason, sub_t, vmeta in review_list:
             if sub_t == "upgrade_candidate":
@@ -442,10 +463,14 @@ def triage_photos_library(library_path, lacie_dest_root=None, dell_dest_root=Non
             sys.stdout.write("\r" + " " * 80 + "\r")
             sys.stdout.flush()
 
-        logger.info(f"✅ Replicated {replicated_duplicates:,} duplicates to DELL1TB02: {duplicates_dir}")
+        if ignore_duplicates:
+            logger.info(f"⏭️  Skipped replicating {len(duplicates_list):,} duplicates (--ignore-duplicates active)")
+            print(f"⏭️  Skipped replicating {len(duplicates_list):,} duplicates (--ignore-duplicates active)")
+        else:
+            logger.info(f"✅ Replicated {replicated_duplicates:,} duplicates to DELL1TB02: {duplicates_dir}")
+            print(f"✅ Replicated {replicated_duplicates:,} duplicates to DELL1TB02: {duplicates_dir}")
         logger.info(f"✅ Replicated {replicated_review:,} review assets to LaCie: {review_dir}")
         logger.info(f"✅ Replicated {replicated_new:,} new assets to LaCie: {new_dir}")
-        print(f"✅ Replicated {replicated_duplicates:,} duplicates to DELL1TB02: {duplicates_dir}")
         print(f"✅ Replicated {replicated_review:,} review assets to LaCie: {review_dir}")
         print(f"✅ Replicated {replicated_new:,} new assets to LaCie: {new_dir}")
 
@@ -481,7 +506,7 @@ def triage_photos_library(library_path, lacie_dest_root=None, dell_dest_root=Non
                     WHERE id = ?
                 """, (
                     len(candidate_files),
-                    replicated_duplicates, total_dup_bytes,
+                    len(duplicates_list), total_dup_bytes,
                     compressed_dup_count, compressed_dup_bytes,
                     replicated_review, total_review_bytes,
                     upgrade_count, upgrade_bytes,
@@ -494,7 +519,7 @@ def triage_photos_library(library_path, lacie_dest_root=None, dell_dest_root=Non
 
                 asset_rows = []
                 for src_full, rel_p, fname, sz, reason, sub_t, vmeta in duplicates_list:
-                    dest_p = os.path.join(duplicates_dir, rel_p)
+                    dest_p = "SKIPPED_DUPLICATE" if ignore_duplicates else os.path.join(duplicates_dir, rel_p)
                     vmeta = vmeta or {}
                     asset_rows.append((
                         db_session_pk, triage_id, rel_p, fname, sz, "duplicate", sub_t, reason, dest_p,
@@ -539,7 +564,10 @@ def triage_photos_library(library_path, lacie_dest_root=None, dell_dest_root=Non
 
         print(f"✅ Triage Complete! [Triage ID: {triage_id}]")
         print(f"   Destination Hierarchy: {session_dest_desc}")
-        print(f"   - {replicated_duplicates:,} duplicates replicated to DELL1TB02: '{duplicates_dir}/'")
+        if ignore_duplicates:
+            print(f"   - {len(duplicates_list):,} duplicates skipped/not copied (--ignore-duplicates)")
+        else:
+            print(f"   - {replicated_duplicates:,} duplicates replicated to DELL1TB02: '{duplicates_dir}/'")
         print(f"   - {replicated_review:,} review assets replicated to LaCie: '{review_dir}/'")
         print(f"   - {replicated_new:,} clean new assets replicated to LaCie: '{new_dir}/'")
 
@@ -552,12 +580,15 @@ def triage_photos_library(library_path, lacie_dest_root=None, dell_dest_root=Non
         print(f"📝 Full audit log: {LOG_PATH}")
 
         print("\n" + "=" * 80)
-        print("🛡️  PHOTOS MEDIA LIBRARY PROCESSED (READ-ONLY FULL REPLICA MODE)")
+        print("🛡️  PHOTOS MEDIA LIBRARY PROCESSED (READ-ONLY MODE)")
         print("-" * 80)
         print(f"The following Apple Photos Library package was processed as a read-only source:")
         print(f"   📦 {library_path}")
-        print("\nAll assets were evaluated and replicated:")
-        print(f"   • {replicated_duplicates:,} duplicates copied to DELL1TB02: '{duplicates_dir}/'")
+        print("\nAll assets were evaluated and processed:")
+        if ignore_duplicates:
+            print(f"   • {len(duplicates_list):,} duplicates identified & skipped (not copied to DELL1TB02)")
+        else:
+            print(f"   • {replicated_duplicates:,} duplicates copied to DELL1TB02: '{duplicates_dir}/'")
         print(f"   • {replicated_review:,} review assets copied to LaCie: '{review_dir}/'")
         print(f"   • {replicated_new:,} clean new assets copied to LaCie: '{new_dir}/'")
         print("\nSource Library Protection:")
@@ -616,6 +647,8 @@ def parse_args():
                         help=f"DELL1TB02 base destination directory for Duplicates (default: {TRIAGE_DELL_DESTINATION_ROOT})")
     parser.add_argument("--triage-id", default=None,
                         help="Custom triage session ID (default: auto-increment integer ID from database)")
+    parser.add_argument("--ignore-duplicates", action="store_true",
+                        help="Skip copying duplicate files to DELL1TB02 (only replicate Review-Similar and New assets to LaCie). Duplicates are still evaluated and logged in DB.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Simulate the triage process without copying any files or modifying DB.")
     return parser.parse_args()
@@ -628,5 +661,6 @@ if __name__ == "__main__":
         lacie_dest_root=args.lacie_dest_dir,
         dell_dest_root=args.dell_dest_dir,
         triage_id=args.triage_id,
-        dry_run=args.dry_run
+        dry_run=args.dry_run,
+        ignore_duplicates=args.ignore_duplicates
     )

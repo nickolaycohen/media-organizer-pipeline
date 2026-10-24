@@ -46,7 +46,7 @@ A dedicated standalone intake and deduplication utility specifically designed fo
 - **100% Read-Only Full Replica Mode**: The source library bundle is strictly read-only (zero moves, zero deletions, zero modifications).
 - **Targeted Traversal**: Automatically navigates internal `originals/` or `Masters/` while skipping internal thumbnail caches (`resources/`), face crops, and internal SQLite databases (`private/`, `database/`, `scopes/`).
 - **Resilient Matching**: Normalizes Apple Photos UUID companion video stems (`<UUID>_3.mov` ➔ `<UUID>`) and indexes exact byte sizes (`aaa.ZORIGINALFILESIZE`) across `All-Media.photoslibrary` to recognize standalone UUID assets.
-- **Safe Replication**: Copies confirmed duplicates to DELL1TB02 (`Duplicates/<triage_id>`) and novel assets to LaCie (`New/<triage_id>`).
+- **Safe Replication & Ignore Duplicates**: Copies confirmed duplicates to DELL1TB02 (`Duplicates/<triage_id>`) and novel assets to LaCie (`New/<triage_id>`). Use `--ignore-duplicates` to skip copying duplicate files entirely, replicating only `Review-Similar` and `New` assets to LaCie.
 - **Action Alert**: Prompts user upon completion that the source library package remains untouched and can be manually reviewed or deleted.
 
 ### 🔧 UUID Session Reconciler (`reconcile_triage_session_movs.py`)
@@ -62,6 +62,9 @@ python3 scripts/triage_media_intake.py
 # Triage an Apple Photos Library as an explicit read-only source (Full Replica mode)
 python3 scripts/triage_photos_library.py "/Volumes/Extreme Pro/tmp/iPhone13ProMax Library.photoslibrary" --dry-run
 python3 scripts/triage_photos_library.py "/Volumes/Extreme Pro/tmp/iPhone13ProMax Library.photoslibrary"
+
+# Triage a Photos Library skipping duplicate copies (only replicate Review-Similar and New to LaCie)
+python3 scripts/triage_photos_library.py "/path/to/Library.photoslibrary" --ignore-duplicates
 
 # Reconcile UUID assets from a previous triage session (e.g. session 37)
 python3 scripts/reconcile_triage_session_movs.py --triage-id 37
@@ -359,6 +362,7 @@ A specialized, standalone intake and deduplication engine dedicated to processin
 | `--dell-dest-dir` | Option | `/Volumes/DELL1TB02/Storage/Priority 4/Media Preprocessing/TriageMediaIntake` | Destination root on DELL1TB02 for `Duplicates` |
 | `--lacie-dest-dir`, `--dest-dir` | Option | `/Volumes/LaCie/Storage/Priority 4/Media Preprocessing/TriageMediaIntake` | Destination root on LaCie for `Review-Similar` and `New` |
 | `--triage-id` | Option | Auto-increment integer | Custom session ID for session subdirectories (recorded in `triage_sessions` DB table) |
+| `--ignore-duplicates` | Flag | `False` | Skips copying duplicate files to DELL1TB02; only replicates `Review-Similar` and `New` assets to LaCie |
 | `--dry-run` | Flag | `False` | Simulates file classification, destination paths, and space calculations without copying files or modifying DB |
 
 #### 📋 Examples
@@ -366,10 +370,13 @@ A specialized, standalone intake and deduplication engine dedicated to processin
 # 1. Preview triage run on a Photos Library bundle (safe simulation)
 python3 scripts/triage_photos_library.py "/Volumes/Extreme Pro/tmp/iPhone13ProMax Library.photoslibrary" --dry-run
 
-# 2. Triage Photos Library in 100% Read-Only Full Replica mode
+# 2. Triage Photos Library in 100% Read-Only Full Replica mode (copies duplicates to DELL, new/review to LaCie)
 python3 scripts/triage_photos_library.py "/Volumes/Extreme Pro/tmp/iPhone13ProMax Library.photoslibrary"
 
-# 3. Use custom session ID and verify destination paths
+# 3. Triage Photos Library skipping duplicate copies (only replicates novel/review media to LaCie)
+python3 scripts/triage_photos_library.py "/Volumes/Extreme Pro/tmp/iPhone13ProMax Library.photoslibrary" --ignore-duplicates
+
+# 4. Use custom session ID and verify destination paths
 python3 scripts/triage_photos_library.py "/Volumes/Backup/OldPhotos.photoslibrary" --triage-id "2026-iPhone-Intake"
 ```
 

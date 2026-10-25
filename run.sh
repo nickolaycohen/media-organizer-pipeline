@@ -64,7 +64,8 @@ print_help() {
     echo -e "  ${GREEN}refresh | bg${RESET}       Run the background database refresh service and metadata sync"
     echo -e "  ${GREEN}executor${RESET}           Execute planned batch operations (move, copy, organize)"
     echo ""
-    echo -e "  ${CYAN}triage${RESET} [dir] [flags]  Run Intake Triage Gateway (default or custom intake directory)"
+    echo -e "  ${CYAN}triage${RESET} [dir] [flags]  Run Intake Triage Gateway (--ignore-duplicates, --dry-run)"
+    echo -e "  ${CYAN}triage-skip-dup${RESET} [dir] Triage intake skipping duplicate copies (only route Review & New)"
     echo -e "  ${CYAN}photos${RESET} [lib] [flags]  Triage Apple Photos Library (--ignore-duplicates, original filenames)"
     echo -e "  ${CYAN}reconcile${RESET} [--triage-id N] Audit/reconcile Live Photo companion MOV videos for a session"
     echo ""
@@ -99,26 +100,27 @@ interactive_menu() {
         echo -e "  ${BOLD}${CYAN}── 🛡️ Intake & Triage Gateway ──${RESET}"
         echo -e "  ${BOLD} 4)${RESET} ${CYAN}Triage Intake (Default Folder)${RESET}      ${DIM}(/Volumes/LaCie/Storage/Priority 4/Media Preprocessing)${RESET}"
         echo -e "  ${BOLD} 5)${RESET} ${CYAN}Triage Intake (Dry-Run Simulation)${RESET}  ${DIM}(Previews classification without moving files)${RESET}"
-        echo -e "  ${BOLD} 6)${RESET} ${CYAN}Triage Custom Directory / Volume${RESET}    ${DIM}(Specify any directory path to triage)${RESET}"
-        echo -e "  ${BOLD} 7)${RESET} ${CYAN}Triage Apple Photos Library${RESET}         ${DIM}(Extract original filenames, skip duplicate copies)${RESET}"
-        echo -e "  ${BOLD} 8)${RESET} ${CYAN}Reconcile Live Photo MOVs${RESET}           ${DIM}(Audit companion video UUIDs against master library)${RESET}"
+        echo -e "  ${BOLD} 6)${RESET} ${CYAN}Triage Intake (Skip Duplicates)${RESET}     ${DIM}(Only route Review-Similar & New to LaCie)${RESET}"
+        echo -e "  ${BOLD} 7)${RESET} ${CYAN}Triage Custom Directory / Volume${RESET}    ${DIM}(Specify any directory path to triage)${RESET}"
+        echo -e "  ${BOLD} 8)${RESET} ${CYAN}Triage Apple Photos Library${RESET}         ${DIM}(Extract original filenames, skip duplicate copies)${RESET}"
+        echo -e "  ${BOLD} 9)${RESET} ${CYAN}Reconcile Live Photo MOVs${RESET}           ${DIM}(Audit companion video UUIDs against master library)${RESET}"
         echo ""
         echo -e "  ${BOLD}${MAGENTA}── 🧭 Folder Decision Flow & Curation ──${RESET}"
-        echo -e "  ${BOLD} 9)${RESET} ${MAGENTA}Interactive Folder Review${RESET}           ${DIM}(Mark folders as Ignored or Scheduled with re-eval)${RESET}"
-        echo -e "  ${BOLD}10)${RESET} ${MAGENTA}List Recorded Folder Decisions${RESET}     ${DIM}(View all currently Ignored & Scheduled folders)${RESET}"
+        echo -e "  ${BOLD}10)${RESET} ${MAGENTA}Interactive Folder Review${RESET}           ${DIM}(Mark folders as Ignored or Scheduled with re-eval)${RESET}"
+        echo -e "  ${BOLD}11)${RESET} ${MAGENTA}List Recorded Folder Decisions${RESET}     ${DIM}(View all currently Ignored & Scheduled folders)${RESET}"
         echo ""
         echo -e "  ${BOLD}${YELLOW}── 📊 Reports & Analytics ──${RESET}"
-        echo -e "  ${BOLD}11)${RESET} ${YELLOW}Temporal Isolation Report${RESET}          ${DIM}(Bubble up unique assets furthest from master library)${RESET}"
-        echo -e "  ${BOLD}12)${RESET} ${YELLOW}Intake Deduplication Summary${RESET}       ${DIM}(View stats across all 41+ triage intake sessions)${RESET}"
-        echo -e "  ${BOLD}13)${RESET} ${YELLOW}Master Library Duplicate Report${RESET}    ${DIM}(Yearly distribution and duplicate clusters)${RESET}"
-        echo -e "  ${BOLD}14)${RESET} ${YELLOW}Verify Duplicates vs Master DB${RESET}     ${DIM}(Confirm DELL1TB02 Duplicates against Photos DB)${RESET}"
+        echo -e "  ${BOLD}12)${RESET} ${YELLOW}Temporal Isolation Report${RESET}          ${DIM}(Bubble up unique assets furthest from master library)${RESET}"
+        echo -e "  ${BOLD}13)${RESET} ${YELLOW}Intake Deduplication Summary${RESET}       ${DIM}(View stats across all 41+ triage intake sessions)${RESET}"
+        echo -e "  ${BOLD}14)${RESET} ${YELLOW}Master Library Duplicate Report${RESET}    ${DIM}(Yearly distribution and duplicate clusters)${RESET}"
+        echo -e "  ${BOLD}15)${RESET} ${YELLOW}Verify Duplicates vs Master DB${RESET}     ${DIM}(Confirm DELL1TB02 Duplicates against Photos DB)${RESET}"
         echo ""
         echo -e "  ${BOLD}${BLUE}── 📁 File Consolidation ──${RESET}"
-        echo -e "  ${BOLD}15)${RESET} ${BLUE}Merge Directories Utility${RESET}          ${DIM}(scripts/merge_directories.py)${RESET}"
+        echo -e "  ${BOLD}16)${RESET} ${BLUE}Merge Directories Utility${RESET}          ${DIM}(scripts/merge_directories.py)${RESET}"
         echo ""
         echo -e "  ${BOLD} q)${RESET} ${RED}Quit${RESET}"
         echo ""
-        echo -n -e "${BOLD}👉 Enter choice [1-15, q]: ${RESET}"
+        echo -n -e "${BOLD}👉 Enter choice [1-16, q]: ${RESET}"
         read -r choice
 
         case "$choice" in
@@ -153,6 +155,12 @@ interactive_menu() {
                 read -r
                 ;;
             6)
+                echo -e "\n${CYAN}🛡️ Running Intake Triage on Default Folder (Skip Duplicates Mode)...${RESET}\n"
+                $PYTHON scripts/triage_media_intake.py --ignore-duplicates
+                echo -e "\n${DIM}Press Enter to return to menu...${RESET}"
+                read -r
+                ;;
+            7)
                 echo -e "\n${CYAN}📁 Triage Custom Directory${RESET}"
                 echo -n "Enter directory path: "
                 read -r target_p
@@ -165,15 +173,20 @@ interactive_menu() {
                 fi
                 echo -n "Run in Dry-Run mode? [y/N]: "
                 read -r dry_ans
+                echo -n "Skip copying duplicates (--ignore-duplicates)? [y/N]: "
+                read -r dup_ans
+                cmd_args=("$target_p")
                 if [[ "$dry_ans" =~ ^[Yy]$ ]]; then
-                    $PYTHON scripts/triage_media_intake.py "$target_p" --dry-run
-                else
-                    $PYTHON scripts/triage_media_intake.py "$target_p"
+                    cmd_args+=(--dry-run)
                 fi
+                if [[ "$dup_ans" =~ ^[Yy]$ ]]; then
+                    cmd_args+=(--ignore-duplicates)
+                fi
+                $PYTHON scripts/triage_media_intake.py "${cmd_args[@]}"
                 echo -e "\n${DIM}Press Enter to return to menu...${RESET}"
                 read -r
                 ;;
-            7)
+            8)
                 echo -e "\n${CYAN}🍏 Triage Apple Photos Library Package${RESET}"
                 echo -n "Enter .photoslibrary path: "
                 read -r lib_p
@@ -194,7 +207,7 @@ interactive_menu() {
                 echo -e "\n${DIM}Press Enter to return to menu...${RESET}"
                 read -r
                 ;;
-            8)
+            9)
                 echo -e "\n${CYAN}🎬 Reconcile Triage Live Photo MOVs${RESET}"
                 echo -n "Enter Triage Session ID (e.g. 37 or 41, or leave empty for all): "
                 read -r rec_id
@@ -206,19 +219,19 @@ interactive_menu() {
                 echo -e "\n${DIM}Press Enter to return to menu...${RESET}"
                 read -r
                 ;;
-            9)
+            10)
                 echo -e "\n${MAGENTA}🧭 Launching Interactive Folder Review & Decision Flow...${RESET}\n"
                 $PYTHON scripts/triage_folder_review.py
                 echo -e "\n${DIM}Press Enter to return to menu...${RESET}"
                 read -r
                 ;;
-            10)
+            11)
                 echo -e "\n${MAGENTA}📋 Listing Recorded Folder Decisions...${RESET}\n"
                 $PYTHON scripts/triage_folder_review.py --list
                 echo -e "\n${DIM}Press Enter to return to menu...${RESET}"
                 read -r
                 ;;
-            11)
+            12)
                 echo -e "\n${YELLOW}⏳ Running Temporal Isolation Report...${RESET}\n"
                 echo -n "Enter number of top assets to bubble up [default: 30]: "
                 read -r top_count
@@ -227,7 +240,7 @@ interactive_menu() {
                 echo -e "\n${DIM}Press Enter to return to menu...${RESET}"
                 read -r
                 ;;
-            12)
+            13)
                 echo -e "\n${YELLOW}📊 Running Intake Deduplication Summary Report...${RESET}\n"
                 echo -n "Inspect specific session ID (or leave blank for all): "
                 read -r sess_id
@@ -239,13 +252,13 @@ interactive_menu() {
                 echo -e "\n${DIM}Press Enter to return to menu...${RESET}"
                 read -r
                 ;;
-            13)
+            14)
                 echo -e "\n${YELLOW}📈 Running Master Library Duplicate Report...${RESET}\n"
                 $PYTHON scripts/report_library_duplicates.py
                 echo -e "\n${DIM}Press Enter to return to menu...${RESET}"
                 read -r
                 ;;
-            14)
+            15)
                 echo -e "\n${YELLOW}🛡️ Verify Duplicates Against Apple Photos Master DB${RESET}\n"
                 echo -n "Enter specific Triage Session ID (or leave blank to verify ALL sessions): "
                 read -r sess_id
@@ -262,7 +275,7 @@ interactive_menu() {
                 echo -e "\n${DIM}Press Enter to return to menu...${RESET}"
                 read -r
                 ;;
-            15)
+            16)
                 echo -e "\n${BLUE}📁 Merge Directories Utility${RESET}"
                 echo -n "Enter Source directory: "
                 read -r src_dir
@@ -292,7 +305,7 @@ interactive_menu() {
                 exit 0
                 ;;
             *)
-                echo -e "${RED}⚠️  Invalid selection. Please enter a number between 1 and 15, or 'q'.${RESET}"
+                echo -e "${RED}⚠️  Invalid selection. Please enter a number between 1 and 16, or 'q'.${RESET}"
                 sleep 1.5
                 ;;
         esac
@@ -316,6 +329,10 @@ case "$1" in
     triage)
         shift
         exec $PYTHON scripts/triage_media_intake.py "$@"
+        ;;
+    triage-skip-dup|triage-ignore-dup)
+        shift
+        exec $PYTHON scripts/triage_media_intake.py --ignore-duplicates "$@"
         ;;
     photos|triage-photos)
         shift

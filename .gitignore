@@ -22,3 +22,4 @@ db/media_organizer.db-wal
 backups
 *.lock
 db/*.lock
+reports/*.csv

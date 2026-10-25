@@ -74,6 +74,7 @@ print_help() {
     echo -e "  ${YELLOW}isolated${RESET} [--top N]   Report non-duplicate intake assets ranked by temporal uniqueness"
     echo -e "  ${YELLOW}triage-report${RESET} [id]   Intake deduplication summary report across all triage sessions"
     echo -e "  ${YELLOW}duplicates${RESET}         Master library annual asset distribution & duplicate cluster report"
+    echo -e "  ${YELLOW}verify-duplicates${RESET}  Independent safety audit of Triage Duplicates against Master DB"
     echo ""
     echo -e "  ${BLUE}merge${RESET} [src] [dst]    Run the recursive Directory Merger and deduplication utility"
     echo -e "  ${BLUE}help${RESET}               Show this help message"
@@ -110,13 +111,14 @@ interactive_menu() {
         echo -e "  ${BOLD}11)${RESET} ${YELLOW}Temporal Isolation Report${RESET}          ${DIM}(Bubble up unique assets furthest from master library)${RESET}"
         echo -e "  ${BOLD}12)${RESET} ${YELLOW}Intake Deduplication Summary${RESET}       ${DIM}(View stats across all 41+ triage intake sessions)${RESET}"
         echo -e "  ${BOLD}13)${RESET} ${YELLOW}Master Library Duplicate Report${RESET}    ${DIM}(Yearly distribution and duplicate clusters)${RESET}"
+        echo -e "  ${BOLD}14)${RESET} ${YELLOW}Verify Duplicates vs Master DB${RESET}     ${DIM}(Confirm DELL1TB02 Duplicates against Photos DB)${RESET}"
         echo ""
         echo -e "  ${BOLD}${BLUE}── 📁 File Consolidation ──${RESET}"
-        echo -e "  ${BOLD}14)${RESET} ${BLUE}Merge Directories Utility${RESET}          ${DIM}(scripts/merge_directories.py)${RESET}"
+        echo -e "  ${BOLD}15)${RESET} ${BLUE}Merge Directories Utility${RESET}          ${DIM}(scripts/merge_directories.py)${RESET}"
         echo ""
         echo -e "  ${BOLD} q)${RESET} ${RED}Quit${RESET}"
         echo ""
-        echo -n -e "${BOLD}👉 Enter choice [1-14, q]: ${RESET}"
+        echo -n -e "${BOLD}👉 Enter choice [1-15, q]: ${RESET}"
         read -r choice
 
         case "$choice" in
@@ -244,6 +246,23 @@ interactive_menu() {
                 read -r
                 ;;
             14)
+                echo -e "\n${YELLOW}🛡️ Verify Duplicates Against Apple Photos Master DB${RESET}\n"
+                echo -n "Enter specific Triage Session ID (or leave blank to verify ALL sessions): "
+                read -r sess_id
+                echo -n "Perform bit-for-bit disk comparisons against originals on disk? [y/N]: "
+                read -r disk_ans
+                extra_args=()
+                if [ -n "$sess_id" ]; then
+                    extra_args+=(--session "$sess_id")
+                fi
+                if [[ "$disk_ans" =~ ^[Yy]$ ]]; then
+                    extra_args+=(--verify-disk)
+                fi
+                $PYTHON scripts/verify_triage_duplicates.py "${extra_args[@]}"
+                echo -e "\n${DIM}Press Enter to return to menu...${RESET}"
+                read -r
+                ;;
+            15)
                 echo -e "\n${BLUE}📁 Merge Directories Utility${RESET}"
                 echo -n "Enter Source directory: "
                 read -r src_dir
@@ -273,7 +292,7 @@ interactive_menu() {
                 exit 0
                 ;;
             *)
-                echo -e "${RED}⚠️  Invalid selection. Please enter a number between 1 and 14, or 'q'.${RESET}"
+                echo -e "${RED}⚠️  Invalid selection. Please enter a number between 1 and 15, or 'q'.${RESET}"
                 sleep 1.5
                 ;;
         esac
@@ -325,6 +344,10 @@ case "$1" in
     duplicates|library-report)
         shift
         exec $PYTHON scripts/report_library_duplicates.py "$@"
+        ;;
+    verify-duplicates|verify|confirm-duplicates)
+        shift
+        exec $PYTHON scripts/verify_triage_duplicates.py "$@"
         ;;
     merge)
         shift

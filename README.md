@@ -65,6 +65,9 @@ Analyzes non-duplicate assets in `New` and `Review-Similar`, computing the close
 ### 🧭 Interactive Folder Decision Flow (`triage_folder_review.py`)
 Interactive review that surfaces top isolated assets and prompts to mark their parent folder as **Ignored** (skipping junk, web cache, disc rips) or **Scheduled** (tagging for library ingestion). Dynamically re-evaluates and bubbles up the next unreviewed folder after each decision!
 
+### 🛡️ Master Library Duplicates Audit & Verifier (`verify_triage_duplicates.py`)
+Independent multi-tier safety audit that re-verifies every single file in `/Volumes/DELL1TB02/Storage/Priority 4/Media Preprocessing/TriageMediaIntake/Duplicates` against the active Apple Photos database (`db/media_organizer.db`) and originals on disk. Ensures 100% mathematical certainty that an asset exists in `All-Media.photoslibrary` before any purge is considered.
+
 ### 🚀 Unified Runner & CLI Gateway (`run.sh`)
 Launch the interactive terminal selector or execute any pipeline tool via fast subcommands:
 
@@ -88,6 +91,7 @@ Launch the interactive terminal selector or execute any pipeline tool via fast s
 ./run.sh isolated --top 30    # Bubble up most temporally isolated intake media
 ./run.sh triage-report        # Audit deduplication volume across all triage intake sessions
 ./run.sh duplicates           # Master library yearly asset distribution & duplicate clusters
+./run.sh verify-duplicates    # Independent safety audit of Duplicates vs Master DB
 
 ./run.sh merge /src /dst      # Production recursive directory merger and deduplicator
 ```
@@ -130,6 +134,10 @@ python3 scripts/report_triage_isolated_assets.py --min-gap-days 7
 # Run interactive folder review to Ignore junk or Schedule folders with dynamic re-evaluation
 python3 scripts/triage_folder_review.py
 python3 scripts/triage_folder_review.py --list
+
+# Re-verify all duplicate files across all triage sessions against Apple Photos DB
+python3 scripts/verify_triage_duplicates.py
+python3 scripts/verify_triage_duplicates.py --session 47 --verify-disk
 ```
 
 ---

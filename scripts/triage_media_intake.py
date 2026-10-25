@@ -904,13 +904,17 @@ def find_photos_library_parent(path):
         cur = os.path.dirname(cur)
     return None
 
-def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, triage_id=None, dry_run=False, clean_empty=True, photos_library=None, ignore_duplicates=False):
+def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, triage_id=None, dry_run=False, clean_empty=True, photos_library=None, ignore_duplicates=False, delete_duplicates=False):
     target_dir = os.path.abspath(target_dir)
     lacie_dest_root = os.path.abspath(lacie_dest_root or TRIAGE_LACIE_DESTINATION_ROOT)
     dell_dest_root = os.path.abspath(dell_dest_root or TRIAGE_DELL_DESTINATION_ROOT)
     is_photos_library = bool(photos_library)
     if is_photos_library:
         clean_empty = False
+        delete_duplicates = False  # NEVER delete from a .photoslibrary package
+
+    if delete_duplicates:
+        ignore_duplicates = True
 
     triage_id = determine_triage_id(MEDIA_ORGANIZER_DB_PATH, lacie_dest_root, dell_dest_root, requested_id=triage_id)
 
@@ -918,16 +922,17 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
     setup_logger(TRIAGE_LOG_PATH, MODULE_TAG, extra_fields={"triage_id": triage_id})
 
     # Multi-Drive Destination Hierarchy:
-    # DELL1TB02: Duplicates/<triage_id> (or skipped if ignore_duplicates)
+    # DELL1TB02: Duplicates/<triage_id> (or skipped/deleted if ignore_duplicates)
     # LaCie:     Review-Similar/<triage_id>, New/<triage_id>
     duplicates_dir = os.path.join(dell_dest_root, "Duplicates", triage_id) if not ignore_duplicates else None
     review_dir = os.path.join(lacie_dest_root, "Review-Similar", triage_id)
     new_dir = os.path.join(lacie_dest_root, "New", triage_id)
-    session_dest_desc = (
-        f"DELL1TB02: [Skipped Duplicates] | LaCie: [Review-Similar|New]/{triage_id}"
-        if ignore_duplicates
-        else f"DELL1TB02: Duplicates/{triage_id} | LaCie: [Review-Similar|New]/{triage_id}"
-    )
+    if delete_duplicates:
+        session_dest_desc = f"DELL1TB02: [Deleted from Intake] | LaCie: [Review-Similar|New]/{triage_id}"
+    elif ignore_duplicates:
+        session_dest_desc = f"DELL1TB02: [Skipped Duplicates] | LaCie: [Review-Similar|New]/{triage_id}"
+    else:
+        session_dest_desc = f"DELL1TB02: Duplicates/{triage_id} | LaCie: [Review-Similar|New]/{triage_id}"
 
     logger.info(f"🚀 Starting Media Intake Triage [Triage ID: {triage_id}]")
     if is_photos_library:
@@ -936,7 +941,10 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
         print(f"🛡️  Apple Photos Library Read-Only Mode Active: {photos_library}")
         print(f"   Mode: Full Replica (Copy Net-New to LaCie & Duplicates to DELL1TB02; source 100% untouched)")
     logger.info(f"   - Source Directory:        {target_dir}")
-    if ignore_duplicates:
+    if delete_duplicates:
+        logger.info("   - Duplicates Destination:  🗑️  DELETE (Confirmed duplicates will be deleted from intake source folder)")
+        print("🗑️  Delete Duplicates mode active: confirmed duplicates will be deleted from the intake folder.")
+    elif ignore_duplicates:
         logger.info("   - Duplicates Destination:  ⚡ SKIPPED (Ignore Duplicates Mode - Duplicates will NOT be moved/copied)")
         print("⚡ Ignore Duplicates mode active: duplicates will be identified but NOT moved/copied to DELL1TB02.")
     else:
@@ -1278,14 +1286,18 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
         if dry_run:
             print(f"🔍 [DRY RUN] Triage ID: {triage_id}")
             print(f"   Destination Hierarchy:")
-            if ignore_duplicates:
+            if delete_duplicates:
+                print(f"   - DELL1TB02: [Bypassed - would delete {len(duplicates_list):,} duplicates from intake]")
+            elif ignore_duplicates:
                 print(f"   - DELL1TB02: [Skipped Duplicates - not copying/moving duplicates]")
             else:
                 print(f"   - DELL1TB02: {dell_dest_root}/Duplicates/{triage_id}/")
             print(f"   - LaCie:     {lacie_dest_root}/[Review-Similar|New]/{triage_id}/")
             act_w = "replicate (copy)" if is_photos_library else "move"
             print(f"   Would {act_w}:")
-            if ignore_duplicates:
+            if delete_duplicates:
+                print(f"   - Would DELETE {len(duplicates_list):,} confirmed duplicates from intake folder")
+            elif ignore_duplicates:
                 print(f"   - {len(duplicates_list):,} duplicates IDENTIFIED (Skipped copying/moving; preserved in source)")
             else:
                 print(f"   - {len(duplicates_list):,} duplicates to DELL1TB02: '{duplicates_dir}/'")
@@ -1310,7 +1322,7 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
             return
 
         # Step 5: Moving / Replicating files
-        total_to_move = (0 if ignore_duplicates else len(duplicates_list)) + len(review_list) + len(new_list)
+        total_to_move = (0 if ignore_duplicates and not delete_duplicates else len(duplicates_list)) + len(review_list) + len(new_list)
         action_verb = "Replicating (Copying)" if is_photos_library else "Moving"
         logger.info(f"🚚 {action_verb} {total_to_move:,} triaged files into destination folders on DELL1TB02 and LaCie...")
         print(f"🚚 {action_verb} {total_to_move:,} triaged files into destination folders...")
@@ -1332,9 +1344,31 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
                 logger.info(f"🚚 {action_verb} Progress: {moved_total:,}/{total_to_move:,} ({pct:.0f}%)")
 
         if ignore_duplicates:
-            logger.info(f"⚡ Ignore Duplicates mode active: skipping {len(duplicates_list):,} duplicate file transfers.")
-            print(f"⚡ Ignore Duplicates mode active: skipping {len(duplicates_list):,} duplicate file transfers.")
-            moved_duplicates = len(duplicates_list)
+            if delete_duplicates:
+                logger.info(f"🗑️  Deleting {len(duplicates_list):,} confirmed duplicates from intake folder...")
+                print(f"🗑️  Deleting {len(duplicates_list):,} confirmed duplicates from intake folder...")
+                deleted_count = 0
+                for src_full, rel_p, fname, sz, reason, sub_t, vmeta in duplicates_list:
+                    is_in_library = bool(find_photos_library_parent(src_full))
+                    if not is_in_library and os.path.exists(src_full):
+                        try:
+                            os.remove(src_full)
+                            deleted_count += 1
+                        except (PermissionError, OSError):
+                            unlock_path(os.path.dirname(src_full))
+                            unlock_path(src_full)
+                            try:
+                                os.remove(src_full)
+                                deleted_count += 1
+                            except Exception as e:
+                                logger.error(f"❌ Failed to delete duplicate {src_full}: {e}")
+                    moved_total += 1
+                    report_move_progress()
+                moved_duplicates = deleted_count
+            else:
+                logger.info(f"⚡ Ignore Duplicates mode active: skipping {len(duplicates_list):,} duplicate file transfers.")
+                print(f"⚡ Ignore Duplicates mode active: skipping {len(duplicates_list):,} duplicate file transfers.")
+                moved_duplicates = len(duplicates_list)
         else:
             for src_full, rel_p, fname, sz, reason, sub_t, vmeta in duplicates_list:
                 dest_full = os.path.join(duplicates_dir, rel_p)
@@ -1413,7 +1447,10 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
             sys.stdout.flush()
 
         trans_verb = "Copied (Replicated)" if is_photos_library else "Moved"
-        if ignore_duplicates:
+        if delete_duplicates:
+            logger.info(f"✅ Deleted {moved_duplicates:,} confirmed duplicates from intake folder")
+            print(f"✅ Deleted {moved_duplicates:,} confirmed duplicates from intake folder")
+        elif ignore_duplicates:
             logger.info(f"✅ Skipped transferring {moved_duplicates:,} duplicates (Ignore Duplicates Mode)")
             print(f"✅ Skipped transferring {moved_duplicates:,} duplicates (Ignore Duplicates Mode; preserved in source)")
         else:
@@ -1487,7 +1524,12 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
 
                 asset_rows = []
                 for src_full, rel_p, fname, sz, reason, sub_t, vmeta in duplicates_list:
-                    dest_p = os.path.join(duplicates_dir, rel_p) if duplicates_dir else "[Skipped Duplicates]"
+                    if delete_duplicates:
+                        dest_p = "[Deleted from Intake]"
+                    elif duplicates_dir:
+                        dest_p = os.path.join(duplicates_dir, rel_p)
+                    else:
+                        dest_p = "[Skipped Duplicates]"
                     vmeta = vmeta or {}
                     asset_rows.append((
                         db_session_pk, triage_id, rel_p, fname, sz, "duplicate", sub_t, reason, dest_p,
@@ -1532,7 +1574,11 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
 
         print(f"✅ Triage Complete! [Triage ID: {triage_id}]")
         print(f"   Destination Hierarchy: {session_dest_desc}")
-        if ignore_duplicates:
+        if delete_duplicates:
+            print(f"   - {moved_duplicates:,} confirmed duplicates deleted from intake folder")
+            print(f"   - {moved_review:,} review assets {'replicated' if is_photos_library else 'moved'} to LaCie: '{review_dir}/'")
+            print(f"   - {moved_new:,} clean new assets {'replicated' if is_photos_library else 'moved'} to LaCie: '{new_dir}/'")
+        elif ignore_duplicates:
             print(f"   - {len(duplicates_list):,} duplicates skipped (not moved/copied; preserved in source)")
             print(f"   - {moved_review:,} review assets {'replicated' if is_photos_library else 'moved'} to LaCie: '{review_dir}/'")
             print(f"   - {moved_new:,} clean new assets {'replicated' if is_photos_library else 'moved'} to LaCie: '{new_dir}/'")
@@ -1639,6 +1685,8 @@ def parse_args():
                         help="Simulate the triage process without moving any files or modifying DB.")
     parser.add_argument("--ignore-duplicates", action="store_true",
                         help="Skip moving/copying duplicate files to DELL1TB02 (only route Review-Similar and New to LaCie).")
+    parser.add_argument("--delete-duplicates", "--remove-duplicates", dest="delete_duplicates", action="store_true",
+                        help="Delete confirmed duplicates directly from the source intake directory instead of moving or preserving them.")
     parser.add_argument("--no-clean", action="store_true",
                         help="Do not delete empty directories left behind in the intake folder.")
     parser.add_argument("--tag-only", action="store_true",
@@ -1668,6 +1716,7 @@ if __name__ == "__main__":
             triage_id=args.triage_id,
             dry_run=args.dry_run,
             clean_empty=not args.no_clean,
-            ignore_duplicates=args.ignore_duplicates
+            ignore_duplicates=args.ignore_duplicates,
+            delete_duplicates=args.delete_duplicates
         )
 

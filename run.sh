@@ -64,8 +64,9 @@ print_help() {
     echo -e "  ${GREEN}refresh | bg${RESET}       Run the background database refresh service and metadata sync"
     echo -e "  ${GREEN}executor${RESET}           Execute planned batch operations (move, copy, organize)"
     echo ""
-    echo -e "  ${CYAN}triage${RESET} [dir] [flags]  Run Intake Triage Gateway (--ignore-duplicates, --dry-run)"
+    echo -e "  ${CYAN}triage${RESET} [dir] [flags]  Run Intake Triage Gateway (--delete-duplicates, --ignore-duplicates, --dry-run)"
     echo -e "  ${CYAN}triage-skip-dup${RESET} [dir] Triage intake skipping duplicate copies (only route Review & New)"
+    echo -e "  ${CYAN}triage-delete-dup${RESET} [dir] Triage intake and delete confirmed duplicates from source folder"
     echo -e "  ${CYAN}photos${RESET} [lib] [flags]  Triage Apple Photos Library (--ignore-duplicates, original filenames)"
     echo -e "  ${CYAN}reconcile${RESET} [--triage-id N] Audit/reconcile Live Photo companion MOV videos for a session"
     echo ""
@@ -100,7 +101,7 @@ interactive_menu() {
         echo -e "  ${BOLD}${CYAN}── 🛡️ Intake & Triage Gateway ──${RESET}"
         echo -e "  ${BOLD} 4)${RESET} ${CYAN}Triage Intake (Default Folder)${RESET}      ${DIM}(/Volumes/LaCie/Storage/Priority 4/Media Preprocessing)${RESET}"
         echo -e "  ${BOLD} 5)${RESET} ${CYAN}Triage Intake (Dry-Run Simulation)${RESET}  ${DIM}(Previews classification without moving files)${RESET}"
-        echo -e "  ${BOLD} 6)${RESET} ${CYAN}Triage Intake (Skip Duplicates)${RESET}     ${DIM}(Only route Review-Similar & New to LaCie)${RESET}"
+        echo -e "  ${BOLD} 6)${RESET} ${CYAN}Triage Intake (Skip/Delete Duplicates)${RESET} ${DIM}(Option to skip or delete confirmed duplicates)${RESET}"
         echo -e "  ${BOLD} 7)${RESET} ${CYAN}Triage Custom Directory / Volume${RESET}    ${DIM}(Specify any directory path to triage)${RESET}"
         echo -e "  ${BOLD} 8)${RESET} ${CYAN}Triage Apple Photos Library${RESET}         ${DIM}(Extract original filenames, skip duplicate copies)${RESET}"
         echo -e "  ${BOLD} 9)${RESET} ${CYAN}Reconcile Live Photo MOVs${RESET}           ${DIM}(Audit companion video UUIDs against master library)${RESET}"
@@ -155,8 +156,14 @@ interactive_menu() {
                 read -r
                 ;;
             6)
-                echo -e "\n${CYAN}🛡️ Running Intake Triage on Default Folder (Skip Duplicates Mode)...${RESET}\n"
-                $PYTHON scripts/triage_media_intake.py --ignore-duplicates
+                echo -e "\n${CYAN}🛡️ Running Intake Triage on Default Folder (Duplicates Management)...${RESET}\n"
+                echo -n "Delete confirmed duplicates from intake folder? [y/N]: "
+                read -r del_ans
+                if [[ "$del_ans" =~ ^[Yy]$ ]]; then
+                    $PYTHON scripts/triage_media_intake.py --delete-duplicates
+                else
+                    $PYTHON scripts/triage_media_intake.py --ignore-duplicates
+                fi
                 echo -e "\n${DIM}Press Enter to return to menu...${RESET}"
                 read -r
                 ;;
@@ -173,13 +180,20 @@ interactive_menu() {
                 fi
                 echo -n "Run in Dry-Run mode? [y/N]: "
                 read -r dry_ans
-                echo -n "Skip copying duplicates (--ignore-duplicates)? [y/N]: "
+                echo -n "Skip copying duplicates to DELL1TB02 (--ignore-duplicates)? [y/N]: "
                 read -r dup_ans
+                del_ans="n"
+                if [[ "$dup_ans" =~ ^[Yy]$ ]]; then
+                    echo -n "Delete confirmed duplicates from source intake folder? [y/N]: "
+                    read -r del_ans
+                fi
                 cmd_args=("$target_p")
                 if [[ "$dry_ans" =~ ^[Yy]$ ]]; then
                     cmd_args+=(--dry-run)
                 fi
-                if [[ "$dup_ans" =~ ^[Yy]$ ]]; then
+                if [[ "$del_ans" =~ ^[Yy]$ ]]; then
+                    cmd_args+=(--delete-duplicates)
+                elif [[ "$dup_ans" =~ ^[Yy]$ ]]; then
                     cmd_args+=(--ignore-duplicates)
                 fi
                 $PYTHON scripts/triage_media_intake.py "${cmd_args[@]}"
@@ -333,6 +347,10 @@ case "$1" in
     triage-skip-dup|triage-ignore-dup)
         shift
         exec $PYTHON scripts/triage_media_intake.py --ignore-duplicates "$@"
+        ;;
+    triage-delete-dup|triage-remove-dup)
+        shift
+        exec $PYTHON scripts/triage_media_intake.py --delete-duplicates "$@"
         ;;
     photos|triage-photos)
         shift

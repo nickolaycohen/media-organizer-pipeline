@@ -83,6 +83,7 @@ Launch the interactive terminal selector or execute any pipeline tool via fast s
 ./run.sh triage               # Intake Triage Gateway on default preprocessing folder
 ./run.sh triage /path/to/dir  # Intake Triage on custom directory
 ./run.sh triage-skip-dup      # Intake Triage on default folder skipping duplicate copies
+./run.sh triage-delete-dup    # Intake Triage on default folder deleting confirmed duplicates
 ./run.sh photos /path/to/lib  # Triage Photos Library (--ignore-duplicates, restore filenames)
 ./run.sh reconcile --triage-id 37 # Reconcile Live Photo companion MOVs against master library
 
@@ -381,6 +382,7 @@ If a scanned intake folder contains an Apple Photos Library bundle (`.photoslibr
 | `--triage-id` | Option | Auto-increment integer | Custom session ID for session subdirectories (recorded in `triage_sessions` DB table) |
 | `--dry-run` | Flag | `False` | Simulates file classification, destination paths, and space calculations without moving files or modifying DB |
 | `--ignore-duplicates` | Flag | `False` | Skips moving/copying duplicate files to DELL1TB02 (only routes `Review-Similar` and `New` to LaCie) |
+| `--delete-duplicates`, `--remove-duplicates` | Flag | `False` | Deletes confirmed duplicate files directly from the intake directory instead of moving or preserving them |
 | `--no-clean` | Flag | `False` | Prevents automatic pruning of empty source subdirectories after moving assets |
 | `--tag-only` | Flag | `False` | Re-applies macOS Finder color tags (🟠 Orange, 🔴 Red, 🟢 Green) to existing triage output folders without re-scanning |
 
@@ -395,13 +397,19 @@ python3 scripts/triage_media_intake.py
 # 3. Triage intake folder skipping duplicate copies (only route Review & New to LaCie)
 python3 scripts/triage_media_intake.py --ignore-duplicates
 
-# 4. Triage a specific external hard drive or folder skipping duplicates
+# 4. Triage intake folder and permanently delete confirmed duplicates from source
+python3 scripts/triage_media_intake.py --delete-duplicates
+
+# 5. Triage a specific external hard drive or folder deleting duplicates
+python3 scripts/triage_media_intake.py "/Volumes/LaCie/toDelete" --delete-duplicates
+
+# 6. Triage a specific external hard drive or folder skipping duplicates
 python3 scripts/triage_media_intake.py "/Volumes/DELL1TB02/Archive/Pictures Extra Sequence" --ignore-duplicates
 
-# 5. Use a specific custom session ID
+# 7. Use a specific custom session ID
 python3 scripts/triage_media_intake.py "/path/to/media" --triage-id "2026-Batch-A"
 
-# 6. Re-apply Finder color tags to all existing triage session directories
+# 8. Re-apply Finder color tags to all existing triage session directories
 python3 scripts/triage_media_intake.py --tag-only
 ```
 

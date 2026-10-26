@@ -31,6 +31,7 @@ import bisect
 import sqlite3
 import argparse
 import csv
+import time
 from datetime import datetime
 
 # Optional EXIF reader

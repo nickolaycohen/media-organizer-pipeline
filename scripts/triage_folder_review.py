@@ -103,6 +103,23 @@ def format_size(bytes_val):
     return f"{bytes_val:.1f} PB"
 
 
+def format_eta(seconds):
+    """Formats remaining seconds into a compact, human-readable ETA string (e.g. '45s', '2m 15s', '1h 05m')."""
+    if seconds is None or seconds < 0:
+        return "--:--"
+    s = int(seconds)
+    if s >= 3600:
+        h = s // 3600
+        m = (s % 3600) // 60
+        return f"{h}h {m:02d}m"
+    elif s >= 60:
+        m = s // 60
+        sec = s % 60
+        return f"{m}m {sec:02d}s"
+    else:
+        return f"{s}s"
+
+
 def format_days_gap(days):
     if days is None or days >= 999990:
         return "∞ (Endpoint)"
@@ -286,7 +303,21 @@ def run_interactive_review(
 
     # Pre-extract dates and build asset items
     all_assets = []
-    for row in triage_rows:
+    total_triage = len(triage_rows)
+    t_start = time.time()
+    last_print = t_start
+
+    for idx_row, row in enumerate(triage_rows, 1):
+        if total_triage >= 50:
+            now = time.time()
+            if idx_row == 1 or idx_row == total_triage or (now - last_print) >= 0.5 or idx_row % 50 == 0:
+                last_print = now
+                pct = (idx_row / total_triage) * 100
+                elapsed = now - t_start
+                eta_str = format_eta((total_triage - idx_row) / (idx_row / elapsed)) if elapsed > 0 and idx_row > 0 else "--:--"
+                sys.stdout.write(f"\r⏳ Analyzing assets: {idx_row:,}/{total_triage:,} ({pct:.1f}%) | ETA: {eta_str}...")
+                sys.stdout.flush()
+
         row_id, tid, fname, cat, sub_t, fsz, dest_p, src_dir, orig_rel = row
         p = dest_p
         if not p or not os.path.isfile(p):
@@ -337,6 +368,10 @@ def run_interactive_review(
             "after": after,
             "after_gap": gap_aft
         })
+
+    if total_triage >= 50:
+        sys.stdout.write("\r" + " " * 90 + "\r")
+        sys.stdout.flush()
 
     # Auto-ignore pattern check if provided
     decisions = get_stored_decisions(db_path)

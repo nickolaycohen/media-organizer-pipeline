@@ -64,6 +64,23 @@ def format_size(bytes_val):
     return f"{bytes_val:.2f} PB"
 
 
+def format_eta(seconds):
+    """Formats remaining seconds into a compact, human-readable ETA string (e.g. '45s', '2m 15s', '1h 05m')."""
+    if seconds is None or seconds < 0:
+        return "--:--"
+    s = int(seconds)
+    if s >= 3600:
+        h = s // 3600
+        m = (s % 3600) // 60
+        return f"{h}h {m:02d}m"
+    elif s >= 60:
+        m = s // 60
+        sec = s % 60
+        return f"{m}m {sec:02d}s"
+    else:
+        return f"{s}s"
+
+
 def are_files_identical(p1, p2, chunk_size=65536):
     """Fast chunked byte comparison between two files."""
     try:
@@ -400,14 +417,16 @@ def audit_duplicates_directory(
         if idx == 1 or idx == total_files or (now - last_print) >= 0.5 or idx % 200 == 0:
             last_print = now
             pct = (idx / total_files) * 100
+            elapsed = now - t_start
+            eta_str = format_eta((total_files - idx) / (idx / elapsed)) if elapsed > 0 and idx > 0 else "--:--"
             sys.stdout.write(
                 f"\r🚚 Verifying: {idx:,}/{total_files:,} ({pct:.1f}%) | "
                 f"Exact: {len(results['CONFIRMED_DB_EXACT']) + len(results['CONFIRMED_DISK_EXACT']):,} | "
-                f"Missing: {len(results['MISSING']):,}..."
+                f"Missing: {len(results['MISSING']):,} | ETA: {eta_str}..."
             )
             sys.stdout.flush()
 
-    sys.stdout.write("\r" + " " * 80 + "\r")
+    sys.stdout.write("\r" + " " * 110 + "\r")
     sys.stdout.flush()
 
     # Step 4: Generate Summary Report

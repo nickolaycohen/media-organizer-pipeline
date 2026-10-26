@@ -47,6 +47,23 @@ def format_size(bytes_val):
     return f"{bytes_val:.2f} PB"
 
 
+def format_eta(seconds):
+    """Formats remaining seconds into a compact, human-readable ETA string (e.g. '45s', '2m 15s', '1h 05m')."""
+    if seconds is None or seconds < 0:
+        return "--:--"
+    s = int(seconds)
+    if s >= 3600:
+        h = s // 3600
+        m = (s % 3600) // 60
+        return f"{h}h {m:02d}m"
+    elif s >= 60:
+        m = s // 60
+        sec = s % 60
+        return f"{m}m {sec:02d}s"
+    else:
+        return f"{s}s"
+
+
 def unlock_path(path):
     """
     Clears macOS immutable flags (uchg, nouappnd) and Time Machine ACLs
@@ -241,18 +258,20 @@ def merge_directories(
         # Progress reporting
         now = time.time()
         pct = (idx / total_files) * 100
+        elapsed = now - t0
+        eta_str = format_eta((total_files - idx) / (idx / elapsed)) if elapsed > 0 and idx > 0 else "--:--"
         if idx == 1 or idx == total_files or (now - last_progress_time) >= 0.5 or idx % 25 == 0:
             last_progress_time = now
             sys.stdout.write(
                 f"\r🚚 Processing: {idx:,}/{total_files:,} ({pct:.1f}%) | "
-                f"Transferred: {transferred_count:,} | Dedup: {dedup_count:,} | Renamed: {renamed_count:,}..."
+                f"Transferred: {transferred_count:,} | Dedup: {dedup_count:,} | Renamed: {renamed_count:,} | ETA: {eta_str}..."
             )
             sys.stdout.flush()
 
         if idx == 1 or idx % max(1, total_files // 10) == 0 or idx == total_files:
             logger.info(
                 f"Progress: {idx:,}/{total_files:,} ({pct:.0f}%) | "
-                f"Transferred: {transferred_count:,}, Dedup: {dedup_count:,}, Renamed: {renamed_count:,}"
+                f"Transferred: {transferred_count:,}, Dedup: {dedup_count:,}, Renamed: {renamed_count:,} | ETA: {eta_str}"
             )
 
         # Evaluate target existence
@@ -330,7 +349,7 @@ def merge_directories(
                 error_count += 1
                 logger.error(f"❌ Failed to transfer {src_full} -> {final_dest}: {e}")
 
-    sys.stdout.write("\r" + " " * 95 + "\r")
+    sys.stdout.write("\r" + " " * 110 + "\r")
     sys.stdout.flush()
 
     # Step 3: Clean empty directories if moving

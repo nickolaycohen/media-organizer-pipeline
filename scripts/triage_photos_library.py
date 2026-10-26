@@ -42,7 +42,8 @@ from scripts.triage_media_intake import (
     ensure_triage_tables,
     tag_triage_folders,
     safe_copy,
-    format_size
+    format_size,
+    format_eta
 )
 
 LOG_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "../logs/triage_photos_library.log"))
@@ -489,23 +490,26 @@ def triage_photos_library(library_path, lacie_dest_root=None, dell_dest_root=Non
         total_new_bytes = 0
 
         total_groups = len(grouped_by_stem)
-        last_progress_time = time.time()
+        eval_start_time = time.time()
+        last_progress_time = eval_start_time
 
         for idx, ((dirname, stem_lower), file_group) in enumerate(grouped_by_stem.items(), 1):
             now = time.time()
             pct = (idx / total_groups) * 100
+            elapsed = now - eval_start_time
+            eta_str = format_eta((total_groups - idx) / (idx / elapsed)) if elapsed > 0 and idx > 0 else "--:--"
             if idx == 1 or idx == total_groups or (now - last_progress_time) >= 0.5 or idx % 25 == 0:
                 last_progress_time = now
                 sys.stdout.write(
                     f"\r⏳ Evaluating library assets: {idx:,}/{total_groups:,} ({pct:.1f}%) | "
-                    f"Dups: {len(duplicates_list):,} | Review: {len(review_list):,} | New: {len(new_list):,}..."
+                    f"Dups: {len(duplicates_list):,} | Review: {len(review_list):,} | New: {len(new_list):,} | ETA: {eta_str}..."
                 )
                 sys.stdout.flush()
 
             if idx == 1 or idx % max(1, total_groups // 10) == 0 or idx == total_groups:
                 logger.info(
                     f"⏳ Evaluation Progress: {idx:,}/{total_groups:,} ({pct:.0f}%) | "
-                    f"Dups: {len(duplicates_list):,} | Review: {len(review_list):,} | New: {len(new_list):,}"
+                    f"Dups: {len(duplicates_list):,}, Review-Similar: {len(review_list):,}, New: {len(new_list):,} | ETA: {eta_str}"
                 )
 
             primary_candidates = [item for item in file_group if item[5] not in ('.mov', '.mp4')]
@@ -616,7 +620,7 @@ def triage_photos_library(library_path, lacie_dest_root=None, dell_dest_root=Non
                         new_list.append((v_full, v_rel, v_orig_f, v_sz, reason, sub_type, visual_meta))
                         total_new_bytes += v_sz
 
-        sys.stdout.write("\r" + " " * 95 + "\r")
+        sys.stdout.write("\r" + " " * 110 + "\r")
         sys.stdout.flush()
 
         # Step 5: Summary Output
@@ -681,18 +685,21 @@ def triage_photos_library(library_path, lacie_dest_root=None, dell_dest_root=Non
         replicated_review = 0
         replicated_new = 0
         moved_total = 0
-        last_move_time = time.time()
+        copy_start_time = time.time()
+        last_move_time = copy_start_time
 
         def report_copy_progress():
             nonlocal last_move_time
             now = time.time()
             pct = (moved_total / total_to_move) * 100 if total_to_move else 100.0
+            elapsed = now - copy_start_time
+            eta_str = format_eta((total_to_move - moved_total) / (moved_total / elapsed)) if elapsed > 0 and moved_total > 0 else "--:--"
             if moved_total == 1 or moved_total == total_to_move or (now - last_move_time) >= 0.5 or moved_total % 25 == 0:
                 last_move_time = now
-                sys.stdout.write(f"\r🚚 Replicating files: {moved_total:,}/{total_to_move:,} ({pct:.1f}%)...")
+                sys.stdout.write(f"\r🚚 Replicating files: {moved_total:,}/{total_to_move:,} ({pct:.1f}%) | ETA: {eta_str}...")
                 sys.stdout.flush()
             if moved_total == 1 or moved_total % max(1, total_to_move // 10) == 0 or moved_total == total_to_move:
-                logger.info(f"🚚 Replication Progress: {moved_total:,}/{total_to_move:,} ({pct:.0f}%)")
+                logger.info(f"🚚 Replication Progress: {moved_total:,}/{total_to_move:,} ({pct:.0f}%) | ETA: {eta_str}")
 
         if not ignore_duplicates:
             for src_full, rel_p, orig_f, sz, reason, sub_t, vmeta in duplicates_list:
@@ -729,7 +736,7 @@ def triage_photos_library(library_path, lacie_dest_root=None, dell_dest_root=Non
             report_copy_progress()
 
         if total_to_move > 0:
-            sys.stdout.write("\r" + " " * 80 + "\r")
+            sys.stdout.write("\r" + " " * 110 + "\r")
             sys.stdout.flush()
 
         if ignore_duplicates:

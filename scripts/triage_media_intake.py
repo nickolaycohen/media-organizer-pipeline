@@ -265,6 +265,22 @@ def format_size(bytes_val):
         bytes_val /= 1024.0
     return f"{bytes_val:.2f} PB"
 
+def format_eta(seconds):
+    """Formats remaining seconds into a compact, human-readable ETA string (e.g. '45s', '2m 15s', '1h 05m')."""
+    if seconds is None or seconds < 0:
+        return "--:--"
+    s = int(seconds)
+    if s >= 3600:
+        h = s // 3600
+        m = (s % 3600) // 60
+        return f"{h}h {m:02d}m"
+    elif s >= 60:
+        m = s // 60
+        sec = s % 60
+        return f"{m}m {sec:02d}s"
+    else:
+        return f"{s}s"
+
 def extract_exif_data(file_path):
     """
     Extracts (date_ymd, unix_timestamp) from file EXIF if available.
@@ -1108,16 +1124,19 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
         total_new_bytes = 0
 
         total_groups = len(grouped_by_stem)
-        last_progress_time = time.time()
+        eval_start_time = time.time()
+        last_progress_time = eval_start_time
 
         for idx, ((dirname, stem_lower), file_group) in enumerate(grouped_by_stem.items(), 1):
             now = time.time()
             pct = (idx / total_groups) * 100
+            elapsed = now - eval_start_time
+            eta_str = format_eta((total_groups - idx) / (idx / elapsed)) if elapsed > 0 and idx > 0 else "--:--"
             if idx == 1 or idx == total_groups or (now - last_progress_time) >= 0.5 or idx % 25 == 0:
                 last_progress_time = now
                 sys.stdout.write(
                     f"\r⏳ Evaluating intake assets: {idx:,}/{total_groups:,} ({pct:.1f}%) | "
-                    f"Dups: {len(duplicates_list):,} | Review: {len(review_list):,} | New: {len(new_list):,}..."
+                    f"Dups: {len(duplicates_list):,} | Review: {len(review_list):,} | New: {len(new_list):,} | ETA: {eta_str}..."
                 )
                 sys.stdout.flush()
 
@@ -1125,7 +1144,7 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
             if idx == 1 or idx % max(1, total_groups // 10) == 0 or idx == total_groups:
                 logger.info(
                     f"⏳ Evaluation Progress: {idx:,}/{total_groups:,} ({pct:.0f}%) | "
-                    f"Duplicates: {len(duplicates_list):,}, Review-Similar: {len(review_list):,}, New: {len(new_list):,}"
+                    f"Duplicates: {len(duplicates_list):,}, Review-Similar: {len(review_list):,}, New: {len(new_list):,} | ETA: {eta_str}"
                 )
 
             primary_candidates = [item for item in file_group if item[4] not in ('.mov', '.mp4')]
@@ -1228,7 +1247,7 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
                         new_list.append((v_full, v_rel, v_f, v_sz, reason, sub_type, visual_meta))
                         total_new_bytes += v_sz
 
-        sys.stdout.write("\r" + " " * 95 + "\r")
+        sys.stdout.write("\r" + " " * 110 + "\r")
         sys.stdout.flush()
 
         # Step 4: Summary Output & Detailed Logging
@@ -1330,18 +1349,21 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
         moved_review = 0
         moved_new = 0
         moved_total = 0
-        last_move_time = time.time()
+        move_start_time = time.time()
+        last_move_time = move_start_time
 
         def report_move_progress():
             nonlocal last_move_time
             now = time.time()
             pct = (moved_total / total_to_move) * 100 if total_to_move else 100.0
+            elapsed = now - move_start_time
+            eta_str = format_eta((total_to_move - moved_total) / (moved_total / elapsed)) if elapsed > 0 and moved_total > 0 else "--:--"
             if moved_total == 1 or moved_total == total_to_move or (now - last_move_time) >= 0.5 or moved_total % 25 == 0:
                 last_move_time = now
-                sys.stdout.write(f"\r🚚 {action_verb} files: {moved_total:,}/{total_to_move:,} ({pct:.1f}%)...")
+                sys.stdout.write(f"\r🚚 {action_verb} files: {moved_total:,}/{total_to_move:,} ({pct:.1f}%) | ETA: {eta_str}...")
                 sys.stdout.flush()
             if moved_total == 1 or moved_total % max(1, total_to_move // 10) == 0 or moved_total == total_to_move:
-                logger.info(f"🚚 {action_verb} Progress: {moved_total:,}/{total_to_move:,} ({pct:.0f}%)")
+                logger.info(f"🚚 {action_verb} Progress: {moved_total:,}/{total_to_move:,} ({pct:.0f}%) | ETA: {eta_str}")
 
         if ignore_duplicates:
             if delete_duplicates:
@@ -1443,7 +1465,7 @@ def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, 
             report_move_progress()
 
         if total_to_move > 0:
-            sys.stdout.write("\r" + " " * 80 + "\r")
+            sys.stdout.write("\r" + " " * 110 + "\r")
             sys.stdout.flush()
 
         trans_verb = "Copied (Replicated)" if is_photos_library else "Moved"

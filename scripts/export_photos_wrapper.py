@@ -13,6 +13,22 @@ from utils.utils import set_batch_status
 
 MODULE_TAG = 'export_wrapper'
 
+def format_eta(seconds):
+    """Formats remaining seconds into a compact, human-readable ETA string (e.g. '45s', '2m 15s', '1h 05m')."""
+    if seconds is None or seconds < 0:
+        return "--:--"
+    s = int(seconds)
+    if s >= 3600:
+        h = s // 3600
+        m = (s % 3600) // 60
+        return f"{h}h {m:02d}m"
+    elif s >= 60:
+        m = s // 60
+        sec = s % 60
+        return f"{m}m {sec:02d}s"
+    else:
+        return f"{s}s"
+
 def get_originals_dir():
     photos_library_dir = os.path.dirname(os.path.dirname(APPLE_PHOTOS_DB_PATH))
     return os.path.join(photos_library_dir, "originals")
@@ -164,7 +180,8 @@ def export_batch_from_db(month, logger, dry_run=False):
         if idx % 100 == 0 or idx == total_assets:
             elapsed = time.time() - start_time
             rate_mb = (total_bytes / (1024 * 1024)) / elapsed if elapsed > 0 else 0
-            msg = f"  [{idx}/{total_assets}] Processed assets... ({exported_primary} copied, {skipped_primary} cached, {rate_mb:.1f} MB/s)"
+            eta_str = format_eta((total_assets - idx) / (idx / elapsed)) if elapsed > 0 and idx > 0 else "--:--"
+            msg = f"  [{idx}/{total_assets}] Processed assets... ({exported_primary} copied, {skipped_primary} cached, {rate_mb:.1f} MB/s | ETA: {eta_str})"
             logger.info(msg)
             print(f"\r{msg}", end="", flush=True)
 

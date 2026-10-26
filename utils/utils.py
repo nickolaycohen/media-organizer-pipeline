@@ -11,6 +11,22 @@ def human_readable_size(size_bytes):
         i += 1
     return f"{size_bytes:.2f}{size_name[i]}"
 
+def format_eta(seconds):
+    """Formats remaining seconds into a compact, human-readable ETA string (e.g. '45s', '2m 15s', '1h 05m')."""
+    if seconds is None or seconds < 0:
+        return "--:--"
+    s = int(seconds)
+    if s >= 3600:
+        h = s // 3600
+        m = (s % 3600) // 60
+        return f"{h}h {m:02d}m"
+    elif s >= 60:
+        m = s // 60
+        sec = s % 60
+        return f"{m}m {sec:02d}s"
+    else:
+        return f"{s}s"
+
 def set_batch_status(cursor, month, current_code, success=True, session_id=None):
     """Update the batch status for the given month based on the outcome of a step."""
     try:

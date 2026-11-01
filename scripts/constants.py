@@ -68,6 +68,26 @@ APPLE_FEATURED_WEIGHT = 0.15
 
 # Syncing Settings
 MAX_RETRIES = 5
+
+# Nightly Backup Window (Local Time): 02:55 AM to 06:15 AM
+# Protects against collisions with:
+# - Time Machine (03:00 AM)
+# - Apple Photos Album Disaster Recovery Backup (05:30 AM)
+# - SQLite Database Backup (06:00 AM)
+BACKUP_WINDOW_START_HOUR = 2
+BACKUP_WINDOW_START_MIN = 55
+BACKUP_WINDOW_END_HOUR = 6
+BACKUP_WINDOW_END_MIN = 15
+
+def is_in_backup_window(dt=None):
+    """Returns True if local time is within the nightly backup window (02:55 - 06:15)."""
+    from datetime import datetime
+    if dt is None:
+        dt = datetime.now()
+    cur_mins = dt.hour * 60 + dt.minute
+    start_mins = BACKUP_WINDOW_START_HOUR * 60 + BACKUP_WINDOW_START_MIN
+    end_mins = BACKUP_WINDOW_END_HOUR * 60 + BACKUP_WINDOW_END_MIN
+    return start_mins <= cur_mins < end_mins
 RETRY_DELAY = 30
 
 # Upload Settings
@@ -104,7 +124,7 @@ DEVICE_OWNER_MAPPING = {
     'iPhone 11 Pro': 'Nickolay',
     'iPhone 8 Plus': 'Nickolay',
     'iPhone 6s': 'Nickolay',
-    'iPhone 5s': 'Nickolay',
+    'iPhone 5s': 'Bianca',
     'iPhone 4': 'Nickolay',
     
     'iPhone 17 Pro Max': 'Wife',

@@ -10,7 +10,7 @@ import threading
 from db.queries import get_next_code
 from utils.utils import set_batch_status
 from utils.logger import setup_logger
-from constants import LOG_PATH, APPLE_PHOTOS_DB_COPY_PATH, APPLE_PHOTOS_DB_LOCK_PATH, MEDIA_ORGANIZER_DB_PATH, STAGING_ROOT
+from constants import LOG_PATH, APPLE_PHOTOS_DB_COPY_PATH, APPLE_PHOTOS_DB_LOCK_PATH, MEDIA_ORGANIZER_DB_PATH, STAGING_ROOT, is_in_backup_window
 import json
 import socket
 import errno
@@ -26,6 +26,7 @@ import atexit
 from db.connections import get_connection, get_cursor, commit, close as close_conn
 
 LOCK_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), "../db/executor.lock"))
+BACKUP_LOCK_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), "../db/backup.lock"))
 
 class ExecutorState:
     def __init__(self):
@@ -158,18 +159,41 @@ def status_reporter_worker(interval_sec=180):
             logger.warning(f"Error in status reporter heartbeat: {e}")
 
 
-def acquire_lock():
+def is_pid_alive(pid):
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError as err:
+        if err.errno == errno.ESRCH:
+            return False
+        return True
+
+def acquire_lock(is_cron=False):
     if os.path.exists(LOCK_FILE):
         try:
             with open(LOCK_FILE, "r") as f:
                 pid = int(f.read().strip())
-            # Check if process is still running
-            os.kill(pid, 0)
-            logger.info(f"⏭️ Executor is already running (PID: {pid}). Exiting.")
-            sys.exit(0)
+            if is_pid_alive(pid):
+                logger.info(f"⏭️ Executor is already running (PID: {pid}). Exiting.")
+                sys.exit(0)
+            else:
+                logger.warning(f"⚠️ Found stale executor lock file from dead PID {pid}. Overriding lock.")
         except (ValueError, OSError):
-            # PID is not running, or lock file is invalid/stale
             pass
+
+    # Check if we are inside the nightly backup window (02:55 - 06:15)
+    if is_in_backup_window():
+        if is_cron:
+            logger.info("⏸️ Current time is inside nightly backup window (02:55 - 06:15). Skipping execution for now.")
+            sys.exit(0)
+        else:
+            logger.info(f"⏸️ Current time ({datetime.now().strftime('%H:%M:%S')}) is inside nightly backup window (02:55 - 06:15).")
+            logger.info("Pausing executor until 06:15 to allow nightly backups to run undisturbed...")
+            while is_in_backup_window():
+                time.sleep(30)
+            logger.info(f"🌅 Outside backup window ({datetime.now().strftime('%H:%M:%S')}). Proceeding with executor startup!")
 
     try:
         os.makedirs(os.path.dirname(LOCK_FILE), exist_ok=True)
@@ -214,19 +238,14 @@ def write_lock_file(status, pid, started_at_utc=None, latest_successful_refresh_
     except Exception as e:
         logger.warning(f"Failed to write lock file: {e}")
 
-def is_pid_alive(pid):
-    if pid is None:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError as err:
-        if err.errno == errno.ESRCH:
-            return False
-        return True
-
 def acquire_db_lock():
     while True:
+        # Check if a database backup is actively in progress
+        if os.path.exists(BACKUP_LOCK_FILE):
+            logger.info("ℹ️ Database backup is currently in progress (db/backup.lock). Waiting for backup completion...")
+            time.sleep(3)
+            continue
+
         lock = read_lock_file()
         last_refresh = "—"
         
@@ -362,6 +381,13 @@ def run_regular_steps(bootstrap_steps, steps, from_index, to_index, dry_run, mon
 
         # Prepare command with current_month replaced if available
         command = [arg.replace("{month}", month) if month else arg for arg in step.command]
+
+        # Check if we are inside the nightly backup window (02:55 - 06:15)
+        if is_in_backup_window():
+            logger.info(f"⏸️ Current time ({datetime.now().strftime('%H:%M:%S')}) is inside nightly backup window (02:55 - 06:15). Pausing before next step '{step.label}'...")
+            while is_in_backup_window():
+                time.sleep(30)
+            logger.info(f"🌅 Outside backup window ({datetime.now().strftime('%H:%M:%S')}). Resuming step '{step.label}'!")
 
         if not run_step(step, dry_run, month, command):
             logger.error(f"❌ Pipeline execution halted. Session ID: {session_id}")
@@ -579,7 +605,7 @@ def get_pipeline_steps(script_dir, use_mock_data=False):
 
 
 def main(args):
-    acquire_lock()
+    acquire_lock(is_cron=args.cron)
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
     # Bootstrap: run initial steps before determining which batch to process
@@ -604,6 +630,13 @@ def main(args):
     status_thread.start()
 
     while True:
+        # Check if we are inside the nightly backup window (02:55 - 06:15)
+        if is_in_backup_window():
+            logger.info(f"⏸️ Current time ({datetime.now().strftime('%H:%M:%S')}) is inside nightly backup window (02:55 - 06:15). Pausing executor queue...")
+            while is_in_backup_window():
+                time.sleep(30)
+            logger.info(f"🌅 Outside backup window ({datetime.now().strftime('%H:%M:%S')}). Resuming execution queue!")
+
         # Check for active planned executions in queue
         acquire_db_lock()
         conn = get_connection()

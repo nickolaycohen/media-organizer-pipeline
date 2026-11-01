@@ -4,6 +4,7 @@ import time
 import sqlite3
 import gzip
 import shutil
+import errno
 from datetime import datetime, timezone
 
 # Ensure project root is in path
@@ -12,6 +13,24 @@ from constants import BASE_DIR, MEDIA_ORGANIZER_DB_PATH
 
 BACKUPS_DIR = os.path.abspath(os.path.join(BASE_DIR, "../backups"))
 BACKUP_RETENTION_COUNT = 7
+EXECUTOR_LOCK_FILE = os.path.abspath(os.path.join(BASE_DIR, "../db/executor.lock"))
+BACKUP_LOCK_FILE = os.path.abspath(os.path.join(BASE_DIR, "../db/backup.lock"))
+
+def is_executor_active():
+    """Checks if pipeline_executor is currently active and alive."""
+    if not os.path.exists(EXECUTOR_LOCK_FILE):
+        return False, None
+    try:
+        with open(EXECUTOR_LOCK_FILE, "r") as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        return True, pid
+    except OSError as err:
+        if err.errno == errno.ESRCH:
+            return False, None
+        return True, pid
+    except Exception:
+        return False, None
 
 def perform_backup():
     print(f"[{datetime.now().isoformat()}] Starting database backup process...")
@@ -20,7 +39,19 @@ def perform_backup():
         print(f"Error: Database file not found at {MEDIA_ORGANIZER_DB_PATH}")
         sys.exit(1)
 
-    # 1. Create backups directory if it doesn't exist
+    # 1. Check if pipeline executor is actively running
+    executor_active, exec_pid = is_executor_active()
+    if executor_active:
+        print(f"[{datetime.now().isoformat()}] ℹ️ Pipeline executor is actively running (PID: {exec_pid}). Coordinating non-blocking online backup...")
+
+    # 2. Write backup lock file so other processes know backup is in progress
+    try:
+        with open(BACKUP_LOCK_FILE, "w") as f:
+            f.write(str(os.getpid()))
+    except Exception:
+        pass
+
+    # 3. Create backups directory if it doesn't exist
     os.makedirs(BACKUPS_DIR, exist_ok=True)
     
     # Generate filenames
@@ -31,13 +62,13 @@ def perform_backup():
     src_conn = None
     dest_conn = None
     try:
-        # 2. Open source database connection (in read-only mode to prevent any locks/writes)
-        src_conn = sqlite3.connect(f"file:{MEDIA_ORGANIZER_DB_PATH}?mode=ro", uri=True)
+        # 4. Open source database connection (read-only mode with timeout to prevent lock contention)
+        src_conn = sqlite3.connect(f"file:{MEDIA_ORGANIZER_DB_PATH}?mode=ro", uri=True, timeout=60)
         
-        # 3. Open temporary destination connection
+        # 5. Open temporary destination connection
         dest_conn = sqlite3.connect(temp_backup_path)
         
-        # 4. Perform SQLite online backup
+        # 6. Perform SQLite online backup
         print("Safely copying database pages (SQLite Online Backup)...")
         with dest_conn:
             src_conn.backup(dest_conn)
@@ -46,7 +77,7 @@ def perform_backup():
         dest_conn.close()
         src_conn.close()
         
-        # 5. Compress the backup copy
+        # 7. Compress the backup copy
         print(f"Compressing database backup to {final_gzip_path}...")
         with open(temp_backup_path, 'rb') as f_in:
             with gzip.open(final_gzip_path, 'wb') as f_out:
@@ -59,7 +90,7 @@ def perform_backup():
         compressed_size_mb = os.path.getsize(final_gzip_path) / (1024 * 1024)
         print(f"✅ Backup created successfully: {final_gzip_path} ({compressed_size_mb:.2f} MB)")
         
-        # 6. Apply rotation policy (keep only last N backups)
+        # 8. Apply rotation policy (keep only last N backups)
         rotate_backups()
         
     except Exception as e:
@@ -71,6 +102,13 @@ def perform_backup():
             except Exception:
                 pass
         sys.exit(1)
+    finally:
+        # Clear backup lock
+        if os.path.exists(BACKUP_LOCK_FILE):
+            try:
+                os.remove(BACKUP_LOCK_FILE)
+            except Exception:
+                pass
 
 def rotate_backups():
     print(f"Applying backup retention policy (keeping last {BACKUP_RETENTION_COUNT} backups)...")

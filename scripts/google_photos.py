@@ -122,8 +122,18 @@ def create_or_get_album(creds, album_title):
     raise Exception(f'Failed to create album: {response.text}')
 
 
+def ensure_creds_valid(creds):
+    if creds and (not creds.valid or creds.expired) and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+            with open(TOKEN_FILE, 'w') as token:
+                token.write(creds.to_json())
+        except Exception as e:
+            logger.warning(f"[Google Photos] Failed to refresh token: {e}")
+
 def upload_media(creds, file_path, album_id, max_retries=5):
     import time
+    ensure_creds_valid(creds)
     headers = {
         'Authorization': f'Bearer {creds.token}',
         'Content-type': 'application/octet-stream',
@@ -141,6 +151,15 @@ def upload_media(creds, file_path, album_id, max_retries=5):
             if upload_token_res.status_code == 200:
                 upload_token = upload_token_res.text
                 break
+            elif upload_token_res.status_code == 401:
+                logger.warning(f"Upload bytes attempt {attempt} got 401 (token expired). Refreshing credentials...")
+                try:
+                    creds.refresh(Request())
+                    with open(TOKEN_FILE, 'w') as token:
+                        token.write(creds.to_json())
+                    headers['Authorization'] = f'Bearer {creds.token}'
+                except Exception as refresh_err:
+                    logger.warning(f"Failed to refresh creds on 401: {refresh_err}")
             else:
                 logger.warning(f"Upload bytes attempt {attempt} failed ({upload_token_res.status_code}): {upload_token_res.text}")
         except Exception as e:
@@ -170,6 +189,7 @@ def upload_media(creds, file_path, album_id, max_retries=5):
     delay = 2
     for attempt in range(1, max_retries + 1):
         try:
+            ensure_creds_valid(creds)
             create_response = requests.post(f'{API_BASE_URL}/mediaItems:batchCreate', headers={
                 'Authorization': f'Bearer {creds.token}',
                 'Content-type': 'application/json'
@@ -187,6 +207,14 @@ def upload_media(creds, file_path, album_id, max_retries=5):
                     else:
                         raise Exception(f"Creation result status error: {status}")
                 return
+            elif create_response.status_code == 401:
+                logger.warning(f"Create media item attempt {attempt} got 401 (token expired). Refreshing credentials...")
+                try:
+                    creds.refresh(Request())
+                    with open(TOKEN_FILE, 'w') as token:
+                        token.write(creds.to_json())
+                except Exception as refresh_err:
+                    logger.warning(f"Failed to refresh creds on 401: {refresh_err}")
             else:
                 logger.warning(f"Create media item attempt {attempt} failed ({create_response.status_code}): {create_response.text}")
         except Exception as e:

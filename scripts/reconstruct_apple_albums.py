@@ -239,6 +239,21 @@ def sync_album_backup(conn, logger):
     - media_organizer_albums
     - media_organizer_album_assets
     """
+    # Check if pipeline executor is actively running to prevent DB lock contention
+    executor_lock_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../db/executor.lock"))
+    if os.path.exists(executor_lock_path):
+        try:
+            with open(executor_lock_path, "r") as f:
+                pid = int(f.read().strip())
+            os.kill(pid, 0)
+            logger.info(f"ℹ️ Pipeline executor is active (PID: {pid}). Waiting for executor quiet window before album backup...")
+            waited = 0
+            while waited < 300 and os.path.exists(executor_lock_path):
+                time.sleep(10)
+                waited += 10
+        except OSError:
+            pass
+
     photos_path = get_source_photos_db_path()
     if not photos_path:
         logger.error(f"❌ Neither live Apple Photos DB ({APPLE_PHOTOS_DB_PATH}) nor local copy ({APPLE_PHOTOS_DB_COPY_PATH}) was found.")

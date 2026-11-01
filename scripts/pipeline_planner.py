@@ -482,6 +482,210 @@ def check_photos_db_for_smart_album(album_name):
         logger.warning(f"Error checking Apple Photos DB for smart album '{album_name}': {e}")
         return None, str(e)
 
+def haversine_distance(lat1, lon1, lat2, lon2):
+    """Calculates Haversine distance in meters between two GPS coordinates."""
+    R = 6371000.0  # meters
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat / 2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
+
+def extract_file_num(fname):
+    """Extracts trailing camera frame index from a filename (e.g. IMG_7475.HEIC -> 7475)."""
+    if not fname:
+        return None
+    m = re.search(r'(\d{1,6})\.[^.]+$', fname)
+    return int(m.group(1)) if m else None
+
+def find_closest_existing_moment_album(cursor, asset_id, filename, dt_utc_str, import_id=None, lat=None, lon=None, cam_model=None, valid_albums=None):
+    """
+    Finds the existing Moments album with the closest proximity to an unassigned asset
+    based on datestamp, filename sequence, session/import, GPS location, and camera source.
+    Returns (best_album_name, best_reason) or None.
+    """
+    dt_target = None
+    if dt_utc_str:
+        for fmt in ('%Y-%m-%d %H:%M:%S.%f', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d'):
+            try:
+                dt_target = datetime.strptime(dt_utc_str, fmt)
+                break
+            except ValueError:
+                pass
+
+    target_num = extract_file_num(filename)
+    has_gps = (lat is not None and lat != -180.0 and lon is not None and lon != -180.0)
+
+    candidates = []
+
+    # 1. Filename & Session Proximity (Same Import ID)
+    if import_id:
+        cursor.execute('''
+            SELECT a.MomentsAlbumName, a.original_filename, a.date_created_utc,
+                   za.ZLATITUDE, za.ZLONGITUDE, ze.ZCAMERAMODEL
+            FROM assets a
+            LEFT JOIN ZASSET za ON a.asset_id = za.ZUUID
+            LEFT JOIN ZEXTENDEDATTRIBUTES ze ON za.ZEXTENDEDATTRIBUTES = ze.Z_PK
+            WHERE a.import_id = ? 
+              AND a.MomentsAlbumName IS NOT NULL AND a.MomentsAlbumName != ''
+              AND LOWER(a.MomentsAlbumName) NOT IN ('ignore', 'skippublishing', 'topscore excluded')
+              AND a.asset_id != ?
+            ORDER BY abs(strftime('%s', a.date_created_utc) - strftime('%s', ?))
+            LIMIT 10
+        ''', (import_id, asset_id, dt_utc_str))
+        for m_alb, m_fn, m_dt, m_lat, m_lon, m_cam in cursor.fetchall():
+            if valid_albums and m_alb not in valid_albums:
+                continue
+            m_dt_obj = None
+            if m_dt:
+                for fmt in ('%Y-%m-%d %H:%M:%S.%f', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d'):
+                    try:
+                        m_dt_obj = datetime.strptime(m_dt, fmt)
+                        break
+                    except ValueError:
+                        pass
+            time_diff_sec = abs((dt_target - m_dt_obj).total_seconds()) if (dt_target and m_dt_obj) else 99999999
+            
+            m_num = extract_file_num(m_fn)
+            fn_diff = abs(target_num - m_num) if (target_num is not None and m_num is not None) else None
+
+            dist_m = None
+            if has_gps and m_lat is not None and m_lat != -180.0 and m_lon is not None and m_lon != -180.0:
+                dist_m = haversine_distance(lat, lon, m_lat, m_lon)
+
+            fn_bonus = max(0.0, 10.0 - (fn_diff * 0.5)) if (fn_diff is not None and fn_diff <= 20) else 0.0
+            time_penalty = min(30.0, (time_diff_sec / 3600.0) * 2.0)
+            score = 10.0 + time_penalty - fn_bonus
+
+            reasons = [f'same import session {import_id}']
+            if fn_diff is not None and fn_diff <= 20:
+                reasons.append(f'frame {m_fn} (Δ{fn_diff})')
+            if time_diff_sec < 60:
+                reasons.append(f'{int(time_diff_sec)}s apart')
+            elif time_diff_sec < 3600:
+                reasons.append(f'{time_diff_sec/60:.0f}m apart')
+            elif time_diff_sec < 86400:
+                reasons.append(f'{time_diff_sec/3600:.1f}h apart')
+            else:
+                reasons.append(f'{time_diff_sec/86400:.1f}d apart')
+
+            if dist_m is not None:
+                if dist_m < 50:
+                    score -= 8.0
+                    reasons.append(f'GPS {dist_m:.0f}m')
+                elif dist_m < 500:
+                    score -= 4.0
+                    reasons.append(f'GPS {dist_m:.0f}m')
+
+            candidates.append((score, m_alb, ', '.join(reasons)))
+
+    # 2. GPS Location Proximity
+    if has_gps:
+        cursor.execute('''
+            SELECT a.MomentsAlbumName, a.original_filename, a.date_created_utc,
+                   za.ZLATITUDE, za.ZLONGITUDE
+            FROM assets a
+            JOIN ZASSET za ON a.asset_id = za.ZUUID
+            WHERE a.MomentsAlbumName IS NOT NULL AND a.MomentsAlbumName != ''
+              AND LOWER(a.MomentsAlbumName) NOT IN ('ignore', 'skippublishing', 'topscore excluded')
+              AND za.ZLATITUDE IS NOT NULL AND za.ZLATITUDE != -180.0
+              AND abs(za.ZLATITUDE - ?) < 0.02 AND abs(za.ZLONGITUDE - ?) < 0.02
+              AND a.asset_id != ?
+            ORDER BY abs(strftime('%s', a.date_created_utc) - strftime('%s', ?))
+            LIMIT 5
+        ''', (lat, lon, asset_id, dt_utc_str))
+        for m_alb, m_fn, m_dt, m_lat, m_lon in cursor.fetchall():
+            if valid_albums and m_alb not in valid_albums:
+                continue
+            dist_m = haversine_distance(lat, lon, m_lat, m_lon)
+            m_dt_obj = None
+            if m_dt:
+                for fmt in ('%Y-%m-%d %H:%M:%S.%f', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d'):
+                    try:
+                        m_dt_obj = datetime.strptime(m_dt, fmt)
+                        break
+                    except ValueError:
+                        pass
+            time_diff_sec = abs((dt_target - m_dt_obj).total_seconds()) if (dt_target and m_dt_obj) else 99999999
+            time_diff_h = time_diff_sec / 3600.0
+
+            if dist_m < 1000:
+                d_str = f'{dist_m:.0f}m' if dist_m < 1000 else f'{dist_m/1000:.1f}km'
+                t_str = f'{time_diff_sec/60:.0f}m' if time_diff_sec < 3600 else (f'{time_diff_h:.1f}h' if time_diff_h < 72 else f'{time_diff_h/24:.1f}d')
+                score = 8.0 + (dist_m / 50.0) + min(15.0, time_diff_h / 48.0)
+                reason = f'GPS location {d_str}, {t_str} apart'
+                candidates.append((score, m_alb, reason))
+
+    # 3. Check Moment Span (ONLY for defined event trips <= 45 days)
+    if dt_target:
+        cursor.execute('''
+            SELECT 
+                a.MomentsAlbumName,
+                min(a.date_created_utc) as min_dt,
+                max(a.date_created_utc) as max_dt,
+                (strftime('%s', max(a.date_created_utc)) - strftime('%s', min(a.date_created_utc))) / 86400 as span_days
+            FROM assets a
+            WHERE a.MomentsAlbumName IS NOT NULL AND a.MomentsAlbumName != ''
+              AND LOWER(a.MomentsAlbumName) NOT IN ('ignore', 'skippublishing', 'topscore excluded')
+            GROUP BY a.MomentsAlbumName
+            HAVING span_days <= 45 AND min_dt <= ? AND max_dt >= ?
+        ''', (dt_utc_str, dt_utc_str))
+        for m_alb, min_dt, max_dt, span_days in cursor.fetchall():
+            if valid_albums and m_alb not in valid_albums:
+                continue
+            score = 6.0
+            reason = f'inside event span ({min_dt[:10]} to {max_dt[:10]})'
+            candidates.append((score, m_alb, reason))
+
+    # 4. Temporal Proximity (Within +/- 7 days)
+    if dt_target:
+        cursor.execute('''
+            SELECT a.MomentsAlbumName, a.original_filename, a.date_created_utc,
+                   ze.ZCAMERAMODEL
+            FROM assets a
+            LEFT JOIN ZASSET za ON a.asset_id = za.ZUUID
+            LEFT JOIN ZEXTENDEDATTRIBUTES ze ON za.ZEXTENDEDATTRIBUTES = ze.Z_PK
+            WHERE a.MomentsAlbumName IS NOT NULL AND a.MomentsAlbumName != ''
+              AND LOWER(a.MomentsAlbumName) NOT IN ('ignore', 'skippublishing', 'topscore excluded')
+              AND a.date_created_utc BETWEEN datetime(?, '-7 days') AND datetime(?, '+7 days')
+              AND a.asset_id != ?
+            ORDER BY abs(strftime('%s', a.date_created_utc) - strftime('%s', ?))
+            LIMIT 5
+        ''', (dt_utc_str, dt_utc_str, asset_id, dt_utc_str))
+        for m_alb, m_fn, m_dt, m_cam in cursor.fetchall():
+            if valid_albums and m_alb not in valid_albums:
+                continue
+            m_dt_obj = None
+            if m_dt:
+                for fmt in ('%Y-%m-%d %H:%M:%S.%f', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d'):
+                    try:
+                        m_dt_obj = datetime.strptime(m_dt, fmt)
+                        break
+                    except ValueError:
+                        pass
+            time_diff_sec = abs((dt_target - m_dt_obj).total_seconds()) if (dt_target and m_dt_obj) else 99999999
+            time_diff_h = time_diff_sec / 3600.0
+
+            score = 15.0 + min(30.0, time_diff_h)
+            t_str = f'{time_diff_sec/60:.0f}m' if time_diff_sec < 3600 else (f'{time_diff_h:.1f}h' if time_diff_h < 48 else f'{time_diff_h/24:.1f}d')
+            reasons = [f'{t_str} apart']
+            if cam_model and m_cam and cam_model.strip() == m_cam.strip():
+                score -= 4.0
+                reasons.append(f'camera {cam_model}')
+            candidates.append((score, m_alb, ', '.join(reasons)))
+
+    if not candidates:
+        return None
+
+    album_best = {}
+    for sc, alb, rsn in candidates:
+        if alb not in album_best or sc < album_best[alb][0]:
+            album_best[alb] = (sc, rsn)
+
+    sorted_albs = sorted(album_best.items(), key=lambda x: x[1][0])
+    best_alb, (best_sc, best_rsn) = sorted_albs[0]
+    return best_alb, best_rsn
+
 def ensure_smart_album_exists(cursor, conn, latest_month, auto_apply=False):
     """
     Ensures the required Smart Album exists in Apple Photos before proposing migration off of 000 / 100E.
@@ -560,6 +764,72 @@ def ensure_smart_album_exists(cursor, conn, latest_month, auto_apply=False):
         release_planner_lock()
         sys.exit(0)
 
+def get_device_ownership_for_month(cursor, camera_model, month_str):
+    """
+    Determines whether a camera model was actively owned/in use during month_str (YYYY-MM),
+    and resolves its owner.
+    
+    Returns:
+        is_active (bool): True if the device was active in month_str, False if outside ownership dates.
+        owner_name (str): Name of the owner or 'Shared/Other'.
+        status_note (str): Informational note (e.g. 'Active', 'ended 2024-12-30', 'starts 2026-06-11').
+    """
+    month_start = f"{month_str}-01"
+    try:
+        dt = datetime.strptime(month_str, "%Y-%m")
+        next_month = (dt.replace(day=28) + timedelta(days=4)).replace(day=1)
+        month_end = (next_month - timedelta(days=1)).strftime("%Y-%m-%d")
+    except Exception:
+        month_end = f"{month_str}-31"
+
+    try:
+        cursor.execute("""
+            SELECT id, owner_name, start_date, end_date
+            FROM device_owners
+            WHERE camera_model = ?
+            ORDER BY 
+                CASE 
+                    WHEN start_date IS NOT NULL AND end_date IS NOT NULL THEN 1
+                    WHEN start_date IS NOT NULL OR end_date IS NOT NULL THEN 2
+                    ELSE 3 
+                END ASC,
+                updated_at_utc DESC
+        """, (camera_model,))
+        rows = cursor.fetchall()
+        
+        if rows:
+            overlapping_rows = []
+            for r_id, r_owner, r_start, r_end in rows:
+                starts_before_month_end = (r_start is None or r_start <= month_end)
+                ends_after_month_start = (r_end is None or r_end >= month_start)
+                if starts_before_month_end and ends_after_month_start:
+                    overlapping_rows.append((r_owner, r_start, r_end))
+            
+            if overlapping_rows:
+                r_owner, r_start, r_end = overlapping_rows[0]
+                period_str = ""
+                if r_start or r_end:
+                    period_str = f" ({r_start or '...'} -> {r_end or 'Present'})"
+                return True, r_owner, f"Active{period_str}"
+            else:
+                latest_end = max((r[3] for r in rows if r[3] is not None), default=None)
+                earliest_start = min((r[2] for r in rows if r[2] is not None), default=None)
+                if latest_end and latest_end < month_start:
+                    return False, rows[0][1], f"ended {latest_end}"
+                elif earliest_start and earliest_start > month_end:
+                    return False, rows[0][1], f"starts {earliest_start}"
+                else:
+                    return False, rows[0][1], "outside ownership period"
+    except Exception as e:
+        logger.debug(f"Error checking device ownership for {camera_model}: {e}")
+
+    # Fallback to static mapping in constants
+    from constants import DEVICE_OWNER_MAPPING
+    if camera_model in DEVICE_OWNER_MAPPING:
+        return True, DEVICE_OWNER_MAPPING[camera_model], "Default Mapping"
+
+    return True, "Shared/Other", "Default Fallback"
+
 def check_active_sources_import_status(cursor, conn, month, auto_apply):
     """
     Checks if all active camera models have imported assets for the proposed month.
@@ -577,8 +847,20 @@ def check_active_sources_import_status(cursor, conn, month, auto_apply):
 
         for month_str in months_to_check:
             source_metadata = []
-            # We use conditional aggregation (CASE WHEN) to get the range for the target month 
-            # while still being able to group by camera model.
+            
+            # Determine active vs inactive status for each camera model in ACTIVE_CAMERA_MODELS
+            model_ownership_status = {}
+            active_expected_models = set()
+            inactive_models = []
+            for model in ACTIVE_CAMERA_MODELS:
+                is_active, owner_name, status_note = get_device_ownership_for_month(cursor, model, month_str)
+                model_ownership_status[model] = (is_active, owner_name, status_note)
+                if is_active:
+                    active_expected_models.add(model)
+                else:
+                    inactive_models.append((model, owner_name, status_note))
+
+            # Query Photos.sqlite for all candidate models
             query = """
                 SELECT 
                     xa.ZCAMERAMODEL,
@@ -606,18 +888,31 @@ def check_active_sources_import_status(cursor, conn, month, auto_apply):
 
             cursor.execute(query, [month_str] * 6 + ACTIVE_CAMERA_MODELS + [month_str + "-01", month_str + "-01"])
             results = cursor.fetchall()
-            found_models = set()
+            results_by_model = {r[0]: r for r in results}
 
-            for row in results:
-                model, make, count, f_min, f_max, d_min, d_max, involved_import_ids = row
+            found_models = set()
+            model_counts = {}
+
+            # Process models that were found or expected
+            for model in ACTIVE_CAMERA_MODELS:
+                is_active, owner_name, status_note = model_ownership_status[model]
+                
+                if model in results_by_model:
+                    row = results_by_model[model]
+                    m_model, make, count, f_min, f_max, d_min, d_max, involved_import_ids = row
+                else:
+                    make, count, f_min, f_max, d_min, d_max, involved_import_ids = None, 0, None, None, None, None, None
+                    row = (model, make, count, f_min, f_max, d_min, d_max, involved_import_ids)
+
+                model_counts[model] = count
                 num_min = None
                 num_max = None
                 gap_info = ""
+
                 if count > 0:
                     found_models.add(model)
 
                     # Reasonability check: parse numeric part from filenames (ignoring extensions)
-                    # We only attempt this if the filename looks like a standard sequential pattern (Prefix + Digits)
                     seq_pattern = r'^([a-zA-Z_-]+)(\d+)$'
                     if f_min:
                         m = re.match(seq_pattern, os.path.splitext(f_min)[0])
@@ -627,56 +922,115 @@ def check_active_sources_import_status(cursor, conn, month, auto_apply):
                         if m: num_max = int(m.group(2))
 
                     if num_min is not None and num_max is not None:
-                        # We use abs because string MIN/MAX might flip if sequence is not zero-padded
                         expected_range = abs(num_max - num_min) + 1
                         if expected_range > count:
                             gap_info = f" | ⚠️ Reasonability: {expected_range} expected vs {count} found (gap of {expected_range - count})"
 
-                # Continuity check with previous month's confirmed imports
-                continuity_info = ""
-                previous_month = (datetime.strptime(month_str, '%Y-%m').replace(day=1) - timedelta(days=1)).strftime('%Y-%m')
-                cursor.execute("""
-                    SELECT MAX(max_filename), MAX(max_date)
-                    FROM imports
-                    WHERE camera_model = ? AND months_detected LIKE ? AND sequencing_confirmed = 1
-                """, (model, f'%{previous_month}%')) # Use LIKE for months_detected as it's comma-separated
-                prev_month_data = cursor.fetchone()
-                prev_max_filename, prev_max_date = prev_month_data if prev_month_data else (None, None)
+                    # Continuity check with previous month's confirmed imports
+                    continuity_info = ""
+                    previous_month = (datetime.strptime(month_str, '%Y-%m').replace(day=1) - timedelta(days=1)).strftime('%Y-%m')
+                    cursor.execute("""
+                        SELECT MAX(max_filename), MAX(max_date)
+                        FROM imports
+                        WHERE camera_model = ? AND months_detected LIKE ? AND sequencing_confirmed = 1
+                    """, (model, f'%{previous_month}%'))
+                    prev_month_data = cursor.fetchone()
+                    prev_max_filename, prev_max_date = prev_month_data if prev_month_data else (None, None)
 
-                if prev_max_filename and num_min is not None:
-                    prev_num_max = None
-                    prev_nums = re.findall(r'(\d+)', os.path.splitext(prev_max_filename)[0])
-                    if prev_nums: prev_num_max = int(prev_nums[-1])
+                    if prev_max_filename and num_min is not None:
+                        prev_num_max = None
+                        prev_nums = re.findall(r'(\d+)', os.path.splitext(prev_max_filename)[0])
+                        if prev_nums: prev_num_max = int(prev_nums[-1])
 
-                    if prev_num_max is not None and num_min > prev_num_max + 1:
-                        continuity_info += f" | ⚠️ Filename gap from {previous_month}: {prev_max_filename} -> {f_min}"
-                    elif prev_num_max is not None and num_min <= prev_num_max:
-                        continuity_info += f" | ⚠️ Filename overlap/reset from {previous_month}: {prev_max_filename} -> {f_min}"
-                
-                if prev_max_date and d_min:
-                    # Simple date string comparison for YYYY-MM-DD HH:MM:SS
-                    if d_min < prev_max_date:
-                        continuity_info += f" | ⚠️ Date overlap from {previous_month}: {prev_max_date} -> {d_min}"
+                        if prev_num_max is not None and num_min > prev_num_max + 1:
+                            continuity_info += f" | ⚠️ Filename gap from {previous_month}: {prev_max_filename} -> {f_min}"
+                        elif prev_num_max is not None and num_min <= prev_num_max:
+                            continuity_info += f" | ⚠️ Filename overlap/reset from {previous_month}: {prev_max_filename} -> {f_min}"
+                    
+                    if prev_max_date and d_min:
+                        if d_min < prev_max_date:
+                            continuity_info += f" | ⚠️ Date overlap from {previous_month}: {prev_max_date} -> {d_min}"
 
-                logger.info(f"📸 Month: {month_str} | Source: {model:20} | Count: {count:4} | Files: {f_min} -> {f_max} | Dates: {d_min} to {d_max}{gap_info}{continuity_info}")
-                source_metadata.append({
-                    'row': row,
-                    'gap_info': gap_info,
-                    'continuity_info': continuity_info
-                })
+                    logger.info(f"📸 Month: {month_str} | Source: {model:20} | Owner: {owner_name:12} | Count: {count:4} | Files: {f_min} -> {f_max} | Dates: {d_min} to {d_max}{gap_info}{continuity_info}")
+                    source_metadata.append({
+                        'row': row,
+                        'gap_info': gap_info,
+                        'continuity_info': continuity_info,
+                        'owner': owner_name
+                    })
+                elif is_active:
+                    # Active source expected in this month, but count is 0
+                    logger.info(f"📸 Month: {month_str} | Source: {model:20} | Owner: {owner_name:12} | Count:    0 | Files: None -> None | Dates: None to None")
 
-            missing_models = set(ACTIVE_CAMERA_MODELS) - found_models
+            # Report inactive models (outside date range)
+            if inactive_models:
+                inactive_strs = [f"{m} ({own}: {note})" for m, own, note in inactive_models]
+                logger.info(f"ℹ️ Inactive devices in {month_str} (outside ownership dates): {', '.join(inactive_strs)}")
+
+            # Family Member Import Coverage & Matching
+            owner_coverage = {}
+            for model in active_expected_models:
+                _, owner_name, _ = model_ownership_status[model]
+                if owner_name not in owner_coverage:
+                    owner_coverage[owner_name] = {
+                        'total_assets': 0,
+                        'active_devices': [],
+                        'devices_with_assets': [],
+                        'zero_devices': []
+                    }
+                cnt = model_counts.get(model, 0)
+                owner_coverage[owner_name]['active_devices'].append(model)
+                owner_coverage[owner_name]['total_assets'] += cnt
+                if cnt > 0:
+                    owner_coverage[owner_name]['devices_with_assets'].append((model, cnt))
+                else:
+                    owner_coverage[owner_name]['zero_devices'].append(model)
+
+            logger.info(f"👥 Family Member Import Coverage ({month_str}):")
+            for owner, data in sorted(owner_coverage.items()):
+                if data['total_assets'] > 0:
+                    dev_summary = ', '.join(f"{m}: {c:,} assets" for m, c in data['devices_with_assets'])
+                    logger.info(f"   • {owner:12}: ✅ Matched ({dev_summary})")
+                else:
+                    dev_list = ', '.join(data['active_devices'])
+                    logger.info(f"   • {owner:12}: ⚠️ No imports (0 assets across: {dev_list})")
+
+            # Missing active models (only those active during month_str with count == 0)
+            missing_models = active_expected_models - found_models
 
             if missing_models:
-                logger.warning(f"⚠️ Missing imports for active camera models in {month_str}: {', '.join(missing_models)}")
+                missing_details = []
+                for m in sorted(missing_models):
+                    _, m_owner, _ = model_ownership_status[m]
+                    if owner_coverage.get(m_owner, {}).get('total_assets', 0) > 0:
+                        covered_via = ', '.join(dev for dev, _ in owner_coverage[m_owner]['devices_with_assets'])
+                        missing_details.append(f"{m} ({m_owner} - note: owner already covered by {covered_via})")
+                    else:
+                        missing_details.append(f"{m} ({m_owner})")
+
+                logger.warning(f"⚠️ Missing imports for active camera models in {month_str}: {', '.join(missing_details)}")
+
+                # Check if any non-shared family member has 0 imports
+                missing_family_members = [
+                    owner for owner, data in owner_coverage.items()
+                    if data['total_assets'] == 0 and owner.lower() not in ('shared', 'shared/other', 'cohens', 'cohens bulgaria')
+                ]
+
                 if not auto_apply:
+                    if missing_family_members:
+                        print(f"\n⚠️  Warning: Missing imports for family member(s): {', '.join(missing_family_members)}")
+                    else:
+                        print(f"\n💡 All primary family members have imports for {month_str}.")
                     proceed_input = input(f"Some active sources are missing imports for {month_str}. Do you want to proceed? [y/N]: ")
                     if proceed_input.strip().lower() != 'y':
                         logger.info("Operation aborted by user due to missing active source imports.")
                         sys.exit(0)
                 else:
-                    logger.error(f"❌ Auto-apply aborted: Missing active source imports for {month_str}. Manual intervention required.")
-                    sys.exit(1)
+                    if missing_family_members:
+                        logger.error(f"❌ Auto-apply aborted: Missing active family member imports ({', '.join(missing_family_members)}) for {month_str}. Manual intervention required.")
+                        sys.exit(1)
+                    else:
+                        logger.info(f"ℹ️ Auto-apply proceeding: Missing sources are shared or secondary; all primary family members have imports.")
 
             # Per-source sequencing confirmation
             if not auto_apply:
@@ -743,7 +1097,8 @@ def check_active_sources_import_status(cursor, conn, month, auto_apply):
                         """, import_id_list + [model, make or "Unknown", month_str])
                         involved_assets = cursor.fetchall()
 
-                        print(f"Verifying {model} for {month_str}:")
+                        owner_str = f" (Owner: {entry.get('owner', 'Unknown')})" if entry.get('owner') else ""
+                        print(f"Verifying {model}{owner_str} for {month_str}:")
                         print(before_str)
                         print(f"  Current: {f_min} -> {f_max} ({d_min} to {d_max}){gap_info}{continuity_info}")
                         print(after_str)
@@ -1264,17 +1619,28 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                     threshold_report.append(f"👉 Note: Please assign moments to assets in new batches until the threshold reaches {historical_min:.4f} again.")
                 threshold_report.append("==================================================\n")
 
+                cursor.execute("SELECT DISTINCT album_name FROM moments WHERE parent_folder_name = 'Moments'")
+                valid_moment_albums = {r[0] for r in cursor.fetchall()}
+
                 if photos_db_attached:
                     cursor.execute("""
                         SELECT 
+                            v.asset_id,
                             v.original_filename, 
                             v.score_normalized, 
                             v.month, 
                             v.date_created_utc,
                             m.ZTITLE,
-                            m.ZSUBTITLE
+                            m.ZSUBTITLE,
+                            ast.import_id,
+                            COALESCE(za.ZLATITUDE, a.ZLATITUDE),
+                            COALESCE(za.ZLONGITUDE, a.ZLONGITUDE),
+                            ze.ZCAMERAMODEL
                         FROM ranked_assets_view v
                         JOIN month_batches mb ON v.month = mb.month
+                        JOIN assets ast ON ast.asset_id = v.asset_id
+                        LEFT JOIN ZASSET za ON za.ZUUID = v.asset_id
+                        LEFT JOIN ZEXTENDEDATTRIBUTES ze ON za.ZEXTENDEDATTRIBUTES = ze.Z_PK
                         LEFT JOIN photos_db.ZASSET a ON a.ZUUID = v.asset_id
                         LEFT JOIN photos_db.ZMOMENT m ON a.ZMOMENT = m.Z_PK
                         WHERE mb.status_code >= '600' AND (v.MomentsAlbumName IS NULL OR v.MomentsAlbumName = '')
@@ -1291,9 +1657,23 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                     """)
                 else:
                     cursor.execute("""
-                        SELECT v.original_filename, v.score_normalized, v.month, v.date_created_utc, NULL, NULL
+                        SELECT 
+                            v.asset_id,
+                            v.original_filename, 
+                            v.score_normalized, 
+                            v.month, 
+                            v.date_created_utc,
+                            NULL, 
+                            NULL,
+                            ast.import_id,
+                            za.ZLATITUDE,
+                            za.ZLONGITUDE,
+                            ze.ZCAMERAMODEL
                         FROM ranked_assets_view v
                         JOIN month_batches mb ON v.month = mb.month
+                        JOIN assets ast ON ast.asset_id = v.asset_id
+                        LEFT JOIN ZASSET za ON za.ZUUID = v.asset_id
+                        LEFT JOIN ZEXTENDEDATTRIBUTES ze ON za.ZEXTENDEDATTRIBUTES = ze.Z_PK
                         WHERE mb.status_code >= '600' AND (v.MomentsAlbumName IS NULL OR v.MomentsAlbumName = '')
                           AND v.score_normalized > 0.50
                         ORDER BY v.score_normalized DESC
@@ -1306,7 +1686,7 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                     threshold_report.append("⚠️  Unassigned High-Rank Assets (Need Moment Naming Decision)")
                     threshold_report.append("==================================================")
                     threshold_report.append("The following highly-ranked assets are not assigned to any Moment album in Apple Photos:")
-                    for fname, score, month, date_created, moment_title, moment_subtitle in unassigned:
+                    for aid, fname, score, month, date_created, moment_title, moment_subtitle, imp_id, lat, lon, cam_model in unassigned:
                         captured_str = "—"
                         if date_created:
                             try:
@@ -1332,14 +1712,28 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                         if moment_subtitle:
                             moment_parts.append(moment_subtitle.replace('\xa0', ' ').strip())
 
-                        suggested_info = ""
+                        closest_match = find_closest_existing_moment_album(
+                            cursor, aid, fname, date_created, imp_id, lat, lon, cam_model, valid_moment_albums
+                        )
+
+                        album_suggestions = []
+                        best_album_name = None
+                        if closest_match:
+                            best_album_name, best_reason = closest_match
+                            album_suggestions.append(f"Nearest Existing: \"{best_album_name}\" [{best_reason}]")
+
                         if moment_parts:
                             captured_date = captured_str[:10] if captured_str != "—" else (date_created[:10] if date_created else month)
-                            suggested_name = f"{captured_date} - {' - '.join(moment_parts)}"
-                            suggested_info = f", Suggested Album: {suggested_name}"
+                            suggested_new = f"{captured_date} - {' - '.join(moment_parts)}"
+                            if not best_album_name or best_album_name.lower() != suggested_new.lower():
+                                album_suggestions.append(f"Photos Moment: {suggested_new}")
+
+                        suggested_info = ""
+                        if album_suggestions:
+                            suggested_info = f", {', '.join(album_suggestions)}"
 
                         threshold_report.append(f" - {fname:<25} (Score: {score:.4f}, Captured: {captured_str}, Month: {month}{suggested_info})")
-                    threshold_report.append("👉 Please consider creating a corresponding album under 'Media Organizer on LaCie / Moments' in Apple Photos (creating the album is sufficient, no need to place the files inside).\n")
+                    threshold_report.append("👉 Please consider assigning these assets to the nearest existing album, or creating a corresponding album under 'Media Organizer on LaCie / Moments' in Apple Photos (creating the album is sufficient, no need to place the files inside).\n")
 
                 print('\n' + '\n'.join(threshold_report))
                 try:
@@ -2664,9 +3058,9 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                     m_name = m_name_raw[:26] + "..." if len(m_name_raw) > 29 else m_name_raw
                     print(f"{p_idx:<4} {m_name:<30} {m['display_stage']:<8} {avg_proposed:<10.4f} {curated:<8} {published:<10} {pending:<8} {m['can_publish_str']:<16} {propose_str:<24} {right_col_str}")
 
-                # Subsection 1: Ready for Publishing (New Assets in ToBeCurated)
+                # Subsection 1: Ready for Publishing (Action Required: Assets in ToBeCurated Need Review & Move to Curated)
                 if top_publishable_tbc:
-                    sub_title = f"--- 🚀 Ready for Publishing (New Assets in ToBeCurated - Top {len(top_publishable_tbc)}) "
+                    sub_title = f"--- ⚠️ 🚀 Ready for Publishing (Action Required: Assets in ToBeCurated Need Review & Move to Curated - Top {len(top_publishable_tbc)}) "
                     print(sub_title + "-" * max(0, 168 - len(sub_title)))
                     for entry in top_publishable_tbc:
                         m = entry['moment']
@@ -2680,11 +3074,11 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                         print_pending_row(curr_p_idx, entry, show_tbc_count=True)
                         curr_p_idx += 1
 
-                # Subsection 2: Ready for Publishing (No Assets in ToBeCurated)
+                # Subsection 2: Ready for Publishing (Fully Curated - No Assets in ToBeCurated)
                 if top_publishable_clean:
                     if top_publishable_tbc:
                         print("-" * 168)
-                    sub_title = f"--- 🚀 Ready for Publishing (No Assets in ToBeCurated - Top {len(top_publishable_clean)}) "
+                    sub_title = f"--- 🚀 Ready for Publishing (Fully Curated - No Assets in ToBeCurated, Ready to Export - Top {len(top_publishable_clean)}) "
                     print(sub_title + "-" * max(0, 168 - len(sub_title)))
                     for entry in top_publishable_clean:
                         m = entry['moment']
@@ -4675,7 +5069,13 @@ def main(auto_apply, no_sync=False):
                 # Only suggest if the next month hasn't even started (not in batches)
                 if next_month_str not in [b[0] for b in batches]:
                     logger.info(f"✨ Current pipeline progress: {latest_month_str} is complete.")
-                    logger.info(f"💡 Suggestion: Ready to start {next_month_str}. Ensure all active sources ({', '.join(ACTIVE_CAMERA_MODELS)}) are imported into Apple Photos.")
+                    active_for_next = []
+                    for m in ACTIVE_CAMERA_MODELS:
+                        is_act, own, _ = get_device_ownership_for_month(cursor, m, next_month_str)
+                        if is_act:
+                            active_for_next.append(f"{m} ({own})")
+                    sources_label = ', '.join(active_for_next) if active_for_next else ', '.join(ACTIVE_CAMERA_MODELS)
+                    logger.info(f"💡 Suggestion: Ready to start {next_month_str}. Ensure all active sources ({sources_label}) are imported into Apple Photos.")
 
     logger.info("=== ✅ Suggested Action ===")
 

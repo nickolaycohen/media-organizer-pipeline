@@ -78,7 +78,7 @@ Launch the interactive terminal selector or execute any pipeline tool via fast s
 # Or launch any pipeline tool directly via subcommands:
 ./run.sh planner              # Interactive Pipeline Planner (menu, batch mgmt, curation)
 ./run.sh refresh              # Background database refresh service and metadata sync
-./run.sh executor             # Execute planned batch operations
+./run.sh monitor              # Monitor background Pipeline Executor & nightly backup status
 
 ./run.sh triage               # Intake Triage Gateway on default preprocessing folder
 ./run.sh triage /path/to/dir  # Intake Triage on custom directory
@@ -170,10 +170,12 @@ python3 scripts/pipeline_planner.py
 * **Locking**: The planner and background service use a shared bidirectional lock. The planner will automatically wait and probe every 10 seconds if a background sync is currently running, and the background service will exit immediately if you are currently using the interactive planner to prevent write contention.
 * **Stale Warnings**: At startup, the planner checks if the source Photos database contains changes since the last background refresh. If it does, it will log a warning indicating that a refresh is recommended.
 
-### Step 3: Execute the Plan (For Batch Management)
-Once a monthly batch is planned under Batch Management, run the executor to perform the file operations.
+### Step 3: Monitor Background Execution (Automated)
+Once a monthly batch is planned under Batch Management, the background cron watchdog (`pipeline_executor.py --cron`) automatically executes the queue outside the nightly backup window (`02:55 – 06:15 AM`). Monitor real-time progress and ETA via:
 ```bash
-python3 scripts/pipeline_executor.py
+python3 scripts/monitor_executor.py
+# Or continuous live refresh:
+python3 scripts/monitor_executor.py --watch
 ```
 
 ---

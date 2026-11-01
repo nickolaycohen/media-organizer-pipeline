@@ -4904,33 +4904,9 @@ def main(auto_apply, no_sync=False):
     check_conn.close()
 
     if active_plans:
-        logger.info(f"📋 Current execution queue ({len(active_plans)} batch(es) pending):")
+        logger.info(f"📋 Current execution queue ({len(active_plans)} batch(es) pending — managed automatically by background executor):")
         for plan_id, p_month, p_time in active_plans:
             logger.info(f"   • Queue ID {plan_id}: Batch {p_month} (queued at {p_time})")
-
-        if not auto_apply:
-            print("\n📋 Active execution queue:")
-            for plan_id, p_month, p_time in active_plans:
-                print(f"   • Queue ID {plan_id}: Batch {p_month} (queued at {p_time})")
-            
-            queue_choice = input("\nOptions: [E]xecute queue now | [C]ontinue planning next batch | [R]eset/clear queue | [Q]uit [E/c/r/q]: ").strip().lower()
-            if queue_choice == 'e':
-                executor_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pipeline_executor.py")
-                logger.info(f"🚀 Launching pipeline_executor for queued batches: {executor_path}")
-                os.execv(sys.executable, [sys.executable, executor_path])
-            elif queue_choice == 'r':
-                reset_conn = sqlite3.connect(MEDIA_ORGANIZER_DB_PATH)
-                reset_cursor = reset_conn.cursor()
-                reset_cursor.execute("UPDATE planned_execution SET active = 0 WHERE active = 1")
-                reset_conn.commit()
-                reset_conn.close()
-                logger.info("🗑️ Active execution queue cleared.")
-                active_plans = []
-            elif queue_choice == 'q':
-                logger.info("Exiting planner.")
-                sys.exit(0)
-            else:
-                logger.info("Proceeding to plan next batch...")
 
     # Run bootstrap steps before proceeding
     if not no_sync:
@@ -5484,20 +5460,13 @@ def main(auto_apply, no_sync=False):
             else:
                 logger.info(f"Enough Google Drive space available for upload. Free space: {human_readable_size(free_space)}, Staging size: {human_readable_size(staging_size)}")
 
-        logger.info("🚀 Executing planned steps...")
+        logger.info("🚀 Queuing planned steps for background executor...")
         set_planned_month(cursor, latest_month)
         conn.commit()
-        logger.info(f"📌 Month {latest_month} recorded in planned_execution for next pipeline run.")
+        logger.info(f"📌 Month {latest_month} recorded in planned_execution. Background executor will process it automatically (monitor via: python3 scripts/monitor_executor.py).")
 
         close_conn()
         release_planner_lock()
-
-        if not auto_apply:
-            exec_now = input("\n🚀 Would you like to start the pipeline executor now? [y/N]: ").strip().lower()
-            if exec_now == 'y':
-                executor_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pipeline_executor.py")
-                logger.info(f"🚀 Launching pipeline_executor: {executor_path}")
-                os.execv(sys.executable, [sys.executable, executor_path])
 
         if selected_type not in ['manual', 'retryable', 'pipeline']:
             logger.warning(f"Unknown transition type '{selected_type}' for current status {current_status}.")

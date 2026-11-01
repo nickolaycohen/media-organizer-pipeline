@@ -62,7 +62,7 @@ print_help() {
     echo -e "${BOLD}Subcommands:${RESET}"
     echo -e "  ${GREEN}planner${RESET}            Launch the interactive Pipeline Planner (menu, batch mgmt, curation)"
     echo -e "  ${GREEN}refresh | bg${RESET}       Run the background database refresh service and metadata sync"
-    echo -e "  ${GREEN}executor${RESET}           Execute planned batch operations (move, copy, organize)"
+    echo -e "  ${GREEN}monitor${RESET}            Monitor background Pipeline Executor & nightly backup status"
     echo ""
     echo -e "  ${CYAN}triage${RESET} [dir] [flags]  Run Intake Triage Gateway (--delete-duplicates, --ignore-duplicates, --dry-run)"
     echo -e "  ${CYAN}triage-skip-dup${RESET} [dir] Triage intake skipping duplicate copies (only route Review & New)"
@@ -96,7 +96,7 @@ interactive_menu() {
         echo -e "  ${BOLD}${GREEN}── 🚀 Core Pipeline ──${RESET}"
         echo -e "  ${BOLD} 1)${RESET} ${GREEN}Interactive Pipeline Planner${RESET}        ${DIM}(scripts/pipeline_planner.py)${RESET}"
         echo -e "  ${BOLD} 2)${RESET} ${GREEN}Background Database Refresh${RESET}         ${DIM}(scripts/bg_copy_db_service.py)${RESET}"
-        echo -e "  ${BOLD} 3)${RESET} ${GREEN}Execute Planned Batches${RESET}             ${DIM}(scripts/pipeline_executor.py)${RESET}"
+        echo -e "  ${BOLD} 3)${RESET} ${GREEN}Monitor Pipeline Executor & Backups${RESET} ${DIM}(scripts/monitor_executor.py)${RESET}"
         echo ""
         echo -e "  ${BOLD}${CYAN}── 🛡️ Intake & Triage Gateway ──${RESET}"
         echo -e "  ${BOLD} 4)${RESET} ${CYAN}Triage Intake (Default Folder)${RESET}      ${DIM}(/Volumes/LaCie/Storage/Priority 4/Media Preprocessing)${RESET}"
@@ -138,8 +138,8 @@ interactive_menu() {
                 read -r
                 ;;
             3)
-                echo -e "\n${GREEN}⚡ Launching Pipeline Batch Executor...${RESET}\n"
-                $PYTHON scripts/pipeline_executor.py
+                echo -e "\n${GREEN}📊 Launching Pipeline Executor & Backup Monitor...${RESET}\n"
+                $PYTHON scripts/monitor_executor.py
                 echo -e "\n${DIM}Press Enter to return to menu...${RESET}"
                 read -r
                 ;;
@@ -335,6 +335,10 @@ case "$1" in
     refresh|bg)
         shift
         exec $PYTHON scripts/bg_copy_db_service.py "$@"
+        ;;
+    monitor|status)
+        shift
+        exec $PYTHON scripts/monitor_executor.py "$@"
         ;;
     executor)
         shift

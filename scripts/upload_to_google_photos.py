@@ -502,6 +502,26 @@ def main(args):
     successful_uploads = []
     has_error = False
 
+    def flush_upload_batch(batch_records):
+        if not batch_records:
+            return
+        try:
+            flush_conn = get_connection()
+            flush_cur = flush_conn.cursor()
+            for f_hash, a_id in batch_records:
+                flush_cur.execute("""
+                    UPDATE assets SET
+                        file_hash = ?,
+                        uploaded_to_google = 1,
+                        updated_at_utc = datetime('now')
+                    WHERE asset_id = ?
+                """, (f_hash, a_id))
+            flush_conn.commit()
+            close_conn()
+            batch_records.clear()
+        except Exception as db_err:
+            logger.warning(f"Deferred incremental upload record save due to DB busy: {db_err}")
+
     for idx, (file_path, file_size, metadata) in enumerate(files_to_process, start=1):
         filename = os.path.basename(file_path)
         file_size_mb = file_size / (1024 * 1024)
@@ -546,6 +566,8 @@ def main(args):
 
                 logger.info(f"[{idx}/{total_files}] Uploaded: {filename} - Est. Completion: {remaining_completion_str} ({remaining_eta_minutes:.1f}m remaining)")
                 successful_uploads.append((file_hash, metadata.get("asset_id")))
+                if len(successful_uploads) >= 5:
+                    flush_upload_batch(successful_uploads)
             except Exception as e:
                 logger.error(f"[{idx}/{total_files}] Failed to upload {filename}: {e}")
                 logger.error("Halting upload process due to error.")

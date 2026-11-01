@@ -13,33 +13,58 @@ import argparse
 import sqlite3
 import errno
 import re
+from pathlib import Path
 from datetime import datetime
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(BASE_DIR, ".."))
-EXECUTOR_LOCK_FILE = os.path.join(PROJECT_ROOT, "db/executor.lock")
-BACKUP_LOCK_FILE = os.path.join(PROJECT_ROOT, "db/backup.lock")
-DB_PATH = os.path.join(PROJECT_ROOT, "db/media_organizer.db")
-LOG_PATH = os.path.join(PROJECT_ROOT, "logs/media_organizer.log")
-BACKUP_LOG_PATH = os.path.join(PROJECT_ROOT, "logs/backup.log")
+SIBLING_ROOT = os.path.abspath(os.path.join(PROJECT_ROOT, "../../..", "media-organizer-pipeline"))
+
+def resolve_path(rel_path):
+    primary = os.path.join(PROJECT_ROOT, rel_path)
+    if os.path.exists(primary) and (os.path.islink(primary) or os.path.getsize(primary) > 0 or "lock" in rel_path):
+        return primary
+    if os.path.exists(SIBLING_ROOT):
+        sibling = os.path.join(SIBLING_ROOT, rel_path)
+        if os.path.exists(sibling):
+            return sibling
+    return primary
+
+EXECUTOR_LOCK_FILE = resolve_path("db/executor.lock")
+BACKUP_LOCK_FILE = resolve_path("db/backup.lock")
+DB_PATH = resolve_path("db/media_organizer.db")
+LOG_PATH = resolve_path("logs/media_organizer.log")
+BACKUP_LOG_PATH = resolve_path("logs/backup.log")
 
 def get_executor_status():
-    if not os.path.exists(EXECUTOR_LOCK_FILE):
-        return False, None
-    try:
-        with open(EXECUTOR_LOCK_FILE, "r") as f:
-            pid = int(f.read().strip())
-        os.kill(pid, 0)
-        return True, pid
-    except OSError as err:
-        if err.errno == errno.ESRCH:
-            return False, None
-        return True, pid
-    except Exception:
-        return False, None
+    lock_files = [EXECUTOR_LOCK_FILE]
+    if os.path.exists(SIBLING_ROOT):
+        sib_lock = os.path.join(SIBLING_ROOT, "db/executor.lock")
+        if sib_lock not in lock_files:
+            lock_files.append(sib_lock)
+            
+    for lf in lock_files:
+        if os.path.exists(lf):
+            try:
+                with open(lf, "r") as f:
+                    pid = int(f.read().strip())
+                os.kill(pid, 0)
+                return True, pid
+            except OSError as err:
+                if err.errno == errno.ESRCH:
+                    pass
+                else:
+                    return True, pid
+            except Exception:
+                pass
+    return False, None
 
 def get_backup_status():
-    return os.path.exists(BACKUP_LOCK_FILE)
+    if os.path.exists(BACKUP_LOCK_FILE):
+        return True
+    if os.path.exists(SIBLING_ROOT) and os.path.exists(os.path.join(SIBLING_ROOT, "db/backup.lock")):
+        return True
+    return False
 
 def display_dashboard():
     os.system('clear' if os.name == 'posix' else 'cls')
@@ -60,19 +85,25 @@ def display_dashboard():
     try:
         conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
         cursor = conn.cursor()
-        cursor.execute("SELECT id, planned_month, set_at_utc FROM planned_execution WHERE active = 1 ORDER BY id ASC")
+        cursor.execute("""
+            SELECT pe.id, pe.planned_month, pe.set_at_utc, mb.status_code, bs.short_label
+            FROM planned_execution pe
+            LEFT JOIN month_batches mb ON pe.planned_month = mb.month
+            LEFT JOIN batch_status bs ON mb.status_code = bs.code
+            WHERE pe.active = 1
+            ORDER BY pe.id ASC
+        """)
         queue = cursor.fetchall()
 
         print(f"\n📋 Execution Queue ({len(queue)} batches queued):")
         if not queue:
             print("  (Queue is currently empty)")
         else:
-            for idx, (qid, month, set_at) in enumerate(queue):
-                cursor.execute("SELECT status_code, updated_at_utc FROM month_batches WHERE month = ?", (month,))
-                brow = cursor.fetchone()
-                status_code = brow[0] if brow else "Unknown"
+            for idx, (qid, month, set_at, status_code, label) in enumerate(queue):
+                status_code = status_code or "Unknown"
+                status_str = f"{status_code} ({label})" if label else status_code
                 marker = "▶️ [IN PROGRESS]" if idx == 0 and is_running else "⏳ [QUEUED]"
-                print(f"  {marker} Month: {month:<7} | Status: {status_code:<5} | Queue ID: {qid:<3} | Scheduled: {set_at}")
+                print(f"  {marker} Month: {month:<7} | Status: {status_str:<24} | Queue ID: {qid:<3} | Scheduled: {set_at}")
         conn.close()
     except Exception as e:
         print(f"  ⚠️ Error querying execution queue: {e}")
@@ -81,19 +112,36 @@ def display_dashboard():
     print("\n📊 Recent Executor Activity:")
     current_step = "—"
     upload_progress = None
-    if os.path.exists(LOG_PATH):
+    target_log = LOG_PATH
+    if not os.path.exists(target_log) and os.path.exists(SIBLING_ROOT):
+        target_log = os.path.join(SIBLING_ROOT, "logs/media_organizer.log")
+
+    if os.path.exists(target_log):
         try:
-            with open(LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
-                lines = f.readlines()[-30:]
+            with open(target_log, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()[-120:]
             
             # Find latest heartbeat and upload progress
+            live_asset_ratio = None
             for line in reversed(lines):
                 if "⏱️ Heartbeat:" in line and current_step == "—":
                     current_step = line.strip().split("⏱️ Heartbeat:")[-1].strip()
+                    current_step = current_step.replace(
+                        "2.4 Partial upload to Google Photos due to insufficient space",
+                        "2.4 Upload to Google Account from Staging Folder"
+                    )
                 if "[upload_to_google_photos:" in line and "Uploading:" in line and not upload_progress:
-                    m = re.search(r'\[(\d+/\d+)\] Uploading: ([^ ]+) \(([^)]+)\) - Est\. Completion: ([^ ]+) \(([^)]+)\)', line)
+                    m = re.search(r'\[(\d+)/(\d+)\] Uploading: (.+?) \(([\d.]+\s*MB)\) - Est\. Completion: ([^ ]+) \(([^)]+)\)', line)
                     if m:
-                        upload_progress = f"Asset {m.group(1)}: {m.group(2)} ({m.group(3)}) | ETA: {m.group(4)} ({m.group(5)})"
+                        idx_num = int(m.group(1))
+                        tot_num = int(m.group(2))
+                        done_num = max(0, idx_num - 1)
+                        pct_val = (done_num / tot_num * 100.0) if tot_num > 0 else 0.0
+                        live_asset_ratio = f"{done_num}/{tot_num} ({pct_val:.1f}%)"
+                        upload_progress = f"Asset {m.group(1)}/{m.group(2)}: {m.group(3)} ({m.group(4)}) | ETA: {m.group(5)} ({m.group(6)})"
+
+            if current_step != "—" and live_asset_ratio:
+                current_step = re.sub(r'Assets:\s*0/\d+', f'Assets: {live_asset_ratio}', current_step)
 
             if current_step != "—":
                 print(f"  ⏱️ Current Step: {current_step}")
@@ -141,4 +189,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

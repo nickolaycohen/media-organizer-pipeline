@@ -12,6 +12,7 @@ from utils.utils import set_batch_status
 from utils.logger import setup_logger
 from constants import LOG_PATH, APPLE_PHOTOS_DB_COPY_PATH, APPLE_PHOTOS_DB_LOCK_PATH, MEDIA_ORGANIZER_DB_PATH, STAGING_ROOT, is_in_backup_window
 import json
+import re
 import socket
 import errno
 import sqlite3
@@ -101,6 +102,37 @@ def report_status(c_month, c_plan_id, c_step, step_start, b_start, executed_coun
             except Exception:
                 pass
 
+    display_step = c_step
+    if display_step == "2.4 Partial upload to Google Photos due to insufficient space":
+        display_step = "2.4 Upload to Google Account from Staging Folder"
+
+    # Check live upload progress from log tail if an upload is actively running
+    live_uploaded = None
+    live_total = None
+    live_eta = None
+    if c_month and display_step and "2.4" in display_step and os.path.exists(LOG_PATH):
+        try:
+            with open(LOG_PATH, "r", encoding="utf-8", errors="replace") as lf:
+                recent_lines = lf.readlines()[-40:]
+            for rline in reversed(recent_lines):
+                if "[upload_to_google_photos:" in rline:
+                    m_up = re.search(r'\[(\d+)/(\d+)\]\s+(Uploaded|Uploading):.*Est\.\s+Completion:\s+([^\s]+)\s+\(([^)]+)\)', rline)
+                    if m_up:
+                        idx_num = int(m_up.group(1))
+                        tot_num = int(m_up.group(2))
+                        action_type = m_up.group(3)
+                        live_uploaded = idx_num if action_type == "Uploaded" else max(0, idx_num - 1)
+                        live_total = tot_num
+                        live_eta = f"{m_up.group(4)} ({m_up.group(5)})"
+                        break
+        except Exception:
+            pass
+
+    eff_uploaded = max(uploaded_assets, live_uploaded) if live_uploaded is not None else uploaded_assets
+    eff_total = live_total if (live_total is not None and live_total > 0 and uploaded_assets == 0) else total_assets
+    if eff_total > 0 and eff_uploaded > eff_total:
+        eff_total = total_assets
+
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     lines = []
     lines.append("\n" + "=" * 90)
@@ -110,12 +142,13 @@ def report_status(c_month, c_plan_id, c_step, step_start, b_start, executed_coun
         b_elapsed = format_duration(time.time() - b_start) if b_start else "0s"
         s_elapsed = format_duration(time.time() - step_start) if step_start else "0s"
         lines.append(f" • Active Batch:      {c_month} (Queue ID: {c_plan_id}, batch elapsed: {b_elapsed})")
-        if c_step:
-            lines.append(f" • Current Step:      {c_step} (step elapsed: {s_elapsed})")
+        if display_step:
+            lines.append(f" • Current Step:      {display_step} (step elapsed: {s_elapsed})")
         lines.append(f" • Batch Status:      {batch_status_code} ({batch_status_desc})")
-        if total_assets > 0:
-            pct = (uploaded_assets / total_assets) * 100.0
-            lines.append(f" • Asset Progress:    {uploaded_assets} / {total_assets} uploaded ({pct:.1f}%) | {staged_count} staged export file(s)")
+        if eff_total > 0:
+            pct = (eff_uploaded / eff_total) * 100.0
+            eta_line_str = f" | ETA: {live_eta}" if live_eta else ""
+            lines.append(f" • Asset Progress:    {eff_uploaded} / {eff_total} uploaded ({pct:.1f}%){eta_line_str} | {staged_count} staged export file(s)")
         else:
             lines.append(f" • Asset Progress:    {staged_count} staged export file(s)")
     else:
@@ -131,7 +164,9 @@ def report_status(c_month, c_plan_id, c_step, step_start, b_start, executed_coun
 
     report_text = "\n".join(lines)
     print(report_text, flush=True)
-    logger.info(f"⏱️ Heartbeat: Batch {c_month or 'None'} | Step: {c_step or 'None'} | Assets: {uploaded_assets}/{total_assets} | Queue pending: {pending_queue_count}")
+    pct_str = f" ({(eff_uploaded / eff_total) * 100.0:.1f}%)" if eff_total > 0 else ""
+    eta_hb_str = f" | ETA: {live_eta}" if live_eta else ""
+    logger.info(f"⏱️ Heartbeat: Batch {c_month or 'None'} | Step: {display_step or 'None'} | Assets: {eff_uploaded}/{eff_total}{pct_str}{eta_hb_str} | Queue pending: {pending_queue_count}")
 
 def status_reporter_worker(interval_sec=180):
     while True:
@@ -572,7 +607,7 @@ def get_pipeline_steps(script_dir, use_mock_data=False):
             PipelineStep("2.1 Verify Smart Album", "100", [sys.executable, os.path.join(script_dir, "verify_smart_album.py"), "{month}"]),
             PipelineStep("2.2 Export Assets", "200", [sys.executable, os.path.join(script_dir, "export_photos_applescript.py"), "{month}"]),
             PipelineStep("2.2.5 Remove duplicate assets based on extension and size", "210", [sys.executable, os.path.join(script_dir, "deduplicate_assets.py"), "{month}"]),
-            PipelineStep("2.4 Partial upload to Google Photos due to insufficient space", "399", [sys.executable, os.path.join(script_dir, "upload_to_google_photos.py"), "{month}"]),
+            PipelineStep("2.4 Upload to Google Account from Staging Folder", "399", [sys.executable, os.path.join(script_dir, "upload_to_google_photos.py"), "{month}"]),
             PipelineStep("3.2 Pull Google Photos Favorites and update asset flags", "550", [sys.executable, os.path.join(script_dir, "pull_google_favorites.py"), "{month}"]),
             PipelineStep("3.4 Rank Assets by Score", "600", [sys.executable, os.path.join(script_dir, "rank_assets_by_score.py"), "{month}"]),
         ]
@@ -591,7 +626,10 @@ def get_pipeline_steps(script_dir, use_mock_data=False):
     """)
     rows = cursor.fetchall()
     for pipeline_stage, full_description, code, script_name, transition_type in rows:
-        label = f"{pipeline_stage} {full_description}"
+        if code == "399":
+            label = f"{pipeline_stage} Upload to Google Account from Staging Folder"
+        else:
+            label = f"{pipeline_stage} {full_description}"
         cmd = []
         if script_name:
             script_path = os.path.join(script_dir, script_name.split()[0])

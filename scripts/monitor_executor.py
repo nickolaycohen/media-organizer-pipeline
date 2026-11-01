@@ -141,7 +141,7 @@ def display_dashboard():
                         upload_progress = f"Asset {m.group(1)}/{m.group(2)}: {m.group(3)} ({m.group(4)}) | ETA: {m.group(5)} ({m.group(6)})"
 
             if current_step != "—" and live_asset_ratio:
-                current_step = re.sub(r'Assets:\s*0/\d+', f'Assets: {live_asset_ratio}', current_step)
+                current_step = re.sub(r'Assets:\s*\d+/\d+(?:\s*\([\d.]+%\))?', f'Assets: {live_asset_ratio}', current_step)
 
             if current_step != "—":
                 print(f"  ⏱️ Current Step: {current_step}")

@@ -342,6 +342,7 @@ def main(args):
     # or that exceed the max upload size threshold.
     files_to_process = []
     already_uploaded_size = 0
+    already_uploaded_count = 0
     total_eligible_size = 0
     skipped_count = 0
     skipped_oversized_count = 0
@@ -375,6 +376,7 @@ def main(args):
 
         if metadata.get("uploaded_to_google") == 1:
             already_uploaded_size += file_size
+            already_uploaded_count += 1
             skipped_count += 1
             logger.debug(f"⏭️ Skipping {disk_filename}: Already marked as uploaded in database.")
             continue
@@ -522,13 +524,15 @@ def main(args):
         except Exception as db_err:
             logger.warning(f"Deferred incremental upload record save due to DB busy: {db_err}")
 
+    display_total = already_uploaded_count + total_files
     for idx, (file_path, file_size, metadata) in enumerate(files_to_process, start=1):
+        display_idx = already_uploaded_count + idx
         filename = os.path.basename(file_path)
         file_size_mb = file_size / (1024 * 1024)
         file_hash = compute_file_hash(file_path)
 
         if args.dry_run:
-            logger.info(f"[Dry Run] [{idx}/{total_files}] Would upload: {filename} ({file_size_mb:.2f} MB)")
+            logger.info(f"[Dry Run] [{display_idx}/{display_total}] Would upload: {filename} ({file_size_mb:.2f} MB)")
         else:
             try:
                 from datetime import timedelta
@@ -543,7 +547,7 @@ def main(args):
                 eta_completion_time = datetime.now() + timedelta(seconds=eta_seconds)
                 eta_completion_str = eta_completion_time.strftime("%H:%M:%S")
                 
-                logger.info(f"[{idx}/{total_files}] Uploading: {filename} ({file_size_mb:.2f} MB) - Est. Completion: {eta_completion_str} ({eta_minutes:.1f}m remaining at {human_readable_size(current_speed)}/s)")
+                logger.info(f"[{display_idx}/{display_total}] Uploading: {filename} ({file_size_mb:.2f} MB) - Est. Completion: {eta_completion_str} ({eta_minutes:.1f}m remaining at {human_readable_size(current_speed)}/s)")
                 
                 t_start = time.time()
                 upload_media(creds_append, file_path, album_id)
@@ -564,12 +568,12 @@ def main(args):
                 remaining_completion_time = datetime.now() + timedelta(seconds=remaining_eta_seconds)
                 remaining_completion_str = remaining_completion_time.strftime("%H:%M:%S")
 
-                logger.info(f"[{idx}/{total_files}] Uploaded: {filename} - Est. Completion: {remaining_completion_str} ({remaining_eta_minutes:.1f}m remaining)")
+                logger.info(f"[{display_idx}/{display_total}] Uploaded: {filename} - Est. Completion: {remaining_completion_str} ({remaining_eta_minutes:.1f}m remaining)")
                 successful_uploads.append((file_hash, metadata.get("asset_id")))
                 if len(successful_uploads) >= 5:
                     flush_upload_batch(successful_uploads)
             except Exception as e:
-                logger.error(f"[{idx}/{total_files}] Failed to upload {filename}: {e}")
+                logger.error(f"[{display_idx}/{display_total}] Failed to upload {filename}: {e}")
                 logger.error("Halting upload process due to error.")
                 has_error = True
                 break

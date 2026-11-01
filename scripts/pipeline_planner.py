@@ -767,11 +767,11 @@ def ensure_smart_album_exists(cursor, conn, latest_month, auto_apply=False):
 def get_device_ownership_for_month(cursor, camera_model, month_str):
     """
     Determines whether a camera model was actively owned/in use during month_str (YYYY-MM),
-    and resolves its owner.
+    and resolves its owner(s).
     
     Returns:
         is_active (bool): True if the device was active in month_str, False if outside ownership dates.
-        owner_name (str): Name of the owner or 'Shared/Other'.
+        owner_name (str): Name of the owner(s) or 'Shared/Other'.
         status_note (str): Informational note (e.g. 'Active', 'ended 2024-12-30', 'starts 2026-06-11').
     """
     month_start = f"{month_str}-01"
@@ -787,13 +787,7 @@ def get_device_ownership_for_month(cursor, camera_model, month_str):
             SELECT id, owner_name, start_date, end_date
             FROM device_owners
             WHERE camera_model = ?
-            ORDER BY 
-                CASE 
-                    WHEN start_date IS NOT NULL AND end_date IS NOT NULL THEN 1
-                    WHEN start_date IS NOT NULL OR end_date IS NOT NULL THEN 2
-                    ELSE 3 
-                END ASC,
-                updated_at_utc DESC
+            ORDER BY COALESCE(start_date, '0000-00-00') ASC, id ASC
         """, (camera_model,))
         rows = cursor.fetchall()
         
@@ -806,18 +800,27 @@ def get_device_ownership_for_month(cursor, camera_model, month_str):
                     overlapping_rows.append((r_owner, r_start, r_end))
             
             if overlapping_rows:
-                r_owner, r_start, r_end = overlapping_rows[0]
-                period_str = ""
-                if r_start or r_end:
-                    period_str = f" ({r_start or '...'} -> {r_end or 'Present'})"
-                return True, r_owner, f"Active{period_str}"
+                if len(overlapping_rows) == 1:
+                    r_owner, r_start, r_end = overlapping_rows[0]
+                    period_str = ""
+                    if r_start or r_end:
+                        period_str = f" ({r_start or '...'} -> {r_end or 'Present'})"
+                    return True, r_owner, f"Active{period_str}"
+                else:
+                    owners_joined = " / ".join(dict.fromkeys(r[0] for r in overlapping_rows))
+                    periods_joined = "; ".join(
+                        f"{r[0]}: {r[1] or '...'} -> {r[2] or 'Present'}" for r in overlapping_rows
+                    )
+                    return True, owners_joined, f"Active ({periods_joined})"
             else:
                 latest_end = max((r[3] for r in rows if r[3] is not None), default=None)
                 earliest_start = min((r[2] for r in rows if r[2] is not None), default=None)
                 if latest_end and latest_end < month_start:
-                    return False, rows[0][1], f"ended {latest_end}"
+                    last_owner = [r[1] for r in rows if r[3] == latest_end][-1]
+                    return False, last_owner, f"ended {latest_end}"
                 elif earliest_start and earliest_start > month_end:
-                    return False, rows[0][1], f"starts {earliest_start}"
+                    first_owner = [r[1] for r in rows if r[2] == earliest_start][0]
+                    return False, first_owner, f"starts {earliest_start}"
                 else:
                     return False, rows[0][1], "outside ownership period"
     except Exception as e:
@@ -830,88 +833,381 @@ def get_device_ownership_for_month(cursor, camera_model, month_str):
 
     return True, "Shared/Other", "Default Fallback"
 
+
+def get_device_ownership_periods_for_month(cursor, month_str):
+    """
+    Returns all active (camera_model, owner_name, start_date, end_date, eff_start, eff_end)
+    ownership periods overlapping month_str from device_owners, plus inactive models from ACTIVE_CAMERA_MODELS.
+    """
+    month_start = f"{month_str}-01"
+    try:
+        dt = datetime.strptime(month_str, "%Y-%m")
+        next_month = (dt.replace(day=28) + timedelta(days=4)).replace(day=1)
+        month_end = (next_month - timedelta(days=1)).strftime("%Y-%m-%d")
+    except Exception:
+        month_end = f"{month_str}-31"
+
+    active_periods = []
+    inactive_models = []
+    seen_models_in_db = set()
+
+    try:
+        cursor.execute("""
+            SELECT id, camera_model, owner_name, start_date, end_date, notes
+            FROM device_owners
+            WHERE notes IS NULL OR (notes NOT LIKE 'Alias for %' AND notes NOT LIKE '%(trimmed)%')
+            ORDER BY COALESCE(start_date, '0000-00-00') ASC, id ASC
+        """)
+        all_rows = cursor.fetchall()
+        model_total_periods = {}
+        for r in all_rows:
+            m = r[1]
+            seen_models_in_db.add(m)
+            model_total_periods[m] = model_total_periods.get(m, 0) + 1
+
+        for r_id, m_model, r_owner, r_start, r_end, r_notes in all_rows:
+            starts_before_month_end = (r_start is None or r_start <= month_end)
+            ends_after_month_start = (r_end is None or r_end >= month_start)
+            if starts_before_month_end and ends_after_month_start:
+                eff_start = max(month_start, r_start) if r_start else month_start
+                eff_end = min(month_end, r_end) if r_end else month_end
+                period_str = f"{r_start or '...'} -> {r_end or 'Present'}"
+                active_periods.append({
+                    'camera_model': m_model,
+                    'owner_name': r_owner,
+                    'start_date': r_start,
+                    'end_date': r_end,
+                    'eff_start': eff_start,
+                    'eff_end': eff_end,
+                    'period_str': period_str,
+                    'is_multi_owner': model_total_periods.get(m_model, 1) > 1,
+                    'is_primary_model': m_model in ACTIVE_CAMERA_MODELS,
+                })
+    except Exception as e:
+        logger.debug(f"Error fetching ownership periods for {month_str}: {e}")
+
+    # Check ACTIVE_CAMERA_MODELS for any inactive models or models missing from device_owners
+    active_model_names = {p['camera_model'] for p in active_periods}
+    for model in ACTIVE_CAMERA_MODELS:
+        if model not in active_model_names:
+            is_active, owner_name, status_note = get_device_ownership_for_month(cursor, model, month_str)
+            if is_active:
+                active_periods.append({
+                    'camera_model': model,
+                    'owner_name': owner_name,
+                    'start_date': None,
+                    'end_date': None,
+                    'eff_start': month_start,
+                    'eff_end': month_end,
+                    'period_str': 'Present',
+                    'is_multi_owner': False,
+                    'is_primary_model': True,
+                })
+            else:
+                inactive_models.append((model, owner_name, status_note))
+
+    return active_periods, inactive_models
+
+
+def resolve_device_owner_period(cursor, camera_model, min_date=None, max_date=None, month_str=None):
+    """
+    Resolves the specific owner and ownership period (start_date, end_date) for a camera_model
+    during a session's [min_date, max_date] or month_str. Also notes handoffs within month_str.
+    """
+    if not camera_model or camera_model in ('Unknown', 'Unknown Model'):
+        return "Unknown", None, None, "Unknown"
+
+    d_start = str(min_date)[:10] if min_date else (f"{month_str}-01" if month_str else None)
+    d_end = str(max_date)[:10] if max_date else (f"{month_str}-31" if month_str else d_start)
+
+    month_start = f"{month_str}-01" if month_str else d_start
+    month_end = f"{month_str}-31" if month_str else d_end
+    if month_str:
+        try:
+            dt = datetime.strptime(month_str, "%Y-%m")
+            next_month = (dt.replace(day=28) + timedelta(days=4)).replace(day=1)
+            month_end = (next_month - timedelta(days=1)).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+
+    try:
+        cursor.execute("""
+            SELECT owner_name, start_date, end_date
+            FROM device_owners
+            WHERE camera_model = ?
+            ORDER BY COALESCE(start_date, '0000-00-00') ASC, id ASC
+        """, (camera_model,))
+        rows = cursor.fetchall()
+        if rows:
+            matching = []
+            month_overlapping = []
+            for r_owner, r_start, r_end in rows:
+                if d_start and d_end:
+                    if (r_start is None or r_start <= d_end) and (r_end is None or r_end >= d_start):
+                        matching.append((r_owner, r_start, r_end))
+                if month_start and month_end:
+                    if (r_start is None or r_start <= month_end) and (r_end is None or r_end >= month_start):
+                        month_overlapping.append((r_owner, r_start, r_end))
+
+            chosen = matching[0] if matching else (month_overlapping[0] if month_overlapping else rows[0])
+            c_owner, c_start, c_end = chosen
+            p_str = f"{c_start or '...'} -> {c_end or 'Present'}"
+            label = f"{c_owner} [{p_str}]"
+
+            # If another owner also overlaps the same month (handoff in month_str), annotate it
+            other_month_owners = [
+                f"{o} [{s or '...'} -> {e or 'Present'}]"
+                for (o, s, e) in month_overlapping
+                if (o, s, e) != chosen
+            ]
+            if other_month_owners:
+                label += f" (handoff in {month_str}: {'; '.join(other_month_owners)})"
+            return c_owner, c_start, c_end, label
+    except Exception as e:
+        logger.debug(f"Error in resolve_device_owner_period for {camera_model}: {e}")
+
+    from constants import DEVICE_OWNER_MAPPING
+    if camera_model in DEVICE_OWNER_MAPPING:
+        owner = DEVICE_OWNER_MAPPING[camera_model]
+        return owner, None, None, owner
+
+    return "Shared/Other", None, None, "Shared/Other"
+
+
+def get_scoped_before_after_strings(cursor, model, month_str, pattern, owner_name=None, start_date=None, end_date=None):
+    """
+    Builds 'Before:' and 'After:' context lines scoped to the current owner's [start_date, end_date],
+    while annotating handoffs to/from other owners in device_owners when applicable.
+    """
+    month_start_ts = f"{month_str}-01 00:00:00"
+    owner_start_ts = f"{start_date} 00:00:00" if start_date else None
+    owner_end_ts = f"{end_date} 23:59:59" if end_date else None
+
+    # --- BEFORE ---
+    cursor.execute("""
+        SELECT MIN(min_filename), MAX(max_filename), MIN(min_date), MAX(max_date)
+        FROM imports
+        WHERE camera_model = ?
+          AND max_date < ?
+          AND (? IS NULL OR min_date >= ?)
+          AND min_filename GLOB ?
+    """, (model, month_start_ts, owner_start_ts, owner_start_ts, pattern))
+    b = cursor.fetchone()
+    if b and b[1]:
+        owner_tag = f" [Owner: {owner_name}]" if owner_name else ""
+        before_str = f"  Before:  {b[0]} -> {b[1]} ({b[2]} to {b[3]}){owner_tag}"
+    else:
+        # Check if a previous owner had imports before month_start_ts
+        cursor.execute("""
+            SELECT MIN(min_filename), MAX(max_filename), MIN(min_date), MAX(max_date)
+            FROM imports
+            WHERE camera_model = ? AND max_date < ? AND min_filename GLOB ?
+        """, (model, month_start_ts, pattern))
+        b_all = cursor.fetchone()
+        prev_owner_row = None
+        if start_date:
+            cursor.execute("""
+                SELECT owner_name, start_date, end_date
+                FROM device_owners
+                WHERE camera_model = ? AND end_date IS NOT NULL AND end_date < ?
+                ORDER BY end_date DESC LIMIT 1
+            """, (model, start_date))
+            prev_owner_row = cursor.fetchone()
+
+        if prev_owner_row and b_all and b_all[1]:
+            p_own, p_s, p_e = prev_owner_row
+            before_str = (
+                f"  Before:  None for {owner_name} (starts {start_date}) | "
+                f"Prev owner {p_own} ({p_s or '...'} -> {p_e}): {b_all[0]} -> {b_all[1]} ({b_all[2]} to {b_all[3]})"
+            )
+        elif start_date and owner_name and start_date >= f"{month_str}-01":
+            before_str = f"  Before:  None for {owner_name} (ownership started {start_date})"
+        else:
+            before_str = "  Before:  None"
+
+    # --- AFTER ---
+    cursor.execute("""
+        SELECT MIN(min_filename), MAX(max_filename), MIN(min_date), MAX(max_date)
+        FROM imports
+        WHERE camera_model = ?
+          AND min_date >= date(?, 'start of month', '+1 month')
+          AND (? IS NULL OR max_date <= ?)
+          AND min_filename GLOB ?
+    """, (model, f"{month_str}-01", owner_end_ts, owner_end_ts, pattern))
+    a = cursor.fetchone()
+    if a and a[0]:
+        owner_tag = f" [Owner: {owner_name}]" if owner_name else ""
+        after_str = f"  After:   {a[0]} -> {a[1]} ({a[2]} to {a[3]}){owner_tag}"
+    else:
+        # Check if a subsequent owner took over after end_date
+        cursor.execute("""
+            SELECT MIN(min_filename), MAX(max_filename), MIN(min_date), MAX(max_date)
+            FROM imports
+            WHERE camera_model = ? AND min_date >= date(?, 'start of month', '+1 month') AND min_filename GLOB ?
+        """, (model, f"{month_str}-01", pattern))
+        a_all = cursor.fetchone()
+        next_owner_row = None
+        if end_date:
+            cursor.execute("""
+                SELECT owner_name, start_date, end_date
+                FROM device_owners
+                WHERE camera_model = ? AND start_date IS NOT NULL AND start_date > ?
+                ORDER BY start_date ASC LIMIT 1
+            """, (model, end_date))
+            next_owner_row = cursor.fetchone()
+
+        if next_owner_row and a_all and a_all[0]:
+            n_own, n_s, n_e = next_owner_row
+            after_str = (
+                f"  After:   None for {owner_name} (ended {end_date}) | "
+                f"Next owner {n_own} ({n_s} -> {n_e or 'Present'}): {a_all[0]} -> {a_all[1]} ({a_all[2]} to {a_all[3]})"
+            )
+        elif next_owner_row:
+            n_own, n_s, n_e = next_owner_row
+            after_str = (
+                f"  After:   None for {owner_name} (ended {end_date}) | "
+                f"Next owner {n_own} ({n_s} -> {n_e or 'Present'}): None"
+            )
+        elif end_date and owner_name:
+            after_str = f"  After:   None for {owner_name} (ownership ended {end_date})"
+        else:
+            after_str = "  After:   None"
+
+    return before_str, after_str
+
+
 def check_active_sources_import_status(cursor, conn, month, auto_apply):
     """
-    Checks if all active camera models have imported assets for the proposed month.
-    Prompts user if any active source is missing.
+    Checks if all active camera models (from device_owners and ACTIVE_CAMERA_MODELS)
+    have imported assets for the proposed month. Prompts user if any primary active source is missing.
     """
     if not ACTIVE_CAMERA_MODELS:
         logger.info("No active camera models configured. Skipping active source check.")
         return True
 
     months_to_check = [month]
+    primary_owners = set()
+    for m in ACTIVE_CAMERA_MODELS:
+        try:
+            cursor.execute("SELECT owner_name FROM device_owners WHERE camera_model = ?", (m,))
+            for r in cursor.fetchall():
+                if r[0] and r[0].lower() not in ('shared', 'shared/other', 'cohens', 'cohens bulgaria'):
+                    primary_owners.add(r[0])
+        except Exception:
+            pass
 
+    attached_photos_db = False
     try:
-        cursor.execute(f"ATTACH DATABASE 'file:{APPLE_PHOTOS_DB_PATH}?mode=ro' AS photos_db;")
-        logger.debug("Attached Photos.sqlite database read-only for active source check.")
+        try:
+            cursor.execute(f"ATTACH DATABASE 'file:{APPLE_PHOTOS_DB_PATH}?mode=ro' AS photos_db;")
+            attached_photos_db = True
+            logger.debug("Attached Photos.sqlite database read-only for active source check.")
+        except Exception as e:
+            logger.debug(f"Using local ZASSET tables in media_organizer.db for active source check ({e}).")
+        db_prefix = "photos_db." if attached_photos_db else ""
 
         for month_str in months_to_check:
             source_metadata = []
-            
-            # Determine active vs inactive status for each camera model in ACTIVE_CAMERA_MODELS
-            model_ownership_status = {}
-            active_expected_models = set()
-            inactive_models = []
-            for model in ACTIVE_CAMERA_MODELS:
-                is_active, owner_name, status_note = get_device_ownership_for_month(cursor, model, month_str)
-                model_ownership_status[model] = (is_active, owner_name, status_note)
-                if is_active:
-                    active_expected_models.add(model)
-                else:
-                    inactive_models.append((model, owner_name, status_note))
+            active_periods, inactive_models = get_device_ownership_periods_for_month(cursor, month_str)
 
-            # Query Photos.sqlite for all candidate models
-            query = """
-                SELECT 
-                    xa.ZCAMERAMODEL,
-                    xa.ZCAMERAMAKE,
-                    COUNT(CASE WHEN strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) = ? THEN 1 END) AS assets_in_month,
-                    MIN(CASE WHEN strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) = ? THEN aaa.ZORIGINALFILENAME END) AS min_filename,
-                    MAX(CASE WHEN strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) = ? THEN aaa.ZORIGINALFILENAME END) AS max_filename,
-                    MIN(CASE WHEN strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) = ? THEN datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime') END) AS min_date,
-                    MAX(CASE WHEN strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) = ? THEN datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime') END) AS max_date,
-                    GROUP_CONCAT(DISTINCT CASE WHEN strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) = ? 
-                                               THEN a.ZIMPORTSESSION END) AS involved_import_ids
-                FROM photos_db.ZASSET a
-                JOIN photos_db.ZEXTENDEDATTRIBUTES xa ON xa.ZASSET = a.Z_PK
-                JOIN photos_db.ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK
-                JOIN imports i ON i.import_uuid = a.ZIMPORTSESSION 
-                              AND i.camera_model = xa.ZCAMERAMODEL
-                LEFT JOIN assets loc ON loc.asset_id = a.ZUUID
-                WHERE a.ZTRASHEDSTATE = 0
-                  AND (loc.ignore_continuity_check = 0 OR loc.ignore_continuity_check IS NULL)
-                  AND xa.ZCAMERAMODEL IN ({})
-                  AND a.ZDATECREATED >= (strftime('%s', date(?, 'start of month', '-12 month')) - 978307200)
-                  AND a.ZDATECREATED < (strftime('%s', date(?, 'start of month', '+2 month')) - 978307200)
-                GROUP BY xa.ZCAMERAMODEL, xa.ZCAMERAMAKE
-            """.format(','.join(['?' for _ in ACTIVE_CAMERA_MODELS]))
+            owner_coverage = {}
+            missing_primary_models = []
 
-            cursor.execute(query, [month_str] * 6 + ACTIVE_CAMERA_MODELS + [month_str + "-01", month_str + "-01"])
-            results = cursor.fetchall()
-            results_by_model = {r[0]: r for r in results}
+            candidate_models = sorted({p['camera_model'] for p in active_periods})
+            raw_asset_rows = []
+            if candidate_models:
+                placeholders_m = ','.join(['?' for _ in candidate_models])
+                cursor.execute(f"""
+                    SELECT 
+                        xa.ZCAMERAMODEL,
+                        xa.ZCAMERAMAKE,
+                        aaa.ZORIGINALFILENAME,
+                        datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime') AS local_dt,
+                        a.ZIMPORTSESSION
+                    FROM {db_prefix}ZASSET a
+                    JOIN {db_prefix}ZEXTENDEDATTRIBUTES xa ON xa.ZASSET = a.Z_PK
+                    JOIN {db_prefix}ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK
+                    JOIN imports i ON i.import_uuid = a.ZIMPORTSESSION 
+                                  AND i.camera_model = xa.ZCAMERAMODEL
+                    LEFT JOIN assets loc ON loc.asset_id = a.ZUUID
+                    WHERE a.ZTRASHEDSTATE = 0
+                      AND (loc.ignore_continuity_check = 0 OR loc.ignore_continuity_check IS NULL)
+                      AND xa.ZCAMERAMODEL IN ({placeholders_m})
+                      AND a.ZDATECREATED >= (strftime('%s', date(?, 'start of month', '-2 day')) - 978307200)
+                      AND a.ZDATECREATED < (strftime('%s', date(?, 'start of month', '+1 month', '+2 day')) - 978307200)
+                      AND strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) = ?
+                """, candidate_models + [month_str + "-01", month_str + "-01", month_str])
+                raw_asset_rows = cursor.fetchall()
 
-            found_models = set()
-            model_counts = {}
+            # Compute metrics per active (camera_model, owner_name, eff_start, eff_end) period
+            period_results = []
+            for p in active_periods:
+                model = p['camera_model']
+                eff_start_ts = f"{p['eff_start']} 00:00:00"
+                eff_end_ts = f"{p['eff_end']} 23:59:59"
 
-            # Process models that were found or expected
-            for model in ACTIVE_CAMERA_MODELS:
-                is_active, owner_name, status_note = model_ownership_status[model]
-                
-                if model in results_by_model:
-                    row = results_by_model[model]
-                    m_model, make, count, f_min, f_max, d_min, d_max, involved_import_ids = row
-                else:
-                    make, count, f_min, f_max, d_min, d_max, involved_import_ids = None, 0, None, None, None, None, None
+                matching_assets = [
+                    r for r in raw_asset_rows
+                    if r[0] == model and r[3] is not None and eff_start_ts <= r[3] <= eff_end_ts
+                ]
+                if matching_assets:
+                    make = matching_assets[0][1]
+                    count = len(matching_assets)
+                    filenames = [r[2] for r in matching_assets if r[2] is not None]
+                    dates = [r[3] for r in matching_assets if r[3] is not None]
+                    import_ids = sorted({str(r[4]) for r in matching_assets if r[4] is not None})
+                    f_min = min(filenames) if filenames else None
+                    f_max = max(filenames) if filenames else None
+                    d_min = min(dates) if dates else None
+                    d_max = max(dates) if dates else None
+                    involved_import_ids = ",".join(import_ids) if import_ids else None
                     row = (model, make, count, f_min, f_max, d_min, d_max, involved_import_ids)
+                else:
+                    row = (model, None, 0, None, None, None, None, None)
+                period_results.append((p, row))
 
-                model_counts[model] = count
+            # Sort so periods with assets > 0 appear first (by count desc), then primary owners, then owner_name
+            period_results.sort(
+                key=lambda item: (
+                    0 if item[1][2] > 0 else 1,
+                    -item[1][2],
+                    0 if item[0]['owner_name'] in primary_owners else 1,
+                    item[0]['owner_name'],
+                    item[0]['camera_model'],
+                )
+            )
+
+            for p, row in period_results:
+                model = p['camera_model']
+                owner_name = p['owner_name']
+                start_date = p['start_date']
+                end_date = p['end_date']
+                period_str = p['period_str']
+                owner_display = f"{owner_name} ({period_str})" if (start_date or end_date) else owner_name
+                m_model, make, count, f_min, f_max, d_min, d_max, involved_import_ids = row
+
+                if owner_name not in owner_coverage:
+                    owner_coverage[owner_name] = {
+                        'total_assets': 0,
+                        'active_devices': [],
+                        'devices_with_assets': [],
+                        'zero_devices': []
+                    }
+                dev_label = f"{model} [{period_str}]" if p['is_multi_owner'] else model
+                owner_coverage[owner_name]['active_devices'].append(dev_label)
+                owner_coverage[owner_name]['total_assets'] += count
+                if count > 0:
+                    owner_coverage[owner_name]['devices_with_assets'].append((dev_label, count))
+                else:
+                    owner_coverage[owner_name]['zero_devices'].append(dev_label)
+                    if p['is_primary_model'] or owner_name in primary_owners:
+                        missing_primary_models.append((model, owner_name, period_str))
+
                 num_min = None
                 num_max = None
                 gap_info = ""
 
                 if count > 0:
-                    found_models.add(model)
-
                     # Reasonability check: parse numeric part from filenames (ignoring extensions)
                     seq_pattern = r'^([a-zA-Z_-]+)(\d+)$'
                     if f_min:
@@ -926,14 +1222,18 @@ def check_active_sources_import_status(cursor, conn, month, auto_apply):
                         if expected_range > count:
                             gap_info = f" | ⚠️ Reasonability: {expected_range} expected vs {count} found (gap of {expected_range - count})"
 
-                    # Continuity check with previous month's confirmed imports
+                    # Continuity check with previous month's confirmed imports (scoped to owner's start_date)
                     continuity_info = ""
                     previous_month = (datetime.strptime(month_str, '%Y-%m').replace(day=1) - timedelta(days=1)).strftime('%Y-%m')
+                    owner_start_ts = f"{start_date} 00:00:00" if start_date else None
                     cursor.execute("""
                         SELECT MAX(max_filename), MAX(max_date)
                         FROM imports
-                        WHERE camera_model = ? AND months_detected LIKE ? AND sequencing_confirmed = 1
-                    """, (model, f'%{previous_month}%'))
+                        WHERE camera_model = ?
+                          AND months_detected LIKE ?
+                          AND sequencing_confirmed = 1
+                          AND (? IS NULL OR min_date >= ?)
+                    """, (model, f'%{previous_month}%', owner_start_ts, owner_start_ts))
                     prev_month_data = cursor.fetchone()
                     prev_max_filename, prev_max_date = prev_month_data if prev_month_data else (None, None)
 
@@ -951,70 +1251,58 @@ def check_active_sources_import_status(cursor, conn, month, auto_apply):
                         if d_min < prev_max_date:
                             continuity_info += f" | ⚠️ Date overlap from {previous_month}: {prev_max_date} -> {d_min}"
 
-                    logger.info(f"📸 Month: {month_str} | Source: {model:20} | Owner: {owner_name:12} | Count: {count:4} | Files: {f_min} -> {f_max} | Dates: {d_min} to {d_max}{gap_info}{continuity_info}")
+                    logger.info(f"📸 Month: {month_str} | Source: {model:26} | Owner: {owner_display:34} | Count: {count:4} | Files: {f_min} -> {f_max} | Dates: {d_min} to {d_max}{gap_info}{continuity_info}")
                     source_metadata.append({
                         'row': row,
                         'gap_info': gap_info,
                         'continuity_info': continuity_info,
-                        'owner': owner_name
+                        'owner': owner_name,
+                        'owner_display': owner_display,
+                        'start_date': start_date,
+                        'end_date': end_date,
+                        'eff_start': p['eff_start'],
+                        'eff_end': p['eff_end'],
                     })
-                elif is_active:
-                    # Active source expected in this month, but count is 0
-                    logger.info(f"📸 Month: {month_str} | Source: {model:20} | Owner: {owner_name:12} | Count:    0 | Files: None -> None | Dates: None to None")
+                elif p['is_primary_model'] or owner_name in primary_owners or p['is_multi_owner']:
+                    # Log active primary or handoff devices even when count is 0 in month_str
+                    logger.info(f"📸 Month: {month_str} | Source: {model:26} | Owner: {owner_display:34} | Count:    0 | Files: None -> None | Dates: None to None")
 
             # Report inactive models (outside date range)
             if inactive_models:
                 inactive_strs = [f"{m} ({own}: {note})" for m, own, note in inactive_models]
                 logger.info(f"ℹ️ Inactive devices in {month_str} (outside ownership dates): {', '.join(inactive_strs)}")
 
-            # Family Member Import Coverage & Matching
-            owner_coverage = {}
-            for model in active_expected_models:
-                _, owner_name, _ = model_ownership_status[model]
-                if owner_name not in owner_coverage:
-                    owner_coverage[owner_name] = {
-                        'total_assets': 0,
-                        'active_devices': [],
-                        'devices_with_assets': [],
-                        'zero_devices': []
-                    }
-                cnt = model_counts.get(model, 0)
-                owner_coverage[owner_name]['active_devices'].append(model)
-                owner_coverage[owner_name]['total_assets'] += cnt
-                if cnt > 0:
-                    owner_coverage[owner_name]['devices_with_assets'].append((model, cnt))
-                else:
-                    owner_coverage[owner_name]['zero_devices'].append(model)
-
             logger.info(f"👥 Family Member Import Coverage ({month_str}):")
             for owner, data in sorted(owner_coverage.items()):
                 if data['total_assets'] > 0:
                     dev_summary = ', '.join(f"{m}: {c:,} assets" for m, c in data['devices_with_assets'])
-                    logger.info(f"   • {owner:12}: ✅ Matched ({dev_summary})")
+                    if data['zero_devices']:
+                        zero_summary = ', '.join(data['zero_devices'])
+                        dev_summary += f" | 0 assets: {zero_summary}"
+                    logger.info(f"   • {owner:14}: ✅ Matched ({dev_summary})")
                 else:
                     dev_list = ', '.join(data['active_devices'])
-                    logger.info(f"   • {owner:12}: ⚠️ No imports (0 assets across: {dev_list})")
-
-            # Missing active models (only those active during month_str with count == 0)
-            missing_models = active_expected_models - found_models
-
-            if missing_models:
-                missing_details = []
-                for m in sorted(missing_models):
-                    _, m_owner, _ = model_ownership_status[m]
-                    if owner_coverage.get(m_owner, {}).get('total_assets', 0) > 0:
-                        covered_via = ', '.join(dev for dev, _ in owner_coverage[m_owner]['devices_with_assets'])
-                        missing_details.append(f"{m} ({m_owner} - note: owner already covered by {covered_via})")
+                    if owner in primary_owners:
+                        logger.info(f"   • {owner:14}: ⚠️ No imports (0 assets across: {dev_list})")
                     else:
-                        missing_details.append(f"{m} ({m_owner})")
+                        logger.info(f"   • {owner:14}: ℹ️ No imports in {month_str} (0 assets across: {dev_list})")
 
-                logger.warning(f"⚠️ Missing imports for active camera models in {month_str}: {', '.join(missing_details)}")
+            # Check if any primary family member has 0 imports overall in month_str
+            missing_family_members = [
+                owner for owner, data in owner_coverage.items()
+                if data['total_assets'] == 0 and owner in primary_owners
+            ]
 
-                # Check if any non-shared family member has 0 imports
-                missing_family_members = [
-                    owner for owner, data in owner_coverage.items()
-                    if data['total_assets'] == 0 and owner.lower() not in ('shared', 'shared/other', 'cohens', 'cohens bulgaria')
-                ]
+            # Only warn/prompt if a primary family member has 0 total assets, or an uncovered primary model is missing
+            uncovered_primary_missing = [
+                (m, own, p_str) for (m, own, p_str) in missing_primary_models
+                if owner_coverage.get(own, {}).get('total_assets', 0) == 0
+            ]
+
+            if uncovered_primary_missing or missing_family_members:
+                missing_details = [f"{m} ({own}: {p_str})" for m, own, p_str in uncovered_primary_missing]
+                if missing_details:
+                    logger.warning(f"⚠️ Missing imports for active primary camera models in {month_str}: {', '.join(missing_details)}")
 
                 if not auto_apply:
                     if missing_family_members:
@@ -1055,49 +1343,45 @@ def check_active_sources_import_status(cursor, conn, month, auto_apply):
                     """.format(placeholders), import_id_list + [model])
                     unconfirmed_count = cursor.fetchone()[0]
 
-                    #   TODO: Before the promt we should check confirmed months for each source in comparison to months in the past or in the future relative to the proposed month
                     if unconfirmed_count > 0:
                         # Determine naming pattern to filter context to relevant conventions
                         pattern = "*"
                         if f_min:
-                            # Only use a prefix filter if it looks like a standard sequence (Prefix + Digits)
                             stem = os.path.splitext(f_min)[0]
                             m = re.match(r'^([a-zA-Z_-]+)\d+$', stem)
                             if m:
                                 pattern = m.group(1) + "*"
 
-                        # Fetch global boundaries for this model before and after the current month
-                        cursor.execute("""
-                            SELECT MIN(min_filename), MAX(max_filename), MIN(min_date), MAX(max_date)
-                            FROM imports
-                            WHERE camera_model = ? AND max_date < ? AND min_filename GLOB ?
-                        """, (model, f"{month_str}-01 00:00:00", pattern))
-                        b = cursor.fetchone()
-                        before_str = f"  Before:  {b[0]} -> {b[1]} ({b[2]} to {b[3]})" if b and b[1] else "  Before:  None"
+                        before_str, after_str = get_scoped_before_after_strings(
+                            cursor,
+                            model,
+                            month_str,
+                            pattern,
+                            owner_name=entry.get('owner'),
+                            start_date=entry.get('start_date'),
+                            end_date=entry.get('end_date'),
+                        )
 
-                        cursor.execute("""
-                            SELECT MIN(min_filename), MAX(max_filename), MIN(min_date), MAX(max_date)
-                            FROM imports
-                            WHERE camera_model = ? AND min_date >= date(?, 'start of month', '+1 month') AND min_filename GLOB ?
-                        """, (model, f"{month_str}-01", pattern))
-                        a = cursor.fetchone()
-                        after_str = f"  After:   {a[0]} -> {a[1]} ({a[2]} to {a[3]})" if a and a[0] else "  After:   None"
+                        eff_start_ts = f"{entry.get('eff_start', month_str + '-01')} 00:00:00"
+                        eff_end_ts = f"{entry.get('eff_end', month_str + '-31')} 23:59:59"
 
                         # Fetch involved assets to print table before prompt
                         cursor.execute(f"""
                             SELECT aaa.ZORIGINALFILENAME, datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime'), a.ZUUID
-                            FROM photos_db.ZASSET a
-                            JOIN photos_db.ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK
-                            LEFT JOIN photos_db.ZEXTENDEDATTRIBUTES ea ON ea.ZASSET = a.Z_PK
+                            FROM {db_prefix}ZASSET a
+                            JOIN {db_prefix}ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK
+                            LEFT JOIN {db_prefix}ZEXTENDEDATTRIBUTES ea ON ea.ZASSET = a.Z_PK
                             WHERE a.ZIMPORTSESSION IN ({placeholders})
                               AND COALESCE(ea.ZCAMERAMODEL, 'Unknown') = ?
                               AND COALESCE(ea.ZCAMERAMAKE, 'Unknown') = ?
                               AND strftime('%Y-%m', datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')) = ?
+                              AND datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime') >= ?
+                              AND datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime') <= ?
                             ORDER BY aaa.ZORIGINALFILENAME
-                        """, import_id_list + [model, make or "Unknown", month_str])
+                        """, import_id_list + [model, make or "Unknown", month_str, eff_start_ts, eff_end_ts])
                         involved_assets = cursor.fetchall()
 
-                        owner_str = f" (Owner: {entry.get('owner', 'Unknown')})" if entry.get('owner') else ""
+                        owner_str = f" (Owner: {entry.get('owner_display') or entry.get('owner', 'Unknown')})"
                         print(f"Verifying {model}{owner_str} for {month_str}:")
                         print(before_str)
                         print(f"  Current: {f_min} -> {f_max} ({d_min} to {d_max}){gap_info}{continuity_info}")
@@ -1111,16 +1395,15 @@ def check_active_sources_import_status(cursor, conn, month, auto_apply):
 
                         if choice == 'I':
                             for import_uuid in import_id_list:
-                                # Calculate metadata specific to this individual import_uuid for the month
-                                cursor.execute("""
+                                cursor.execute(f"""
                                     SELECT 
                                         MIN(aaa.ZORIGINALFILENAME),
                                         MAX(aaa.ZORIGINALFILENAME),
                                         MIN(datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime')),
                                         MAX(datetime(a.ZDATECREATED + 978307200, 'unixepoch', 'localtime'))
-                                    FROM photos_db.ZASSET a
-                                    JOIN photos_db.ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK
-                                    LEFT JOIN ZEXTENDEDATTRIBUTES ea ON ea.ZASSET = a.Z_PK
+                                    FROM {db_prefix}ZASSET a
+                                    JOIN {db_prefix}ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = a.Z_PK
+                                    LEFT JOIN {db_prefix}ZEXTENDEDATTRIBUTES ea ON ea.ZASSET = a.Z_PK
                                     LEFT JOIN assets loc ON loc.asset_id = a.ZUUID
                                     WHERE a.ZIMPORTSESSION = ?
                                       AND (loc.ignore_continuity_check = 0 OR loc.ignore_continuity_check IS NULL)
@@ -1147,8 +1430,9 @@ def check_active_sources_import_status(cursor, conn, month, auto_apply):
                                 cursor, conn, import_id_list, model, make or "Unknown", month_str, label=f"month {month_str}"
                             )
     finally:
-        cursor.execute("DETACH DATABASE photos_db;")
-        logger.debug("Detached Photos.sqlite database.")
+        if attached_photos_db:
+            cursor.execute("DETACH DATABASE photos_db;")
+            logger.debug("Detached Photos.sqlite database.")
     return True
 
 def check_favorites_count(cursor, month, check_remote=False, all_favs=None, creds=None, verbose=True):
@@ -1267,7 +1551,12 @@ def verify_sequencing_for_planned_month(cursor, conn, month, auto_apply):
             gap = expected - count if expected > count else 0
             if gap > 0:
                 gap_str = f" | ⚠️ Gap detected: {gap} items"
-        logger.info(f"   - Session {uuid} ({model}): {f_min} -> {f_max} ({d_min} to {d_max}) ({count} files){gap_str}")
+
+        owner_name, owner_start, owner_end, owner_label = resolve_device_owner_period(
+            cursor, model, min_date=d_min, max_date=d_max, month_str=month
+        )
+        owner_tag = f" | Owner: {owner_label}" if owner_label and owner_label != "Unknown" else ""
+        logger.info(f"   - Session {uuid} ({model}{owner_tag}): {f_min} -> {f_max} ({d_min} to {d_max}) ({count} files){gap_str}")
 
         if auto_apply:
             continue
@@ -1281,22 +1570,15 @@ def verify_sequencing_for_planned_month(cursor, conn, month, auto_apply):
             if m:
                 pattern = m.group(1) + "*"
 
-        # Fetch global boundaries for this model before and after the current month
-        cursor.execute("""
-            SELECT MIN(min_filename), MAX(max_filename), MIN(min_date), MAX(max_date)
-            FROM imports
-            WHERE camera_model = ? AND max_date < ? AND min_filename GLOB ?
-        """, (model, f"{month}-01 00:00:00", pattern))
-        b = cursor.fetchone()
-        before_str = f"  Before:  {b[0]} -> {b[1]} ({b[2]} to {b[3]})" if b and b[1] else "  Before:  None"
-
-        cursor.execute("""
-            SELECT MIN(min_filename), MAX(max_filename), MIN(min_date), MAX(max_date)
-            FROM imports
-            WHERE camera_model = ? AND min_date >= date(?, 'start of month', '+1 month') AND min_filename GLOB ?
-        """, (model, f"{month}-01", pattern))
-        a = cursor.fetchone()
-        after_str = f"  After:   {a[0]} -> {a[1]} ({a[2]} to {a[3]})" if a and a[0] else "  After:   None"
+        before_str, after_str = get_scoped_before_after_strings(
+            cursor,
+            model,
+            month,
+            pattern,
+            owner_name=owner_name if owner_name != "Unknown" else None,
+            start_date=owner_start,
+            end_date=owner_end,
+        )
 
         # Fetch involved assets to print table before prompt
         cursor.execute("""
@@ -1314,7 +1596,8 @@ def verify_sequencing_for_planned_month(cursor, conn, month, auto_apply):
         """, (uuid, model, make, month))
         involved_assets = cursor.fetchall()
 
-        print(f"Verifying {model} session {uuid} for {month}:")
+        prompt_owner_str = f" (Owner: {owner_label})" if owner_label and owner_label != "Unknown" else ""
+        print(f"Verifying {model}{prompt_owner_str} session {uuid} for {month}:")
         print(before_str)
         print(f"  Current: {f_min} -> {f_max} ({d_min} to {d_max}) ({count} files){gap_str}")
         print(after_str)
@@ -3734,13 +4017,38 @@ def manage_device_owners_flow(cursor=None, conn=None):
                     own = p['owner_name']
                     if own not in timeline_by_owner:
                         timeline_by_owner[own] = []
+                    p_count = item['count']
+                    p_min = item['min_created']
+                    p_max = item['max_created']
+                    if len(item['periods']) > 1 and (p['start_date'] or p['end_date']):
+                        try:
+                            s_bound = p['start_date'] or '0000-01-01'
+                            e_bound = (p['end_date'] + ' 23:59:59') if p['end_date'] else '9999-12-31 23:59:59'
+                            cursor.execute("""
+                                SELECT COUNT(DISTINCT a.asset_id),
+                                       MIN(substr(a.date_created_utc, 1, 10)),
+                                       MAX(substr(a.date_created_utc, 1, 10))
+                                FROM assets a
+                                JOIN ZASSET z ON a.asset_id = z.ZUUID
+                                JOIN ZEXTENDEDATTRIBUTES ze ON z.ZEXTENDEDATTRIBUTES = ze.Z_PK
+                                WHERE ze.ZCAMERAMODEL = ?
+                                  AND a.date_created_utc >= ?
+                                  AND a.date_created_utc <= ?
+                            """, (item['model'], s_bound, e_bound))
+                            prow = cursor.fetchone()
+                            if prow:
+                                p_count = prow[0] or 0
+                                p_min = prow[1] or '—'
+                                p_max = prow[2] or '—'
+                        except Exception:
+                            pass
                     timeline_by_owner[own].append({
                         'model': item['model'],
-                        'count': item['count'],
+                        'count': p_count,
                         'start_date': p['start_date'] or '—',
                         'end_date': p['end_date'] or 'Present',
-                        'earliest_asset': item['min_created'],
-                        'latest_asset': item['max_created']
+                        'earliest_asset': p_min,
+                        'latest_asset': p_max
                     })
 
         if timeline_by_owner:

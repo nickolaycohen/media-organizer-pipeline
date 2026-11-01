@@ -129,7 +129,7 @@ def report_status(c_month, c_plan_id, c_step, step_start, b_start, executed_coun
             pass
 
     eff_uploaded = max(uploaded_assets, live_uploaded) if live_uploaded is not None else uploaded_assets
-    eff_total = live_total if (live_total is not None and live_total > 0 and uploaded_assets == 0) else total_assets
+    eff_total = live_total if (live_total is not None and live_total > 0) else total_assets
     if eff_total > 0 and eff_uploaded > eff_total:
         eff_total = total_assets
 
@@ -440,6 +440,15 @@ def run_step(step: PipelineStep, dry_run=False, month=None, command=None):
     with executor_state.lock:
         executor_state.current_step_label = step.label
         executor_state.current_step_start_time = time.time()
+        c_month = executor_state.current_month
+        c_plan_id = executor_state.current_plan_id
+        step_start = executor_state.current_step_start_time
+        b_start = executor_state.batch_start_time
+        ex_count = executor_state.executed_count
+    try:
+        report_status(c_month, c_plan_id, step.label, step_start, b_start, ex_count)
+    except Exception:
+        pass
     batch_month_id = None
     if month is not None:
         acquire_db_lock()
@@ -663,8 +672,8 @@ def main(args):
     executed_count = 0
     processed_dry_run_ids = set()
 
-    # Start background status heartbeat thread (reports every 180 seconds / 3 minutes)
-    status_thread = threading.Thread(target=status_reporter_worker, args=(180,), daemon=True)
+    # Start background status heartbeat thread (reports every 60 seconds / 1 minute)
+    status_thread = threading.Thread(target=status_reporter_worker, args=(60,), daemon=True)
     status_thread.start()
 
     while True:

@@ -270,6 +270,23 @@ def ensure_views_exist(cursor, conn=None):
             if conn:
                 conn.commit()
             logger.info("✅ ranked_assets_view successfully created.")
+
+        # Ensure published URL columns exist on publications and curated_moments
+        cursor.execute("PRAGMA table_info(publications)")
+        pub_cols = {r[1] for r in cursor.fetchall()}
+        if pub_cols and "published_url" not in pub_cols:
+            cursor.execute("ALTER TABLE publications ADD COLUMN published_url TEXT")
+            if conn:
+                conn.commit()
+        cursor.execute("PRAGMA table_info(curated_moments)")
+        cm_cols = {r[1] for r in cursor.fetchall()}
+        if cm_cols:
+            if "shutterfly_url" not in cm_cols:
+                cursor.execute("ALTER TABLE curated_moments ADD COLUMN shutterfly_url TEXT")
+            if "youtube_url" not in cm_cols:
+                cursor.execute("ALTER TABLE curated_moments ADD COLUMN youtube_url TEXT")
+            if conn:
+                conn.commit()
     except Exception as e:
         logger.error(f"Error ensuring views exist: {e}")
 
@@ -3586,10 +3603,11 @@ def run_memory_publishing_flow(cursor=None, conn=None):
         print("\n--- Actions ---")
         print(" [1] Sync proposed assets to ToBeCurated albums in Apple Photos")
         print(" [2] Export Curated Moment for Publishing")
-        print(" [3] Record publication in the database (Mark as Published to Shutterfly/YouTube)")
+        print(" [3] Record publication in the database (Mark as Published to Shutterfly/YouTube + URLs)")
         print(" [4] Generate Publishing Candidates report (on demand)")
         print(" [5] Display Skipped Videos Table (on demand)")
         print(" [6] Move ToBeCurated assets to Curated in Apple Photos")
+        print(" [7] Set / Update Published URLs (Shutterfly Album / YouTube Video) for a Moment")
         print(" [R] Restart the planner")
         print(" [E] Exit")
         
@@ -3763,6 +3781,8 @@ def run_memory_publishing_flow(cursor=None, conn=None):
             pub_choice = input("Enter selection [1]: ").strip()
 
             pub_rows = []
+            shutterfly_url_val = None
+            youtube_url_val = None
             if pub_choice == '2':
                 custom_platform = input("Enter platform [e.g. Shutterfly, YouTube, Google Photos]: ").strip()
                 if not custom_platform:
@@ -3770,20 +3790,30 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                 custom_account = input("Enter account email [default: nickolay.cohen@gmail.com]: ").strip()
                 if not custom_account:
                     custom_account = "nickolay.cohen@gmail.com"
+                custom_url = input(f"🔗 Enter published URL on {custom_platform} for '{moment_name}' (optional, press Enter to skip): ").strip() or None
+                if "shutterfly" in custom_platform.lower():
+                    shutterfly_url_val = custom_url
+                elif "youtube" in custom_platform.lower():
+                    youtube_url_val = custom_url
                 for aid, fn in target_assets:
-                    pub_rows.append((aid, fn or '', moment_name, custom_platform, custom_account))
+                    pub_rows.append((aid, fn or '', moment_name, custom_platform, custom_account, custom_url))
             else:
+                if photos:
+                    shutterfly_url_val = input(f"🔗 Enter Shutterfly Album URL for '{moment_name}' ({len(photos)} photos) [optional, press Enter to skip]: ").strip() or None
+                if videos:
+                    youtube_url_val = input(f"🔗 Enter YouTube Video/Playlist URL for '{moment_name}' ({len(videos)} videos) [optional, press Enter to skip]: ").strip() or None
                 for aid, fn in photos:
-                    pub_rows.append((aid, fn or '', moment_name, 'Shutterfly', 'nickolay.cohen@gmail.com'))
+                    pub_rows.append((aid, fn or '', moment_name, 'Shutterfly', 'nickolay.cohen@gmail.com', shutterfly_url_val))
                 for aid, fn in videos:
-                    pub_rows.append((aid, fn or '', moment_name, 'YouTube', 'nickolay.cohen@gmail.com'))
+                    pub_rows.append((aid, fn or '', moment_name, 'YouTube', 'nickolay.cohen@gmail.com', youtube_url_val))
 
             confirm = input(f"\nConfirm recording publication of {len(pub_rows)} assets of '{moment_name}'? [y/N]: ").strip().lower()
             if confirm == 'y':
                 try:
+                    ensure_views_exist(cursor, conn)
                     cursor.executemany("""
-                        INSERT INTO publications (asset_uuid, filename, moment_name, platform, account, published_at_utc)
-                        VALUES (?, ?, ?, ?, ?, datetime('now'))
+                        INSERT INTO publications (asset_uuid, filename, moment_name, platform, account, published_url, published_at_utc)
+                        VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
                     """, pub_rows)
                     
                     # Calculate new stage
@@ -3791,15 +3821,59 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                     new_stage = 'M500' if total_pub_after >= len(curated_assets_info) else ('M450' if total_pub_after > 0 else 'M400')
 
                     cursor.execute("""
-                        INSERT INTO curated_moments (moment_name, memory_stage)
-                        VALUES (?, ?)
-                        ON CONFLICT(moment_name) DO UPDATE SET memory_stage = excluded.memory_stage
-                    """, (moment_name, new_stage))
+                        INSERT INTO curated_moments (moment_name, memory_stage, shutterfly_url, youtube_url)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(moment_name) DO UPDATE SET
+                            memory_stage = excluded.memory_stage,
+                            shutterfly_url = COALESCE(excluded.shutterfly_url, curated_moments.shutterfly_url),
+                            youtube_url = COALESCE(excluded.youtube_url, curated_moments.youtube_url)
+                    """, (moment_name, new_stage, shutterfly_url_val, youtube_url_val))
                     
                     conn.commit()
                     print(f"✅ Recorded publication of {len(pub_rows)} assets for '{moment_name}' in database (Stage: {new_stage}).")
                 except Exception as e:
                     logger.warning(f"Failed to record publication: {e}")
+                    conn.rollback()
+            close_conn()
+            release_planner_lock()
+        elif choice == '7':
+            moment_name = input("Enter Moment Name to set/update Published URLs: ").strip()
+            if moment_name.isdigit():
+                idx = int(moment_name)
+                if idx in displayed_moments_map:
+                    moment_name = displayed_moments_map[idx]['name']
+            if not moment_name:
+                continue
+            acquire_planner_lock()
+            conn = get_connection()
+            conn.execute("PRAGMA busy_timeout = 30000")
+            cursor = get_cursor()
+            ensure_views_exist(cursor, conn)
+            shutterfly_url_val = input(f"🔗 Enter Shutterfly Album URL for '{moment_name}' (leave blank to keep existing): ").strip() or None
+            youtube_url_val = input(f"🔗 Enter YouTube Video URL for '{moment_name}' (leave blank to keep existing): ").strip() or None
+            if shutterfly_url_val or youtube_url_val:
+                try:
+                    if shutterfly_url_val:
+                        cursor.execute("""
+                            UPDATE publications SET published_url = ?
+                            WHERE moment_name = ? AND LOWER(platform) LIKE '%shutterfly%'
+                        """, (shutterfly_url_val, moment_name))
+                    if youtube_url_val:
+                        cursor.execute("""
+                            UPDATE publications SET published_url = ?
+                            WHERE moment_name = ? AND LOWER(platform) LIKE '%youtube%'
+                        """, (youtube_url_val, moment_name))
+                    cursor.execute("""
+                        INSERT INTO curated_moments (moment_name, shutterfly_url, youtube_url)
+                        VALUES (?, ?, ?)
+                        ON CONFLICT(moment_name) DO UPDATE SET
+                            shutterfly_url = COALESCE(excluded.shutterfly_url, curated_moments.shutterfly_url),
+                            youtube_url = COALESCE(excluded.youtube_url, curated_moments.youtube_url)
+                    """, (moment_name, shutterfly_url_val, youtube_url_val))
+                    conn.commit()
+                    print(f"✅ Updated published URLs for '{moment_name}'.")
+                except Exception as e:
+                    logger.warning(f"Failed to update published URLs: {e}")
                     conn.rollback()
             close_conn()
             release_planner_lock()

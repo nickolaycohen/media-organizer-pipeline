@@ -431,7 +431,12 @@ Examples:
     parser.add_argument("--no-clean", action="store_true",
                         help="Do not delete empty directories from the source folder after moving")
 
-    return parser.parse_args()
+    parsed = parser.parse_args()
+    if parsed.source:
+        parsed.source = parsed.source.strip().strip("'\"")
+    if parsed.destination:
+        parsed.destination = parsed.destination.strip().strip("'\"")
+    return parsed
 
 
 if __name__ == "__main__":

@@ -62,6 +62,21 @@ def set_batch_status(cursor, month, current_code, success=True, session_id=None)
     except Exception as e:
         print(f"[DB] ❌ Failed to update status for {month}: {e}")
 
+def clean_path(path_str):
+    """
+    Trims surrounding whitespace, single quotes, double quotes, and trailing slashes 
+    from pathnames (e.g. copied from macOS Finder 'Copy as Pathname').
+    """
+    if not path_str:
+        return path_str
+    p = str(path_str).strip()
+    # Strip surrounding matching quotes
+    if (p.startswith("'") and p.endswith("'")) or (p.startswith('"') and p.endswith('"')):
+        p = p[1:-1].strip()
+    # Also strip any residual leading/trailing literal single or double quotes
+    p = p.strip("'\"").strip()
+    return p
+
 def get_full_transition_path(transitions, current_status):
     path = []
     status = current_status

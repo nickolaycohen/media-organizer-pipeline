@@ -33,6 +33,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from constants import MERGE_LOG_PATH
 from utils.logger import setup_logger
+from utils.utils import clean_path
 
 MODULE_TAG = "merge_directories"
 logger = setup_logger(MERGE_LOG_PATH, MODULE_TAG)
@@ -163,8 +164,8 @@ def merge_directories(
       dry_run: If True, simulates without moving or copying
       clean_empty: If True (and mode=='move'), deletes empty source folders
     """
-    source_dir = os.path.abspath(source_dir)
-    dest_dir = os.path.abspath(dest_dir)
+    source_dir = os.path.abspath(clean_path(source_dir))
+    dest_dir = os.path.abspath(clean_path(dest_dir))
 
     print("=" * 78)
     print("📁 RECURSIVE FILE MERGER UTILITY")
@@ -415,8 +416,8 @@ Examples:
   python3 scripts/merge_directories.py /path/to/source /path/to/dest --on-collision overwrite
         """
     )
-    parser.add_argument("source", help="Source directory containing files to merge")
-    parser.add_argument("destination", help="Destination directory to merge into")
+    parser.add_argument("source", type=clean_path, help="Source directory containing files to merge")
+    parser.add_argument("destination", type=clean_path, help="Destination directory to merge into")
     
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument("--move", dest="mode", action="store_const", const="move", default="move",

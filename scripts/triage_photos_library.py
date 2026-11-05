@@ -36,6 +36,7 @@ from constants import (
     MEDIA_EXTENSIONS
 )
 from utils.logger import setup_logger
+from utils.utils import clean_path
 from scripts.triage_media_intake import (
     LibraryIndex,
     determine_triage_id,
@@ -916,11 +917,11 @@ def parse_args():
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("library_path",
+    parser.add_argument("library_path", type=clean_path,
                         help="Path to the Apple Photos Library bundle (.photoslibrary / .photolibrary)")
-    parser.add_argument("--lacie-dest-dir", "--dest-dir", dest="lacie_dest_dir", default=None,
+    parser.add_argument("--lacie-dest-dir", "--dest-dir", dest="lacie_dest_dir", type=clean_path, default=None,
                         help=f"LaCie base destination directory for Review-Similar and New (default: {TRIAGE_LACIE_DESTINATION_ROOT})")
-    parser.add_argument("--dell-dest-dir", dest="dell_dest_dir", default=None,
+    parser.add_argument("--dell-dest-dir", dest="dell_dest_dir", type=clean_path, default=None,
                         help=f"DELL1TB02 base destination directory for Duplicates (default: {TRIAGE_DELL_DESTINATION_ROOT})")
     parser.add_argument("--triage-id", default=None,
                         help="Custom triage session ID (default: auto-increment integer ID from database)")

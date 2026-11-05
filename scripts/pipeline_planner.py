@@ -436,23 +436,52 @@ def ignore_all_assets_for_batch(cursor, conn, import_uuids, camera_model, camera
     print(f"\n✅ Marked {count} asset(s) as ignored for {camera_model} in {month}. Continuing with planner...")
     return True
 
+def mark_import_invalid(cursor, conn, import_uuids, camera_model, camera_make, month):
+    """
+    Marks the import session(s) as INVALID and ignores all their assets for this month.
+    """
+    placeholders = ','.join(['?' for _ in import_uuids])
+    cursor.execute(f"""
+        UPDATE assets
+        SET ignore_continuity_check = 1, updated_at_utc = CURRENT_TIMESTAMP
+        WHERE import_id IN ({placeholders})
+          AND month = ?
+          AND (ignore_continuity_check = 0 OR ignore_continuity_check IS NULL)
+    """, import_uuids + [month])
+    asset_count = cursor.rowcount
+
+    cursor.execute(f"""
+        UPDATE imports
+        SET status_code = 'INVALID', sequencing_confirmed = 1
+        WHERE import_uuid IN ({placeholders})
+          AND camera_model = ?
+    """, import_uuids + [camera_model])
+
+    conn.commit()
+    logger.info(f"🚫 Marked import session(s) {import_uuids} for {camera_model} as INVALID ({asset_count} assets ignored).")
+    print(f"\n🚫 Marked import session(s) as INVALID and ignored {asset_count} asset(s). Continuing with planner...")
+    return True
+
 def handle_reasonability_rejection(cursor, conn, import_uuids, camera_model, camera_make, month, label=""):
     """
     Handles user rejecting reasonability for an import session or batch.
-    Prompts the user to triage assets one by one or ignore the whole batch.
+    Prompts the user to triage assets one by one, ignore the whole batch, or mark as INVALID.
     """
     print(f"\n❌ Reasonability rejected for {camera_model or 'Unknown'}{f' ({label})' if label else ''}.")
     print("\nHow would you like to handle these assets?")
     print("  [1] Triage assets one by one (select individual assets to ignore)")
     print("  [2] Ignore the whole batch (ignore all involved assets for this month)")
+    print("  [3] Mark import session(s) as INVALID (ignore import & all its assets)")
     print("  [Q] Quit / abort execution")
     
-    choice = input("\nSelection [1/2/Q]: ").strip().lower()
+    choice = input("\nSelection [1/2/3/Q]: ").strip().lower()
     
     if choice == '1':
         return prompt_asset_level_triage(cursor, conn, import_uuids, camera_model or "Unknown", camera_make or "Unknown", month)
     elif choice == '2':
         return ignore_all_assets_for_batch(cursor, conn, import_uuids, camera_model or "Unknown", camera_make or "Unknown", month)
+    elif choice == '3':
+        return mark_import_invalid(cursor, conn, import_uuids, camera_model or "Unknown", camera_make or "Unknown", month)
     else:
         logger.error("Execution halted by user. Source data needs fixing.")
         close_conn()
@@ -1005,6 +1034,7 @@ def get_scoped_before_after_strings(cursor, model, month_str, pattern, owner_nam
         SELECT MIN(min_filename), MAX(max_filename), MIN(min_date), MAX(max_date)
         FROM imports
         WHERE camera_model = ?
+          AND (status_code IS NULL OR status_code != 'INVALID')
           AND max_date < ?
           AND (? IS NULL OR min_date >= ?)
           AND min_filename GLOB ?
@@ -1018,7 +1048,7 @@ def get_scoped_before_after_strings(cursor, model, month_str, pattern, owner_nam
         cursor.execute("""
             SELECT MIN(min_filename), MAX(max_filename), MIN(min_date), MAX(max_date)
             FROM imports
-            WHERE camera_model = ? AND max_date < ? AND min_filename GLOB ?
+            WHERE camera_model = ? AND (status_code IS NULL OR status_code != 'INVALID') AND max_date < ? AND min_filename GLOB ?
         """, (model, month_start_ts, pattern))
         b_all = cursor.fetchone()
         prev_owner_row = None
@@ -1047,6 +1077,7 @@ def get_scoped_before_after_strings(cursor, model, month_str, pattern, owner_nam
         SELECT MIN(min_filename), MAX(max_filename), MIN(min_date), MAX(max_date)
         FROM imports
         WHERE camera_model = ?
+          AND (status_code IS NULL OR status_code != 'INVALID')
           AND min_date >= date(?, 'start of month', '+1 month')
           AND (? IS NULL OR max_date <= ?)
           AND min_filename GLOB ?
@@ -1060,7 +1091,7 @@ def get_scoped_before_after_strings(cursor, model, month_str, pattern, owner_nam
         cursor.execute("""
             SELECT MIN(min_filename), MAX(max_filename), MIN(min_date), MAX(max_date)
             FROM imports
-            WHERE camera_model = ? AND min_date >= date(?, 'start of month', '+1 month') AND min_filename GLOB ?
+            WHERE camera_model = ? AND (status_code IS NULL OR status_code != 'INVALID') AND min_date >= date(?, 'start of month', '+1 month') AND min_filename GLOB ?
         """, (model, f"{month_str}-01", pattern))
         a_all = cursor.fetchone()
         next_owner_row = None
@@ -1149,6 +1180,7 @@ def check_active_sources_import_status(cursor, conn, month, auto_apply):
                     LEFT JOIN assets loc ON loc.asset_id = a.ZUUID
                     WHERE a.ZTRASHEDSTATE = 0
                       AND (loc.ignore_continuity_check = 0 OR loc.ignore_continuity_check IS NULL)
+                      AND (i.status_code IS NULL OR i.status_code != 'INVALID')
                       AND xa.ZCAMERAMODEL IN ({placeholders_m})
                       AND a.ZDATECREATED >= (strftime('%s', date(?, 'start of month', '-2 day')) - 978307200)
                       AND a.ZDATECREATED < (strftime('%s', date(?, 'start of month', '+1 month', '+2 day')) - 978307200)
@@ -1249,6 +1281,7 @@ def check_active_sources_import_status(cursor, conn, month, auto_apply):
                         WHERE camera_model = ?
                           AND months_detected LIKE ?
                           AND sequencing_confirmed = 1
+                          AND (status_code IS NULL OR status_code != 'INVALID')
                           AND (? IS NULL OR min_date >= ?)
                     """, (model, f'%{previous_month}%', owner_start_ts, owner_start_ts))
                     prev_month_data = cursor.fetchone()
@@ -1329,7 +1362,7 @@ def check_active_sources_import_status(cursor, conn, month, auto_apply):
                     proceed_input = input(f"Some active sources are missing imports for {month_str}. Do you want to proceed? [y/N]: ")
                     if proceed_input.strip().lower() != 'y':
                         logger.info("Operation aborted by user due to missing active source imports.")
-                        sys.exit(0)
+                        return False
                 else:
                     if missing_family_members:
                         logger.error(f"❌ Auto-apply aborted: Missing active family member imports ({', '.join(missing_family_members)}) for {month_str}. Manual intervention required.")
@@ -1357,6 +1390,7 @@ def check_active_sources_import_status(cursor, conn, month, auto_apply):
                         SELECT COUNT(*) FROM imports
                         WHERE import_uuid IN ({}) AND camera_model = ?
                           AND (sequencing_confirmed = 0 OR sequencing_confirmed IS NULL)
+                          AND (status_code IS NULL OR status_code != 'INVALID')
                     """.format(placeholders), import_id_list + [model])
                     unconfirmed_count = cursor.fetchone()[0]
 
@@ -1518,6 +1552,7 @@ def verify_sequencing_for_planned_month(cursor, conn, month, auto_apply):
           AND COALESCE(zea.ZCAMERAMAKE, 'Unknown') = COALESCE(i.camera_make, 'Unknown')
           AND (a.ignore_continuity_check = 0 OR a.ignore_continuity_check IS NULL)
           AND (i.sequencing_confirmed = 0 OR i.sequencing_confirmed IS NULL)
+          AND (i.status_code IS NULL OR i.status_code != 'INVALID')
     """, (month,))
     unconfirmed = cursor.fetchall()
 
@@ -1663,6 +1698,7 @@ def verify_sequencing_for_planned_month(cursor, conn, month, auto_apply):
         WHERE a.month = ? 
           AND (a.ignore_continuity_check = 0 OR a.ignore_continuity_check IS NULL)
           AND (i.sequencing_confirmed = 0 OR i.sequencing_confirmed IS NULL)
+          AND (i.status_code IS NULL OR i.status_code != 'INVALID')
     """, (month,))
     remaining = cursor.fetchone()[0]
     return remaining == 0
@@ -1744,9 +1780,23 @@ def run_memory_publishing_flow(cursor=None, conn=None):
             init_cursor.execute("ALTER TABLE threshold_history ADD COLUMN threshold_met INTEGER DEFAULT 0;")
         if 'auto_synced' not in cols:
             init_cursor.execute("ALTER TABLE threshold_history ADD COLUMN auto_synced INTEGER DEFAULT 0;")
+
+        # Ensure URL tracking columns exist in curated_moments and publications
+        init_cursor.execute("PRAGMA table_info(curated_moments);")
+        cm_cols = [c[1] for c in init_cursor.fetchall()]
+        if 'shutterfly_url' not in cm_cols:
+            init_cursor.execute("ALTER TABLE curated_moments ADD COLUMN shutterfly_url TEXT;")
+        if 'youtube_url' not in cm_cols:
+            init_cursor.execute("ALTER TABLE curated_moments ADD COLUMN youtube_url TEXT;")
+
+        init_cursor.execute("PRAGMA table_info(publications);")
+        pub_cols = [c[1] for c in init_cursor.fetchall()]
+        if 'published_url' not in pub_cols:
+            init_cursor.execute("ALTER TABLE publications ADD COLUMN published_url TEXT;")
+
         init_conn.commit()
     except Exception as e:
-        logger.warning(f"Could not initialize threshold_history table: {e}")
+        logger.warning(f"Could not initialize threshold_history table or URL columns: {e}")
 
     # Fetch historical minimum threshold
     historical_min = 0.0
@@ -3743,6 +3793,11 @@ def run_memory_publishing_flow(cursor=None, conn=None):
             cursor.execute("SELECT asset_uuid FROM publications WHERE moment_name = ?", (moment_name,))
             already_published = set(row[0] for row in cursor.fetchall())
 
+            cursor.execute("SELECT shutterfly_url, youtube_url FROM curated_moments WHERE moment_name = ?", (moment_name,))
+            cm_row = cursor.fetchone()
+            existing_shutterfly_url = cm_row[0] if cm_row and cm_row[0] else None
+            existing_youtube_url = cm_row[1] if cm_row and cm_row[1] else None
+
             # Filter target assets to publish
             if selected_rec:
                 rec_bases = set(selected_rec['rec_bases'])
@@ -3759,7 +3814,43 @@ def run_memory_publishing_flow(cursor=None, conn=None):
             target_assets = [(aid, fn) for aid, fn in target_assets if aid not in already_published]
 
             if not target_assets:
-                print(f"ℹ️ All selected assets for '{moment_name}' are already marked as published.")
+                print(f"ℹ️ All selected assets for '{moment_name}' are already marked as published ({len(already_published)} published).")
+                if existing_shutterfly_url:
+                    print(f"  🔗 Current Shutterfly URL: {existing_shutterfly_url}")
+                if existing_youtube_url:
+                    print(f"  🔗 Current YouTube URL:    {existing_youtube_url}")
+                update_url_choice = input("\nDo you want to update the publication URL(s) for this moment? [y/N]: ").strip().lower()
+                if update_url_choice == 'y':
+                    sf_prompt = f"Enter Shutterfly Album URL [{existing_shutterfly_url}]: " if existing_shutterfly_url else "Enter Shutterfly Album URL (or press Enter to skip): "
+                    sf_in = input(sf_prompt).strip().strip("'\"")
+                    new_sf_url = sf_in if sf_in else existing_shutterfly_url
+
+                    yt_prompt = f"Enter YouTube Video/Playlist URL [{existing_youtube_url}]: " if existing_youtube_url else "Enter YouTube Video/Playlist URL (or press Enter to skip): "
+                    yt_in = input(yt_prompt).strip().strip("'\"")
+                    new_yt_url = yt_in if yt_in else existing_youtube_url
+
+                    cursor.execute("""
+                        INSERT INTO curated_moments (moment_name, shutterfly_url, youtube_url)
+                        VALUES (?, ?, ?)
+                        ON CONFLICT(moment_name) DO UPDATE SET
+                            shutterfly_url = COALESCE(excluded.shutterfly_url, curated_moments.shutterfly_url),
+                            youtube_url = COALESCE(excluded.youtube_url, curated_moments.youtube_url)
+                    """, (moment_name, new_sf_url, new_yt_url))
+
+                    if new_sf_url:
+                        cursor.execute("""
+                            UPDATE publications
+                            SET published_url = ?
+                            WHERE moment_name = ? AND platform = 'Shutterfly'
+                        """, (new_sf_url, moment_name))
+                    if new_yt_url:
+                        cursor.execute("""
+                            UPDATE publications
+                            SET published_url = ?
+                            WHERE moment_name = ? AND platform = 'YouTube'
+                        """, (new_yt_url, moment_name))
+                    conn.commit()
+                    print(f"✅ Updated publication URL(s) for '{moment_name}' in database.")
                 close_conn()
                 release_planner_lock()
                 continue
@@ -3781,8 +3872,9 @@ def run_memory_publishing_flow(cursor=None, conn=None):
             pub_choice = input("Enter selection [1]: ").strip()
 
             pub_rows = []
-            shutterfly_url_val = None
-            youtube_url_val = None
+            shutterfly_url_val = existing_shutterfly_url
+            youtube_url_val = existing_youtube_url
+
             if pub_choice == '2':
                 custom_platform = input("Enter platform [e.g. Shutterfly, YouTube, Google Photos]: ").strip()
                 if not custom_platform:
@@ -3790,18 +3882,24 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                 custom_account = input("Enter account email [default: nickolay.cohen@gmail.com]: ").strip()
                 if not custom_account:
                     custom_account = "nickolay.cohen@gmail.com"
-                custom_url = input(f"🔗 Enter published URL on {custom_platform} for '{moment_name}' (optional, press Enter to skip): ").strip() or None
+                custom_url = input(f"🔗 Enter published URL on {custom_platform} for '{moment_name}' (optional, press Enter to skip): ").strip().strip("'\"") or None
                 if "shutterfly" in custom_platform.lower():
-                    shutterfly_url_val = custom_url
+                    shutterfly_url_val = custom_url or existing_shutterfly_url
                 elif "youtube" in custom_platform.lower():
-                    youtube_url_val = custom_url
+                    youtube_url_val = custom_url or existing_youtube_url
+
                 for aid, fn in target_assets:
                     pub_rows.append((aid, fn or '', moment_name, custom_platform, custom_account, custom_url))
             else:
                 if photos:
-                    shutterfly_url_val = input(f"🔗 Enter Shutterfly Album URL for '{moment_name}' ({len(photos)} photos) [optional, press Enter to skip]: ").strip() or None
+                    prompt_sf = f"🔗 Enter Shutterfly Album URL for '{moment_name}' ({len(photos)} photos) [{existing_shutterfly_url}]: " if existing_shutterfly_url else f"🔗 Enter Shutterfly Album URL for '{moment_name}' ({len(photos)} photos) [optional, press Enter to skip]: "
+                    sf_in = input(prompt_sf).strip().strip("'\"")
+                    shutterfly_url_val = (sf_in if sf_in else existing_shutterfly_url) or None
                 if videos:
-                    youtube_url_val = input(f"🔗 Enter YouTube Video/Playlist URL for '{moment_name}' ({len(videos)} videos) [optional, press Enter to skip]: ").strip() or None
+                    prompt_yt = f"🔗 Enter YouTube Video/Playlist URL for '{moment_name}' ({len(videos)} videos) [{existing_youtube_url}]: " if existing_youtube_url else f"🔗 Enter YouTube Video/Playlist URL for '{moment_name}' ({len(videos)} videos) [optional, press Enter to skip]: "
+                    yt_in = input(prompt_yt).strip().strip("'\"")
+                    youtube_url_val = (yt_in if yt_in else existing_youtube_url) or None
+
                 for aid, fn in photos:
                     pub_rows.append((aid, fn or '', moment_name, 'Shutterfly', 'nickolay.cohen@gmail.com', shutterfly_url_val))
                 for aid, fn in videos:
@@ -3878,6 +3976,13 @@ def run_memory_publishing_flow(cursor=None, conn=None):
             close_conn()
             release_planner_lock()
         elif choice == 'e':
+            if photos_db_attached:
+                try:
+                    cursor.execute("DETACH DATABASE photos_db;")
+                except Exception:
+                    pass
+            close_conn()
+            release_planner_lock()
             break
 
 def resolve_device_owner(cursor, camera_model, asset_date=None):
@@ -5271,24 +5376,658 @@ def display_media_cleanup_recommendations(cursor, verbose=True):
     # Print to console
     print('\n' + '\n'.join(cleanup_report))
 
+
+def run_batch_management_flow(auto_apply):
+    while True:
+        acquire_planner_lock()
+        conn = get_connection()
+        conn.execute("PRAGMA busy_timeout = 30000")
+        cursor = get_cursor()
+        ensure_views_exist(cursor, conn)
+
+        # Check for completed batches that have new assets imported since their last update
+        cursor.execute("""
+            SELECT 
+                mb.month, 
+                mb.updated_at_utc, 
+                MAX(a.imported_date_utc), 
+                COUNT(DISTINCT CASE WHEN a.imported_date_utc > mb.updated_at_utc THEN a.asset_id END) AS late_asset_count
+            FROM month_batches mb
+            JOIN assets a ON a.month = mb.month
+            LEFT JOIN imports i ON i.import_uuid = a.import_id
+            WHERE mb.status_code >= '600'
+              AND (a.ignore_continuity_check = 0 OR a.ignore_continuity_check IS NULL)
+              AND (i.status_code IS NULL OR i.status_code != 'INVALID')
+              AND LOWER(COALESCE(a.MomentsAlbumName, '')) NOT IN ('ignore', 'skippublishing')
+            GROUP BY mb.month
+            HAVING late_asset_count > 0
+        """)
+        outdated_batches = cursor.fetchall()
+        if outdated_batches:
+            print("\n==================================================")
+            print("🔄 Detected New Assets in Completed Batches")
+            print("==================================================")
+            print("The following processed/finalized batches have new imported photos:")
+            for month, finalized_at, newest_import, late_count in outdated_batches:
+                print(f" - {month}: Finalized on {finalized_at}, Newest import: {newest_import} ({late_count} new asset(s))")
+        
+            for month, finalized_at, newest_import, late_count in outdated_batches:
+                if not auto_apply:
+                    reset_input = input(f"\nDo you want to reset batch {month} to status '000' (added) to re-process new assets? [y/N]: ").strip().lower()
+                    if reset_input == 'y':
+                        cursor.execute("UPDATE month_batches SET status_code = '000', updated_at_utc = CURRENT_TIMESTAMP WHERE month = ?", (month,))
+                        conn.commit()
+                        logger.info(f"✅ Reset batch {month} to status '000'.")
+                    else:
+                        ignore_choice = input(f"Mark these {late_count} new asset(s) for {month} as ignored/invalid so this prompt is not shown again? [Y/n]: ").strip().lower()
+                        if ignore_choice != 'n':
+                            finalized_at_str = str(finalized_at)
+                            cursor.execute("""
+                                SELECT DISTINCT import_id
+                                FROM assets
+                                WHERE month = ? AND imported_date_utc > ?
+                                  AND import_id IS NOT NULL AND import_id != ''
+                            """, (month, finalized_at_str))
+                            late_import_ids = [r[0] for r in cursor.fetchall()]
+
+                            cursor.execute("""
+                                UPDATE assets
+                                SET ignore_continuity_check = 1, updated_at_utc = CURRENT_TIMESTAMP
+                                WHERE month = ? AND imported_date_utc > ?
+                            """, (month, finalized_at_str))
+
+                            if late_import_ids:
+                                placeholders = ','.join(['?' for _ in late_import_ids])
+                                cursor.execute(f"""
+                                    UPDATE imports
+                                    SET status_code = 'INVALID', sequencing_confirmed = 1
+                                    WHERE import_uuid IN ({placeholders})
+                                """, late_import_ids)
+
+                            cursor.execute("UPDATE month_batches SET updated_at_utc = CURRENT_TIMESTAMP WHERE month = ?", (month,))
+                            conn.commit()
+                            logger.info(f"✅ Marked {late_count} new asset(s) and imports {late_import_ids} for batch {month} as ignored/INVALID.")
+
+        # Shared credentials for all Google API calls in this planner session
+        creds = authenticate(scopes=PLANNER_REQUIRED_SCOPES)
+
+        # Pre-fetch remote favorites to avoid repeated API calls during analysis
+        remote_favs_cache = None
+        try:
+            logger.info("🌐 Fetching remote favorites from Google Photos API to verify curation status...")
+            remote_favs_cache = get_all_favorites(creds)
+        
+            # Auto-run retroactive favorites sync for bypassed months
+            try:
+                cursor.execute("SELECT month FROM month_batches WHERE is_bypassed = 1")
+                byp_months = [row[0] for row in cursor.fetchall()]
+                if byp_months:
+                    logger.info(f"🔄 Auto-syncing late favorites for bypassed months: {byp_months}...")
+                    from google_photos import create_or_get_album
+                    from pull_google_favorites import get_album_items
+                
+                    favorite_set = {(f.get('filename'), f.get('mediaMetadata', {}).get('creationTime')) for f in remote_favs_cache}
+                    for bm in byp_months:
+                        album_title = f"Currently Curating - {bm}"
+                        album_id = create_or_get_album(creds, album_title)
+                        if album_id:
+                            album_items = get_album_items(creds, album_id)
+                            matched = [item for item in album_items
+                                       if (item.get('filename'), item.get('mediaMetadata', {}).get('creationTime')) in favorite_set]
+                        
+                            update_count = 0
+                            for item in matched:
+                                filename = item.get('filename')
+                                raw_creation_time = item.get('mediaMetadata', {}).get('creationTime', '')
+                                creation_time = raw_creation_time.replace('T', ' ').split('.')[0] if raw_creation_time else ''
+                                if filename and creation_time:
+                                    cursor.execute("""
+                                        UPDATE assets
+                                        SET google_favorite = 1, updated_at_utc = datetime('now')
+                                        WHERE original_filename = ? AND date_created_utc = ? AND month = ? AND MomentsAlbumName IS NOT NULL AND google_favorite = 0
+                                    """, (filename, creation_time, bm))
+                                    if cursor.rowcount:
+                                        update_count += 1
+                            if update_count > 0:
+                                conn.commit()
+                                logger.info(f"⭐️ Retroactively synced {update_count} favorites for bypassed month {bm}.")
+            except Exception as ex:
+                logger.error(f"Error during bypassed batch auto-sync: {ex}")
+            
+        except Exception as e:
+            logger.warning(f"Could not pre-fetch remote favorites: {e}")
+
+        transitions = get_stage_transitions(cursor)
+        batches = get_batch_statuses(cursor)
+
+        display_summary(transitions, batches, cursor, remote_favs_cache)
+
+        # Media cleanup recommendations for source cameras
+        display_media_cleanup_recommendations(cursor, verbose=False)
+
+        # Proactive check for new month readiness
+        if batches:
+            latest_month_str, latest_status = batches[0][:2]  # Ordered DESC
+            if str(latest_status) >= '600':
+                now = datetime.now()
+                current_month_str = now.strftime('%Y-%m')
+                if latest_month_str < current_month_str:
+                    latest_dt = datetime.strptime(latest_month_str, '%Y-%m')
+                    next_dt = (latest_dt + timedelta(days=32)).replace(day=1)
+                    next_month_str = next_dt.strftime('%Y-%m')
+                
+                    # Only suggest if the next month hasn't even started (not in batches)
+                    if next_month_str not in [b[0] for b in batches]:
+                        logger.info(f"✨ Current pipeline progress: {latest_month_str} is complete.")
+                        active_for_next = []
+                        for m in ACTIVE_CAMERA_MODELS:
+                            is_act, own, _ = get_device_ownership_for_month(cursor, m, next_month_str)
+                            if is_act:
+                                active_for_next.append(f"{m} ({own})")
+                        sources_label = ', '.join(active_for_next) if active_for_next else ', '.join(ACTIVE_CAMERA_MODELS)
+                        logger.info(f"💡 Suggestion: Ready to start {next_month_str}. Ensure all active sources ({sources_label}) are imported into Apple Photos.")
+
+        logger.info("=== ✅ Suggested Action ===")
+
+        # Fetch all months in descending order, excluding the current calendar month
+        # as it is considered incomplete for processing.
+        # TODO - month selection also should be done after the transition type is determined 
+        current_month_str = datetime.now().strftime('%Y-%m')
+        cursor.execute("SELECT DISTINCT month FROM month_batches WHERE month < ? ORDER BY month DESC", (current_month_str,))
+        months_descending = [row[0] for row in cursor.fetchall()]
+
+        # Collect candidates for each transition type, across all months
+        manual_candidates = []
+        retryable_candidates = []
+        pipeline_candidates = []
+
+        for month in months_descending:
+            month_status = None
+            for m, s in [b[:2] for b in batches]:
+                if m == month:
+                    month_status = s
+                    break
+            if month_status is None:
+                continue
+
+            # Filter the pre-fetched transitions list for this month's status using string comparison
+            transitions_for_month = [
+                t for t in transitions 
+                if str(t[1]) == str(month_status)
+            ]
+
+            # If in an error state (e.g., 400E), find the transition that was attempted (code=400)
+            # so we can suggest a retry.
+            if not transitions_for_month and str(month_status).endswith('E'):
+                failed_code = str(month_status)[:-1]
+                # Find the transition where the target code is the one that failed
+                retry_candidates = [t for t in transitions if str(t[0]) == failed_code]
+                for t in retry_candidates:
+                    logger.info(f"Found error state '{month_status}' for {month}. Suggesting retry of step {failed_code}.")
+                    # Treat as a retryable candidate to prioritize resolving the failure
+                    retryable_candidates.append((month, t))
+
+            logger.debug(f"Inspecting transitions for month {month} with status {month_status}")
+            for t in transitions_for_month:
+                if t[3] == 'manual':
+                    logger.debug(f"Found manual transition candidate for month {month}: {t[2]} (code {t[1]}) -> (code {t[0]})")
+                    manual_candidates.append((month, t))
+                elif t[3] == 'retryable':
+                    logger.debug(f"Found retryable transition candidate for month {month}: {t[2]} (code {t[1]}) -> (code {t[0]})")
+                    retryable_candidates.append((month, t))
+                elif t[3] == 'pipeline':
+                    logger.debug(f"Found pipeline transition candidate for month {month}: {t[2]} (code {t[1]}) -> (code {t[0]})")
+                
+                    is_delay = False
+                    if t[0] == '650':
+                        cursor.execute("SELECT is_bypassed, bypass_timestamp FROM month_batches WHERE month = ?", (month,))
+                        row_byp = cursor.fetchone()
+                        if row_byp and row_byp[0] == 1 and row_byp[1]:
+                            try:
+                                bypass_dt = datetime.strptime(row_byp[1], "%Y-%m-%d %H:%M:%S")
+                                now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+                                elapsed = (now_utc - bypass_dt).total_seconds() / 86400
+                                if elapsed < 14:
+                                    is_delay = True
+                                    logger.info(f"⏳ Cleanup delayed for bypassed batch {month}. {14 - elapsed:.1f} days remaining in grace period.")
+                            except Exception as e:
+                                logger.error(f"Error parsing bypass_timestamp for {month}: {e}")
+                
+                    if not is_delay:
+                        pipeline_candidates.append((month, t))
+
+        # Precedence: manual > retryable > pipeline. Sort by month descending to prioritize newer batches.
+        manual_candidates.sort(key=lambda x: x[0], reverse=True)
+        retryable_candidates.sort(key=lambda x: x[0], reverse=True)
+        pipeline_candidates.sort(key=lambda x: x[0], reverse=True)
+
+        selected_month = None
+        selected_transition = None
+
+        # Check active queue to skip already-queued candidates
+        cursor.execute("SELECT planned_month FROM planned_execution WHERE active = 1")
+        active_planned_set = set(row[0] for row in cursor.fetchall())
+
+        logger.info("🔍 Evaluating manual transition candidates...")
+        transition_applied = False
+        for month, transition in manual_candidates:
+            if month in active_planned_set:
+                logger.info(f"  ⏭️ Skipping {month} (already in planned execution queue).")
+                continue
+            selected_code, selected_prev, selected_desc, selected_type, short_label = transition
+            logger.info(f"  Checking {month} ({selected_desc}, status {selected_prev})...")
+
+            cursor.execute("SELECT MAX(updated_at_utc) FROM assets WHERE uploaded_to_google = 1 AND month = ?", (month,))
+            result = cursor.fetchone()
+            last_completed_at = result[0] if result else None
+            elapsed_days = None
+            if last_completed_at:
+                try:
+                    last_dt = datetime.strptime(last_completed_at, "%Y-%m-%d %H:%M:%S")
+                    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+                    elapsed_days = (now_utc - last_dt).total_seconds() / 86400
+                except: pass
+
+            fav_count, source, _ = check_favorites_count(cursor, month, check_remote=True, all_favs=remote_favs_cache, creds=creds)
+
+            if fav_count == 0 and elapsed_days is not None and elapsed_days < 3:
+                logger.info(f"    ⏸️ Too soon: Only {elapsed_days:.1f} days since upload and no favorites found. Need 3 days for Google AI curation.")
+                continue
+
+            if fav_count == 0:
+                if selected_prev == '500':
+                    logger.info(f"    ⏸️ Manual transition blocked: No favorites in Google Photos.")
+                    continue
+                else:
+                    logger.warning(f"    ⚠️ No favorites found for {month}. Starring may not be complete.")
+            else:
+                logger.info(f"    ✨ Detected {fav_count} favorites ({source}).")
+
+            if not auto_apply:
+                if fav_count == 0:
+                    proceed_input = input(f"\nPlease confirm: has '{short_label}' task been completed for {month}? [y/N/bypass] (Choose 'bypass' to proceed with aesthetic ranking only): ").strip().lower()
+                else:
+                    proceed_input = input(f"\nPlease confirm: has '{short_label}' task been completed for {month}? [y/N]: ").strip().lower()
+
+                if proceed_input == 'y':
+                    cursor.execute("UPDATE month_batches SET status_code = ?, is_bypassed = 0, bypass_timestamp = NULL WHERE month = ?", (selected_code, month))
+                    conn.commit()
+                    logger.info(f"✅ Month {month} status updated to {selected_code}.")
+                    close_conn()
+                    release_planner_lock()
+                    transition_applied = True
+                    break
+                elif proceed_input == 'bypass' and fav_count == 0:
+                    now_str = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+                    cursor.execute("UPDATE month_batches SET status_code = ?, is_bypassed = 1, bypass_timestamp = ? WHERE month = ?", (selected_code, now_str, month))
+                    conn.commit()
+                    logger.info(f"✅ Month {month} status updated to {selected_code} (Direct-Rank Bypassed).")
+                    close_conn()
+                    release_planner_lock()
+                    transition_applied = True
+                    break
+                else:
+                    logger.info(f"  Skipped manual transition for {month}. Checking next candidate...")
+                    continue
+            else:
+                logger.info(f"  Auto-apply enabled; skipping manual task {month} for safety. Checking next candidate...")
+                continue
+
+        if transition_applied:
+            continue
+
+        logger.info("🔍 Evaluating retryable transition candidates...")
+        transition_applied = False
+        for month, transition in retryable_candidates:
+            if month in active_planned_set:
+                logger.info(f"  ⏭️ Skipping {month} (already in planned execution queue).")
+                continue
+            selected_code, selected_prev, selected_desc, selected_type, short_label = transition
+
+            # Only perform space-based analysis and branching for batches that haven't finished 
+            # their primary upload (stage < 400) and are targeting an upload operation.
+            is_upload_retry = selected_code in ['399', '400'] and int(selected_prev) < 400
+            if is_upload_retry:
+                free_space = check_google_quota(creds=creds)
+                if free_space is None:
+                    logger.error("❌ Error: Could not retrieve Google Drive quota."); close_conn(); sys.exit(1)
+
+                import glob
+                matched_folders = glob.glob(os.path.join(STAGING_ROOT, f"*{month}*"))
+                if matched_folders:
+                    staging_folder = matched_folders[0]
+                    staging_size = 0
+                    staging_eligible_count = 0
+                    staging_oversized_count = 0
+                    for root, dirs, files in os.walk(staging_folder):
+                        for f in files:
+                            ext = os.path.splitext(f)[1].lower()
+                            if ext in SUPPORTED_EXTENSIONS:
+                                fp = os.path.join(root, f)
+                                fp_size = os.path.getsize(fp)
+                                if fp_size <= MAX_UPLOAD_FILE_SIZE_BYTES:
+                                    staging_size += fp_size
+                                    staging_eligible_count += 1
+                                else:
+                                    staging_oversized_count += 1
+                    logger.info(f"Staging folder content for {month}: {human_readable_size(staging_size)} eligible upload files ({staging_eligible_count} items <= {MAX_UPLOAD_FILE_SIZE_MB}MB, {staging_oversized_count} skipped).")
+                else:
+                    staging_folder = None; staging_size = 0; logger.warning(f"No staging folder found for {month}")
+
+                cursor.execute("SELECT COUNT(*), COUNT(CASE WHEN uploaded_to_google = 1 THEN 1 END) FROM assets WHERE month = ?", (month,))
+                row_cnt = cursor.fetchone()
+                total_db_assets = row_cnt[0] if row_cnt else 0
+                uploaded_db_count = row_cnt[1] if row_cnt else 0
+
+                cursor.execute("SELECT original_filename FROM assets WHERE month = ? AND uploaded_to_google = 1", (month,))
+                uploaded_assets = cursor.fetchall()
+                latest_upload_size = 0
+                if uploaded_assets and staging_folder:
+                    for filename_tuple in uploaded_assets:
+                        file_path = os.path.join(staging_folder, filename_tuple[0])
+                        if os.path.exists(file_path):
+                            latest_upload_size += os.path.getsize(file_path)
+                logger.info(f"Upload progress: {uploaded_db_count}/{total_db_assets} assets ({human_readable_size(latest_upload_size)}) of {month} in Google Photos.")
+
+                if staging_folder and staging_size > 0:
+                    remaining_to_upload = max(0, staging_size - latest_upload_size)
+                else:
+                    remaining_to_upload = 0 if (total_db_assets > 0 and (uploaded_db_count >= total_db_assets or (staging_folder and (uploaded_db_count + staging_oversized_count) >= total_db_assets))) else 999999999999
+
+                if total_db_assets > 0 and (uploaded_db_count >= total_db_assets or (staging_folder and (uploaded_db_count + staging_oversized_count) >= total_db_assets)) and remaining_to_upload == 0:
+                    logger.info(f"✅ All eligible assets for {month} appear to be uploaded already ({uploaded_db_count} uploaded, {staging_oversized_count} skipped > {MAX_UPLOAD_FILE_SIZE_MB}MB).")
+                    if auto_apply: proceed_transition = True
+                    else:
+                        ans = input(f"All assets uploaded - transition {month} to 400 status? [y/N]: ").strip().lower()
+                        proceed_transition = ans == 'y'
+                    if proceed_transition:
+                        cursor.execute("UPDATE month_batches SET status_code = '400' WHERE month = ?", (month,))
+                        conn.commit()
+                        logger.info(f"Month {month} updated to 400.")
+                        close_conn()
+                        release_planner_lock()
+                        transition_applied = True
+                        break
+                elif staging_folder and free_space >= remaining_to_upload:
+                    logger.info(f"🚀 Found {human_readable_size(remaining_to_upload)} left to upload for {month}. "
+                                f"Available space: {human_readable_size(free_space)}. Priority given to finishing this batch.")
+                    selected_month = month
+                    selected_transition = transition
+                    break
+                else:
+                    logger.warning(f"⚠️ Insufficient space for {month}. Free: {human_readable_size(free_space)}, Need: {human_readable_size(remaining_to_upload)}.")
+                
+                    # Branch and suggest cleanup for months at stage 600
+                    cleanup_candidates = [m for m, s in [b[:2] for b in batches] if str(s) == '600']
+                    if cleanup_candidates:
+                        logger.info(f"💡 Suggestion: Drive cleanup available for processed months: {', '.join(cleanup_candidates)}")
+                        for m_c, t_c in pipeline_candidates:
+                            if m_c in cleanup_candidates and str(t_c[1]) == '600':
+                                selected_month = m_c
+                                selected_transition = t_c
+                                logger.info(f"🔄 Branching to cleanup transition (600->650) for {selected_month} to free up space.")
+                                break
+                        if selected_month:
+                            break
+                    continue
+
+        if transition_applied:
+            continue
+
+        if not selected_month:
+            logger.info("🔍 Evaluating pipeline transition candidates...")
+            available_pipeline_candidates = [
+                (m, t) for m, t in pipeline_candidates if m not in active_planned_set
+            ]
+            if not available_pipeline_candidates:
+                if active_planned_set:
+                    logger.info(f"All available pipeline candidates are already in the execution queue ({sorted(list(active_planned_set))}).")
+                else:
+                    logger.info("No pipeline transitions available.")
+                close_conn()
+                release_planner_lock()
+                if auto_apply:
+                    return "done"
+                action = input("\n--- 📋 Batch Management ---\n[Enter/R] Refresh & re-evaluate batches | [M] Main menu | [Q] Quit Planner: ").strip().lower()
+                if action in ('q', 'quit', 'exit'):
+                    return "quit"
+                elif action == 'm':
+                    return "menu"
+                else:
+                    continue
+            selected_month, selected_transition = available_pipeline_candidates[0]
+
+        latest_month = selected_month
+        selected_code, selected_prev, selected_desc, selected_type, short_label = selected_transition
+        current_status = selected_prev
+
+        if True:
+            # Build the full transition path from current status, only including pipeline transitions
+            full_transition_list = get_full_transition_path(
+                [t for t in transitions if t[3] in ['pipeline', 'retryable']],
+                str(current_status)
+            )
+
+            # Filter out delayed cleanup (600->650) for bypassed batches
+            cursor.execute("SELECT is_bypassed, bypass_timestamp FROM month_batches WHERE month = ?", (latest_month,))
+            row_byp = cursor.fetchone()
+            if row_byp and row_byp[0] == 1 and row_byp[1]:
+                try:
+                    bypass_dt = datetime.strptime(row_byp[1], "%Y-%m-%d %H:%M:%S")
+                    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+                    elapsed = (now_utc - bypass_dt).total_seconds() / 86400
+                    if elapsed < 14:
+                        # Delay cleanup
+                        full_transition_list = [t for t in full_transition_list if not t.endswith('->650')]
+                except Exception as e:
+                    logger.error(f"Error parsing bypass_timestamp for {latest_month} in full path build: {e}")
+
+            # Only perform import continuity and sequencing checks for batches that haven't reached the upload stage (400)
+            # This prevents redundant prompts for batches that are already processed or being curated.
+            if current_status and str(current_status) < '400':
+                # Verify assets exist in Media Organizer DB before proposing migration off of 000 / 100E
+                if str(current_status) in ('000', '100E'):
+                    cursor.execute("SELECT COUNT(*) FROM assets WHERE month = ?", (latest_month,))
+                    batch_asset_count = cursor.fetchone()[0]
+                    if batch_asset_count == 0:
+                        logger.warning(f"⚠️ No assets found for month '{latest_month}' in Media Organizer DB.")
+                    else:
+                        logger.info(f"✅ Verified {batch_asset_count} assets for month '{latest_month}' in Media Organizer DB. Ready for direct export.")
+
+                if not check_active_sources_import_status(cursor, conn, latest_month, auto_apply):
+                    logger.warning(f"Active sources check not confirmed for {latest_month}. Aborting plan recording.")
+                    close_conn()
+                    release_planner_lock()
+                    if auto_apply:
+                        return "done"
+                    action = input("\n[Enter/R] Re-evaluate batches | [M] Main menu | [Q] Quit Planner: ").strip().lower()
+                    if action in ('q', 'quit', 'exit'):
+                        return "quit"
+                    elif action == 'm':
+                        return "menu"
+                    else:
+                        continue
+
+                # --- Check sequencing before recording the plan ---
+                if not verify_sequencing_for_planned_month(cursor, conn, latest_month, auto_apply):
+                    logger.warning(f"Sequencing not confirmed for {latest_month}. Aborting plan recording.")
+                    close_conn()
+                    release_planner_lock()
+                    if auto_apply:
+                        return "done"
+                    action = input("\n[Enter/R] Re-evaluate batches | [M] Main menu | [Q] Quit Planner: ").strip().lower()
+                    if action in ('q', 'quit', 'exit'):
+                        return "quit"
+                    elif action == 'm':
+                        return "menu"
+                    else:
+                        continue
+
+            logger.info(f"Run pipeline for: Month={latest_month}, Transitions={full_transition_list}")
+
+            # --- Check for favorites readiness if transition involves pulling or ranking ---
+            is_favorites_pull = any('550' in str(t) or 'Pull Google' in str(t) for t in full_transition_list)
+            is_after_pull = any('Rank Assets' in str(t) or 'Ranking' in str(t) for t in full_transition_list)
+        
+            # Check if the batch is bypassed before printing favorites warnings
+            cursor.execute("SELECT is_bypassed FROM month_batches WHERE month = ?", (latest_month,))
+            row_byp = cursor.fetchone()
+            is_byp = row_byp[0] if row_byp else 0
+
+            if is_favorites_pull:
+                if is_byp:
+                    logger.info(f"ℹ️ Batch {latest_month} is running in Direct-Rank Bypass mode (no remote favorites expected).")
+                else:
+                    fav_count, source, fav_names = check_favorites_count(
+                        cursor, latest_month, check_remote=True, 
+                        all_favs=remote_favs_cache, creds=creds
+                    )
+                    if fav_count == 0:
+                        logger.warning(f"⚠️ Suggested batch {latest_month} has no favorites in Google Photos yet.")
+                    else:
+                        logger.info(f"✨ Batch {latest_month} is ready with {fav_count} favorites in Google Photos (Source: {source}).")
+            elif is_after_pull:
+                if is_byp:
+                    logger.info(f"ℹ️ Batch {latest_month} is running in Direct-Rank Bypass mode (no local favorites expected).")
+                else:
+                    fav_count, source, fav_names = check_favorites_count(
+                        cursor, latest_month, check_remote=False, 
+                        all_favs=remote_favs_cache, creds=creds
+                    )
+                    if fav_count == 0:
+                        logger.warning(f"⚠️ Suggested batch {latest_month} has 0 favorites in local DB (Source: {source}). Ranking steps may be skipped.")
+
+            # --- Begin Google quota check for upload transitions ---
+            # Determine if any transition in the pipeline represents an upload to Google (e.g., '210->399')
+            quota_check_needed = any(
+                isinstance(transition, str) and '210->399' in transition
+                or (isinstance(transition, (list, tuple)) and len(transition) >= 1 and '210->399' in str(transition))
+                for transition in full_transition_list
+            )
+            # --- End Google quota check (defer actual check to after user confirmation) ---
+
+            if not auto_apply:
+                proceed = input("Proceed with this plan? [y/N]: ")
+                if proceed.strip().lower() != 'y':
+                    logger.info("Plan cancelled by user.")
+                    close_conn()
+                    release_planner_lock()
+                    action = input("\n[Enter/R] Re-evaluate batches | [M] Main menu | [Q] Quit Planner: ").strip().lower()
+                    if action in ('q', 'quit', 'exit'):
+                        return "quit"
+                    elif action == 'm':
+                        return "menu"
+                    else:
+                        continue
+
+            # Now, if quota check is needed, perform the actual quota check before executing
+            if quota_check_needed:
+                import glob
+                matched_folders = glob.glob(os.path.join(STAGING_ROOT, f"*{latest_month}*"))
+                if matched_folders:
+                    staging_folder = matched_folders[0]
+                    staging_size = 0
+                    staging_oversized_count = 0
+                    for root, dirs, files in os.walk(staging_folder):
+                        for f in files:
+                            ext = os.path.splitext(f)[1].lower()
+                            if ext in SUPPORTED_EXTENSIONS:
+                                fp = os.path.join(root, f)
+                                fp_size = os.path.getsize(fp)
+                                if fp_size <= MAX_UPLOAD_FILE_SIZE_BYTES:
+                                    staging_size += fp_size
+                                else:
+                                    staging_oversized_count += 1
+                    logger.info(f"Detected staging folder for month {latest_month}: {staging_folder}, eligible upload size: {human_readable_size(staging_size)} (skipped {staging_oversized_count} files > {MAX_UPLOAD_FILE_SIZE_MB}MB)")
+                else:
+                    staging_folder = None
+                    staging_size = 0
+                    logger.warning(f"No staging folder found for month {latest_month}")
+                free_space = check_google_quota(creds=creds)
+                if free_space is None:
+                    logger.error("❌ Aborting: Could not retrieve Google Drive quota before upload.")
+                    close_conn()
+                    sys.exit(1)
+                if free_space < staging_size:
+                    logger.warning(f"⚠️ Insufficient space: {human_readable_size(free_space)} available vs {human_readable_size(staging_size)} required.")
+                
+                    # Perform estimation of how many assets will fit based on aesthetic score
+                    cursor.execute("SELECT original_filename, aesthetic_score FROM assets WHERE month = ?", (latest_month,))
+                    db_scores = {row[0].lower(): (row[1] or -1) for row in cursor.fetchall()}
+                
+                    staging_files = []
+                    for root, _, fnames in os.walk(staging_folder):
+                        for f in fnames:
+                            fp = os.path.join(root, f)
+                            staging_files.append((f, os.path.getsize(fp), db_scores.get(f.lower(), -1)))
+                
+                    # Sort by score descending (highest ranked first)
+                    staging_files.sort(key=lambda x: x[2], reverse=True)
+                
+                    can_upload_count = 0
+                    simulated_sum = 0
+                    for _, size, _ in staging_files:
+                        if simulated_sum + size <= free_space:
+                            simulated_sum += size
+                            can_upload_count += 1
+                        else:
+                            break
+                
+                    logger.warning(f"📊 Estimate: Only {can_upload_count} out of {len(staging_files)} assets will fit.")
+                
+                    if not auto_apply:
+                        partial_confirm = input(f"Proceed with a partial upload of the highest-ranked assets for {latest_month}? [y/N]: ")
+                        if partial_confirm.strip().lower() != 'y':
+                            logger.info("Pipeline transition aborted by user.")
+                            close_conn()
+                            release_planner_lock()
+                            action = input("\n[Enter/R] Re-evaluate batches | [M] Main menu | [Q] Quit Planner: ").strip().lower()
+                            if action in ('q', 'quit', 'exit'):
+                                return "quit"
+                            elif action == 'm':
+                                return "menu"
+                            else:
+                                continue
+                        logger.info("User confirmed partial upload. Proceeding with plan...")
+                    else:
+                        logger.error("❌ Auto-apply aborted: Insufficient space for full upload. Manual confirmation required for partial sync.")
+                        close_conn()
+                        sys.exit(1)
+                else:
+                    logger.info(f"Enough Google Drive space available for upload. Free space: {human_readable_size(free_space)}, Staging size: {human_readable_size(staging_size)}")
+
+            logger.info("🚀 Queuing planned steps for background executor...")
+            set_planned_month(cursor, latest_month)
+            conn.commit()
+            logger.info(f"📌 Month {latest_month} recorded in planned_execution. Background executor will process it automatically (monitor via: python3 scripts/monitor_executor.py).")
+
+            close_conn()
+            release_planner_lock()
+
+            if selected_type not in ['manual', 'retryable', 'pipeline']:
+                logger.warning(f"Unknown transition type '{selected_type}' for current status {current_status}.")
+
+            if auto_apply:
+                return "done"
+
+            action = input("\n--- 📋 Batch Management ---\n[Enter/R] Plan another batch / refresh | [M] Main menu | [Q] Quit Planner: ").strip().lower()
+            if action in ('q', 'quit', 'exit'):
+                return "quit"
+            elif action == 'm':
+                return "menu"
+            else:
+                continue
+
+        close_conn()
+        release_planner_lock()
+
+
 def main(auto_apply, no_sync=False):
     # Set up logger with line number in format
     atexit.register(stop_bg_service_on_exit)
     if not no_sync:
         ensure_bg_service_running()
     check_if_refresh_needed()
-
-    # Check for active planned executions in queue
-    check_conn = sqlite3.connect(MEDIA_ORGANIZER_DB_PATH)
-    check_cursor = check_conn.cursor()
-    check_cursor.execute("SELECT id, planned_month, set_at_utc FROM planned_execution WHERE active = 1 ORDER BY id ASC")
-    active_plans = check_cursor.fetchall()
-    check_conn.close()
-
-    if active_plans:
-        logger.info(f"📋 Current execution queue ({len(active_plans)} batch(es) pending — managed automatically by background executor):")
-        for plan_id, p_month, p_time in active_plans:
-            logger.info(f"   • Queue ID {plan_id}: Batch {p_month} (queued at {p_time})")
 
     # Run bootstrap steps before proceeding
     if not no_sync:
@@ -5298,566 +6037,69 @@ def main(auto_apply, no_sync=False):
     else:
         logger.info("⚡ Fast Mode: Skipping bootstrap sync steps.")
 
-    # Prompt for session mode: Batch Management, Memory Feature & Publishing, Media Cleanup, or Manage Device Owners
-    if not auto_apply:
-        print("\n--- 🛠️  Session Mode ---")
-        mode = input("Select mode: [B] Batch Management (default) | [M] Memory Feature & Publishing | [C] Media Cleanup | [O] Manage Device Owners: ").strip().lower()
-        if mode == 'm':
-            run_memory_publishing_flow(None, None)
-            sys.exit(0)
-        elif mode == 'c':
-            cleanup_type = input("\nSelect Cleanup Mode: [Q] Quartile Low-Quality Device Cleanup (default) | [L] Legacy Published SD-Card Cleanup: ").strip().lower()
-            if cleanup_type == 'l':
-                acquire_planner_lock()
-                conn = get_connection()
-                conn.execute("PRAGMA busy_timeout = 30000")
-                cursor = get_cursor()
-                display_media_cleanup_recommendations(cursor, verbose=True)
-                close_conn()
-                release_planner_lock()
-                sys.exit(0)
-            else:
-                display_quartile_cleanup_flow(None, None)
-                sys.exit(0)
-        elif mode == 'o':
-            manage_device_owners_flow(None, None)
-            # Restart the script to return to the main menu clean
-            os.execv(sys.executable, [sys.executable] + sys.argv)
+    if auto_apply:
+        run_batch_management_flow(auto_apply)
+        return
 
-    acquire_planner_lock()
-    conn = get_connection()
-    conn.execute("PRAGMA busy_timeout = 30000")
-    cursor = get_cursor()
-    ensure_views_exist(cursor, conn)
-
-    # Check for completed batches that have new assets imported since their last update
-    cursor.execute("""
-        SELECT mb.month, mb.updated_at_utc, MAX(a.imported_date_utc), COUNT(a.asset_id)
-        FROM month_batches mb
-        JOIN assets a ON a.month = mb.month
-        WHERE mb.status_code >= '600'
-        GROUP BY mb.month
-        HAVING MAX(a.imported_date_utc) > mb.updated_at_utc
-    """)
-    outdated_batches = cursor.fetchall()
-    if outdated_batches:
-        print("\n==================================================")
-        print("🔄 Detected New Assets in Completed Batches")
-        print("==================================================")
-        print("The following processed/finalized batches have new imported photos:")
-        for month, finalized_at, newest_import, asset_count in outdated_batches:
-            print(f" - {month}: Finalized on {finalized_at}, Newest import: {newest_import}")
-        
-        for month, finalized_at, newest_import, asset_count in outdated_batches:
-            if not auto_apply:
-                reset_input = input(f"\nDo you want to reset batch {month} to status '000' (added) to re-process new assets? [y/N]: ").strip().lower()
-                if reset_input == 'y':
-                    cursor.execute("UPDATE month_batches SET status_code = '000', updated_at_utc = CURRENT_TIMESTAMP WHERE month = ?", (month,))
-                    conn.commit()
-                    logger.info(f"✅ Reset batch {month} to status '000'.")
-
-    # Shared credentials for all Google API calls in this planner session
-    creds = authenticate(scopes=PLANNER_REQUIRED_SCOPES)
-
-    # Pre-fetch remote favorites to avoid repeated API calls during analysis
-    remote_favs_cache = None
-    try:
-        logger.info("🌐 Fetching remote favorites from Google Photos API to verify curation status...")
-        remote_favs_cache = get_all_favorites(creds)
-        
-        # Auto-run retroactive favorites sync for bypassed months
+    # Interactive top-level loop: only quits when explicitly chosen by the user
+    while True:
         try:
-            cursor.execute("SELECT month FROM month_batches WHERE is_bypassed = 1")
-            byp_months = [row[0] for row in cursor.fetchall()]
-            if byp_months:
-                logger.info(f"🔄 Auto-syncing late favorites for bypassed months: {byp_months}...")
-                from google_photos import create_or_get_album
-                from pull_google_favorites import get_album_items
-                
-                favorite_set = {(f.get('filename'), f.get('mediaMetadata', {}).get('creationTime')) for f in remote_favs_cache}
-                for bm in byp_months:
-                    album_title = f"Currently Curating - {bm}"
-                    album_id = create_or_get_album(creds, album_title)
-                    if album_id:
-                        album_items = get_album_items(creds, album_id)
-                        matched = [item for item in album_items
-                                   if (item.get('filename'), item.get('mediaMetadata', {}).get('creationTime')) in favorite_set]
-                        
-                        update_count = 0
-                        for item in matched:
-                            filename = item.get('filename')
-                            raw_creation_time = item.get('mediaMetadata', {}).get('creationTime', '')
-                            creation_time = raw_creation_time.replace('T', ' ').split('.')[0] if raw_creation_time else ''
-                            if filename and creation_time:
-                                cursor.execute("""
-                                    UPDATE assets
-                                    SET google_favorite = 1, updated_at_utc = datetime('now')
-                                    WHERE original_filename = ? AND date_created_utc = ? AND month = ? AND MomentsAlbumName IS NOT NULL AND google_favorite = 0
-                                """, (filename, creation_time, bm))
-                                if cursor.rowcount:
-                                    update_count += 1
-                        if update_count > 0:
-                            conn.commit()
-                            logger.info(f"⭐️ Retroactively synced {update_count} favorites for bypassed month {bm}.")
-        except Exception as ex:
-            logger.error(f"Error during bypassed batch auto-sync: {ex}")
-            
-    except Exception as e:
-        logger.warning(f"Could not pre-fetch remote favorites: {e}")
-
-    transitions = get_stage_transitions(cursor)
-    batches = get_batch_statuses(cursor)
-
-    display_summary(transitions, batches, cursor, remote_favs_cache)
-
-    # Media cleanup recommendations for source cameras
-    display_media_cleanup_recommendations(cursor, verbose=False)
-
-    # Proactive check for new month readiness
-    if batches:
-        latest_month_str, latest_status = batches[0][:2]  # Ordered DESC
-        if str(latest_status) >= '600':
-            now = datetime.now()
-            current_month_str = now.strftime('%Y-%m')
-            if latest_month_str < current_month_str:
-                latest_dt = datetime.strptime(latest_month_str, '%Y-%m')
-                next_dt = (latest_dt + timedelta(days=32)).replace(day=1)
-                next_month_str = next_dt.strftime('%Y-%m')
-                
-                # Only suggest if the next month hasn't even started (not in batches)
-                if next_month_str not in [b[0] for b in batches]:
-                    logger.info(f"✨ Current pipeline progress: {latest_month_str} is complete.")
-                    active_for_next = []
-                    for m in ACTIVE_CAMERA_MODELS:
-                        is_act, own, _ = get_device_ownership_for_month(cursor, m, next_month_str)
-                        if is_act:
-                            active_for_next.append(f"{m} ({own})")
-                    sources_label = ', '.join(active_for_next) if active_for_next else ', '.join(ACTIVE_CAMERA_MODELS)
-                    logger.info(f"💡 Suggestion: Ready to start {next_month_str}. Ensure all active sources ({sources_label}) are imported into Apple Photos.")
-
-    logger.info("=== ✅ Suggested Action ===")
-
-    # Fetch all months in descending order, excluding the current calendar month
-    # as it is considered incomplete for processing.
-    # TODO - month selection also should be done after the transition type is determined 
-    current_month_str = datetime.now().strftime('%Y-%m')
-    cursor.execute("SELECT DISTINCT month FROM month_batches WHERE month < ? ORDER BY month DESC", (current_month_str,))
-    months_descending = [row[0] for row in cursor.fetchall()]
-
-    # Collect candidates for each transition type, across all months
-    manual_candidates = []
-    retryable_candidates = []
-    pipeline_candidates = []
-
-    for month in months_descending:
-        month_status = None
-        for m, s in [b[:2] for b in batches]:
-            if m == month:
-                month_status = s
-                break
-        if month_status is None:
-            continue
-
-        # Filter the pre-fetched transitions list for this month's status using string comparison
-        transitions_for_month = [
-            t for t in transitions 
-            if str(t[1]) == str(month_status)
-        ]
-
-        # If in an error state (e.g., 400E), find the transition that was attempted (code=400)
-        # so we can suggest a retry.
-        if not transitions_for_month and str(month_status).endswith('E'):
-            failed_code = str(month_status)[:-1]
-            # Find the transition where the target code is the one that failed
-            retry_candidates = [t for t in transitions if str(t[0]) == failed_code]
-            for t in retry_candidates:
-                logger.info(f"Found error state '{month_status}' for {month}. Suggesting retry of step {failed_code}.")
-                # Treat as a retryable candidate to prioritize resolving the failure
-                retryable_candidates.append((month, t))
-
-        logger.debug(f"Inspecting transitions for month {month} with status {month_status}")
-        for t in transitions_for_month:
-            if t[3] == 'manual':
-                logger.debug(f"Found manual transition candidate for month {month}: {t[2]} (code {t[1]}) -> (code {t[0]})")
-                manual_candidates.append((month, t))
-            elif t[3] == 'retryable':
-                logger.debug(f"Found retryable transition candidate for month {month}: {t[2]} (code {t[1]}) -> (code {t[0]})")
-                retryable_candidates.append((month, t))
-            elif t[3] == 'pipeline':
-                logger.debug(f"Found pipeline transition candidate for month {month}: {t[2]} (code {t[1]}) -> (code {t[0]})")
-                
-                is_delay = False
-                if t[0] == '650':
-                    cursor.execute("SELECT is_bypassed, bypass_timestamp FROM month_batches WHERE month = ?", (month,))
-                    row_byp = cursor.fetchone()
-                    if row_byp and row_byp[0] == 1 and row_byp[1]:
-                        try:
-                            bypass_dt = datetime.strptime(row_byp[1], "%Y-%m-%d %H:%M:%S")
-                            now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
-                            elapsed = (now_utc - bypass_dt).total_seconds() / 86400
-                            if elapsed < 14:
-                                is_delay = True
-                                logger.info(f"⏳ Cleanup delayed for bypassed batch {month}. {14 - elapsed:.1f} days remaining in grace period.")
-                        except Exception as e:
-                            logger.error(f"Error parsing bypass_timestamp for {month}: {e}")
-                
-                if not is_delay:
-                    pipeline_candidates.append((month, t))
-
-    # Precedence: manual > retryable > pipeline. Sort by month descending to prioritize newer batches.
-    manual_candidates.sort(key=lambda x: x[0], reverse=True)
-    retryable_candidates.sort(key=lambda x: x[0], reverse=True)
-    pipeline_candidates.sort(key=lambda x: x[0], reverse=True)
-
-    selected_month = None
-    selected_transition = None
-
-    # Check active queue to skip already-queued candidates
-    cursor.execute("SELECT planned_month FROM planned_execution WHERE active = 1")
-    active_planned_set = set(row[0] for row in cursor.fetchall())
-
-    logger.info("🔍 Evaluating manual transition candidates...")
-    for month, transition in manual_candidates:
-        if month in active_planned_set:
-            logger.info(f"  ⏭️ Skipping {month} (already in planned execution queue).")
-            continue
-        selected_code, selected_prev, selected_desc, selected_type, short_label = transition
-        logger.info(f"  Checking {month} ({selected_desc}, status {selected_prev})...")
-
-        cursor.execute("SELECT MAX(updated_at_utc) FROM assets WHERE uploaded_to_google = 1 AND month = ?", (month,))
-        result = cursor.fetchone()
-        last_completed_at = result[0] if result else None
-        elapsed_days = None
-        if last_completed_at:
+            # Check for active planned executions in queue
             try:
-                last_dt = datetime.strptime(last_completed_at, "%Y-%m-%d %H:%M:%S")
-                now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
-                elapsed_days = (now_utc - last_dt).total_seconds() / 86400
-            except: pass
+                check_conn = sqlite3.connect(MEDIA_ORGANIZER_DB_PATH)
+                check_cursor = check_conn.cursor()
+                check_cursor.execute("SELECT id, planned_month, set_at_utc FROM planned_execution WHERE active = 1 ORDER BY id ASC")
+                active_plans = check_cursor.fetchall()
+                check_conn.close()
 
-        fav_count, source, _ = check_favorites_count(cursor, month, check_remote=True, all_favs=remote_favs_cache, creds=creds)
-
-        if fav_count == 0 and elapsed_days is not None and elapsed_days < 3:
-            logger.info(f"    ⏸️ Too soon: Only {elapsed_days:.1f} days since upload and no favorites found. Need 3 days for Google AI curation.")
-            continue
-
-        if fav_count == 0:
-            if selected_prev == '500':
-                logger.info(f"    ⏸️ Manual transition blocked: No favorites in Google Photos.")
-                continue
-            else:
-                logger.warning(f"    ⚠️ No favorites found for {month}. Starring may not be complete.")
-        else:
-            logger.info(f"    ✨ Detected {fav_count} favorites ({source}).")
-
-        if not auto_apply:
-            if fav_count == 0:
-                proceed_input = input(f"\nPlease confirm: has '{short_label}' task been completed for {month}? [y/N/bypass] (Choose 'bypass' to proceed with aesthetic ranking only): ").strip().lower()
-            else:
-                proceed_input = input(f"\nPlease confirm: has '{short_label}' task been completed for {month}? [y/N]: ").strip().lower()
-
-            if proceed_input == 'y':
-                cursor.execute("UPDATE month_batches SET status_code = ?, is_bypassed = 0, bypass_timestamp = NULL WHERE month = ?", (selected_code, month))
-                conn.commit()
-                logger.info(f"✅ Month {month} status updated to {selected_code}.")
-                restart_planner()
-            elif proceed_input == 'bypass' and fav_count == 0:
-                now_str = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
-                cursor.execute("UPDATE month_batches SET status_code = ?, is_bypassed = 1, bypass_timestamp = ? WHERE month = ?", (selected_code, now_str, month))
-                conn.commit()
-                logger.info(f"✅ Month {month} status updated to {selected_code} (Direct-Rank Bypassed).")
-                restart_planner()
-            else:
-                logger.info(f"  Skipped manual transition for {month}. Checking next candidate...")
-                continue
-        else:
-            logger.info(f"  Auto-apply enabled; skipping manual task {month} for safety. Checking next candidate...")
-            continue
-
-    logger.info("🔍 Evaluating retryable transition candidates...")
-    for month, transition in retryable_candidates:
-        if month in active_planned_set:
-            logger.info(f"  ⏭️ Skipping {month} (already in planned execution queue).")
-            continue
-        selected_code, selected_prev, selected_desc, selected_type, short_label = transition
-
-        # Only perform space-based analysis and branching for batches that haven't finished 
-        # their primary upload (stage < 400) and are targeting an upload operation.
-        is_upload_retry = selected_code in ['399', '400'] and int(selected_prev) < 400
-        if is_upload_retry:
-            free_space = check_google_quota(creds=creds)
-            if free_space is None:
-                logger.error("❌ Error: Could not retrieve Google Drive quota."); close_conn(); sys.exit(1)
-
-            import glob
-            matched_folders = glob.glob(os.path.join(STAGING_ROOT, f"*{month}*"))
-            if matched_folders:
-                staging_folder = matched_folders[0]
-                staging_size = 0
-                staging_eligible_count = 0
-                staging_oversized_count = 0
-                for root, dirs, files in os.walk(staging_folder):
-                    for f in files:
-                        ext = os.path.splitext(f)[1].lower()
-                        if ext in SUPPORTED_EXTENSIONS:
-                            fp = os.path.join(root, f)
-                            fp_size = os.path.getsize(fp)
-                            if fp_size <= MAX_UPLOAD_FILE_SIZE_BYTES:
-                                staging_size += fp_size
-                                staging_eligible_count += 1
-                            else:
-                                staging_oversized_count += 1
-                logger.info(f"Staging folder content for {month}: {human_readable_size(staging_size)} eligible upload files ({staging_eligible_count} items <= {MAX_UPLOAD_FILE_SIZE_MB}MB, {staging_oversized_count} skipped).")
-            else:
-                staging_folder = None; staging_size = 0; logger.warning(f"No staging folder found for {month}")
-
-            cursor.execute("SELECT COUNT(*), COUNT(CASE WHEN uploaded_to_google = 1 THEN 1 END) FROM assets WHERE month = ?", (month,))
-            row_cnt = cursor.fetchone()
-            total_db_assets = row_cnt[0] if row_cnt else 0
-            uploaded_db_count = row_cnt[1] if row_cnt else 0
-
-            cursor.execute("SELECT original_filename FROM assets WHERE month = ? AND uploaded_to_google = 1", (month,))
-            uploaded_assets = cursor.fetchall()
-            latest_upload_size = 0
-            if uploaded_assets and staging_folder:
-                for filename_tuple in uploaded_assets:
-                    file_path = os.path.join(staging_folder, filename_tuple[0])
-                    if os.path.exists(file_path):
-                        latest_upload_size += os.path.getsize(file_path)
-            logger.info(f"Upload progress: {uploaded_db_count}/{total_db_assets} assets ({human_readable_size(latest_upload_size)}) of {month} in Google Photos.")
-
-            if staging_folder and staging_size > 0:
-                remaining_to_upload = max(0, staging_size - latest_upload_size)
-            else:
-                remaining_to_upload = 0 if (total_db_assets > 0 and (uploaded_db_count >= total_db_assets or (staging_folder and (uploaded_db_count + staging_oversized_count) >= total_db_assets))) else 999999999999
-
-            if total_db_assets > 0 and (uploaded_db_count >= total_db_assets or (staging_folder and (uploaded_db_count + staging_oversized_count) >= total_db_assets)) and remaining_to_upload == 0:
-                logger.info(f"✅ All eligible assets for {month} appear to be uploaded already ({uploaded_db_count} uploaded, {staging_oversized_count} skipped > {MAX_UPLOAD_FILE_SIZE_MB}MB).")
-                if auto_apply: proceed_transition = True
-                else:
-                    ans = input(f"All assets uploaded - transition {month} to 400 status? [y/N]: ").strip().lower()
-                    proceed_transition = ans == 'y'
-                if proceed_transition:
-                    cursor.execute("UPDATE month_batches SET status_code = '400' WHERE month = ?", (month,))
-                    conn.commit()
-                    logger.info(f"Month {month} updated to 400.")
-                    restart_planner()
-            elif staging_folder and free_space >= remaining_to_upload:
-                logger.info(f"🚀 Found {human_readable_size(remaining_to_upload)} left to upload for {month}. "
-                            f"Available space: {human_readable_size(free_space)}. Priority given to finishing this batch.")
-                selected_month = month
-                selected_transition = transition
-                break
-            else:
-                logger.warning(f"⚠️ Insufficient space for {month}. Free: {human_readable_size(free_space)}, Need: {human_readable_size(remaining_to_upload)}.")
-                
-                # Branch and suggest cleanup for months at stage 600
-                cleanup_candidates = [m for m, s in [b[:2] for b in batches] if str(s) == '600']
-                if cleanup_candidates:
-                    logger.info(f"💡 Suggestion: Drive cleanup available for processed months: {', '.join(cleanup_candidates)}")
-                    for m_c, t_c in pipeline_candidates:
-                        if m_c in cleanup_candidates and str(t_c[1]) == '600':
-                            selected_month = m_c
-                            selected_transition = t_c
-                            logger.info(f"🔄 Branching to cleanup transition (600->650) for {selected_month} to free up space.")
-                            break
-                    if selected_month:
-                        break
-                continue
-
-    if not selected_month:
-        logger.info("🔍 Evaluating pipeline transition candidates...")
-        available_pipeline_candidates = [
-            (m, t) for m, t in pipeline_candidates if m not in active_planned_set
-        ]
-        if not available_pipeline_candidates:
-            if active_planned_set:
-                logger.info(f"All available pipeline candidates are already in the execution queue ({sorted(list(active_planned_set))}). Exiting.")
-            else:
-                logger.info("No pipeline transitions available. Exiting.")
-            close_conn(); sys.exit(0)
-        selected_month, selected_transition = available_pipeline_candidates[0]
-
-    latest_month = selected_month
-    selected_code, selected_prev, selected_desc, selected_type, short_label = selected_transition
-    current_status = selected_prev
-
-    if True:
-        # Build the full transition path from current status, only including pipeline transitions
-        full_transition_list = get_full_transition_path(
-            [t for t in transitions if t[3] in ['pipeline', 'retryable']],
-            str(current_status)
-        )
-
-        # Filter out delayed cleanup (600->650) for bypassed batches
-        cursor.execute("SELECT is_bypassed, bypass_timestamp FROM month_batches WHERE month = ?", (latest_month,))
-        row_byp = cursor.fetchone()
-        if row_byp and row_byp[0] == 1 and row_byp[1]:
-            try:
-                bypass_dt = datetime.strptime(row_byp[1], "%Y-%m-%d %H:%M:%S")
-                now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
-                elapsed = (now_utc - bypass_dt).total_seconds() / 86400
-                if elapsed < 14:
-                    # Delay cleanup
-                    full_transition_list = [t for t in full_transition_list if not t.endswith('->650')]
+                if active_plans:
+                    logger.info(f"📋 Current execution queue ({len(active_plans)} batch(es) pending — managed automatically by background executor):")
+                    for plan_id, p_month, p_time in active_plans:
+                        logger.info(f"   • Queue ID {plan_id}: Batch {p_month} (queued at {p_time})")
             except Exception as e:
-                logger.error(f"Error parsing bypass_timestamp for {latest_month} in full path build: {e}")
+                logger.warning(f"Could not check execution queue: {e}")
 
-        # Only perform import continuity and sequencing checks for batches that haven't reached the upload stage (400)
-        # This prevents redundant prompts for batches that are already processed or being curated.
-        if current_status and str(current_status) < '400':
-            # Verify assets exist in Media Organizer DB before proposing migration off of 000 / 100E
-            if str(current_status) in ('000', '100E'):
-                cursor.execute("SELECT COUNT(*) FROM assets WHERE month = ?", (latest_month,))
-                batch_asset_count = cursor.fetchone()[0]
-                if batch_asset_count == 0:
-                    logger.warning(f"⚠️ No assets found for month '{latest_month}' in Media Organizer DB.")
-                else:
-                    logger.info(f"✅ Verified {batch_asset_count} assets for month '{latest_month}' in Media Organizer DB. Ready for direct export.")
+            print("\n--- 🛠️  Session Mode ---")
+            mode = input("Select mode: [B] Batch Management (default) | [M] Memory Feature & Publishing | [C] Media Cleanup | [O] Manage Device Owners | [Q] Quit: ").strip().lower()
 
-            check_active_sources_import_status(cursor, conn, latest_month, auto_apply)
-
-            # --- Check sequencing before recording the plan ---
-            if not verify_sequencing_for_planned_month(cursor, conn, latest_month, auto_apply):
-                logger.warning(f"Sequencing not confirmed for {latest_month}. Aborting plan recording.")
-                close_conn()
-                sys.exit(0)
-
-        logger.info(f"Run pipeline for: Month={latest_month}, Transitions={full_transition_list}")
-
-        # --- Check for favorites readiness if transition involves pulling or ranking ---
-        is_favorites_pull = any('550' in str(t) or 'Pull Google' in str(t) for t in full_transition_list)
-        is_after_pull = any('Rank Assets' in str(t) or 'Ranking' in str(t) for t in full_transition_list)
-        
-        # Check if the batch is bypassed before printing favorites warnings
-        cursor.execute("SELECT is_bypassed FROM month_batches WHERE month = ?", (latest_month,))
-        row_byp = cursor.fetchone()
-        is_byp = row_byp[0] if row_byp else 0
-
-        if is_favorites_pull:
-            if is_byp:
-                logger.info(f"ℹ️ Batch {latest_month} is running in Direct-Rank Bypass mode (no remote favorites expected).")
-            else:
-                fav_count, source, fav_names = check_favorites_count(
-                    cursor, latest_month, check_remote=True, 
-                    all_favs=remote_favs_cache, creds=creds
-                )
-                if fav_count == 0:
-                    logger.warning(f"⚠️ Suggested batch {latest_month} has no favorites in Google Photos yet.")
-                else:
-                    logger.info(f"✨ Batch {latest_month} is ready with {fav_count} favorites in Google Photos (Source: {source}).")
-        elif is_after_pull:
-            if is_byp:
-                logger.info(f"ℹ️ Batch {latest_month} is running in Direct-Rank Bypass mode (no local favorites expected).")
-            else:
-                fav_count, source, fav_names = check_favorites_count(
-                    cursor, latest_month, check_remote=False, 
-                    all_favs=remote_favs_cache, creds=creds
-                )
-                if fav_count == 0:
-                    logger.warning(f"⚠️ Suggested batch {latest_month} has 0 favorites in local DB (Source: {source}). Ranking steps may be skipped.")
-
-        # --- Begin Google quota check for upload transitions ---
-        # Determine if any transition in the pipeline represents an upload to Google (e.g., '210->399')
-        quota_check_needed = any(
-            isinstance(transition, str) and '210->399' in transition
-            or (isinstance(transition, (list, tuple)) and len(transition) >= 1 and '210->399' in str(transition))
-            for transition in full_transition_list
-        )
-        # --- End Google quota check (defer actual check to after user confirmation) ---
-
-        if not auto_apply:
-            proceed = input("Proceed with this plan? [y/N]: ")
-            if proceed.strip().lower() != 'y':
-                logger.info("Aborted by user.")
-                close_conn()
-                sys.exit(0)
-
-        # Now, if quota check is needed, perform the actual quota check before executing
-        if quota_check_needed:
-            import glob
-            matched_folders = glob.glob(os.path.join(STAGING_ROOT, f"*{latest_month}*"))
-            if matched_folders:
-                staging_folder = matched_folders[0]
-                staging_size = 0
-                staging_oversized_count = 0
-                for root, dirs, files in os.walk(staging_folder):
-                    for f in files:
-                        ext = os.path.splitext(f)[1].lower()
-                        if ext in SUPPORTED_EXTENSIONS:
-                            fp = os.path.join(root, f)
-                            fp_size = os.path.getsize(fp)
-                            if fp_size <= MAX_UPLOAD_FILE_SIZE_BYTES:
-                                staging_size += fp_size
-                            else:
-                                staging_oversized_count += 1
-                logger.info(f"Detected staging folder for month {latest_month}: {staging_folder}, eligible upload size: {human_readable_size(staging_size)} (skipped {staging_oversized_count} files > {MAX_UPLOAD_FILE_SIZE_MB}MB)")
-            else:
-                staging_folder = None
-                staging_size = 0
-                logger.warning(f"No staging folder found for month {latest_month}")
-            free_space = check_google_quota(creds=creds)
-            if free_space is None:
-                logger.error("❌ Aborting: Could not retrieve Google Drive quota before upload.")
-                close_conn()
-                sys.exit(1)
-            if free_space < staging_size:
-                logger.warning(f"⚠️ Insufficient space: {human_readable_size(free_space)} available vs {human_readable_size(staging_size)} required.")
-                
-                # Perform estimation of how many assets will fit based on aesthetic score
-                cursor.execute("SELECT original_filename, aesthetic_score FROM assets WHERE month = ?", (latest_month,))
-                db_scores = {row[0].lower(): (row[1] or -1) for row in cursor.fetchall()}
-                
-                staging_files = []
-                for root, _, fnames in os.walk(staging_folder):
-                    for f in fnames:
-                        fp = os.path.join(root, f)
-                        staging_files.append((f, os.path.getsize(fp), db_scores.get(f.lower(), -1)))
-                
-                # Sort by score descending (highest ranked first)
-                staging_files.sort(key=lambda x: x[2], reverse=True)
-                
-                can_upload_count = 0
-                simulated_sum = 0
-                for _, size, _ in staging_files:
-                    if simulated_sum + size <= free_space:
-                        simulated_sum += size
-                        can_upload_count += 1
-                    else:
-                        break
-                
-                logger.warning(f"📊 Estimate: Only {can_upload_count} out of {len(staging_files)} assets will fit.")
-                
-                if not auto_apply:
-                    partial_confirm = input(f"Proceed with a partial upload of the highest-ranked assets for {latest_month}? [y/N]: ")
-                    if partial_confirm.strip().lower() != 'y':
-                        logger.info("Pipeline transition aborted by user.")
-                        close_conn()
-                        sys.exit(0)
-                    logger.info("User confirmed partial upload. Proceeding with plan...")
-                else:
-                    logger.error("❌ Auto-apply aborted: Insufficient space for full upload. Manual confirmation required for partial sync.")
+            if mode in ('q', 'quit', 'exit', 'e'):
+                print("\n👋 Exiting Pipeline Planner.")
+                logger.info("Pipeline planner terminated by user.")
+                break
+            elif mode == 'm':
+                run_memory_publishing_flow(None, None)
+            elif mode == 'c':
+                cleanup_type = input("\nSelect Cleanup Mode: [Q] Quartile Low-Quality Device Cleanup (default) | [L] Legacy Published SD-Card Cleanup | [B] Back to Menu: ").strip().lower()
+                if cleanup_type == 'l':
+                    acquire_planner_lock()
+                    conn = get_connection()
+                    conn.execute("PRAGMA busy_timeout = 30000")
+                    cursor = get_cursor()
+                    display_media_cleanup_recommendations(cursor, verbose=True)
                     close_conn()
-                    sys.exit(1)
+                    release_planner_lock()
+                elif cleanup_type == 'b':
+                    continue
+                else:
+                    display_quartile_cleanup_flow(None, None)
+            elif mode == 'o':
+                manage_device_owners_flow(None, None)
             else:
-                logger.info(f"Enough Google Drive space available for upload. Free space: {human_readable_size(free_space)}, Staging size: {human_readable_size(staging_size)}")
+                status = run_batch_management_flow(auto_apply)
+                if status == 'quit':
+                    print("\n👋 Exiting Pipeline Planner.")
+                    logger.info("Pipeline planner terminated by user.")
+                    break
 
-        logger.info("🚀 Queuing planned steps for background executor...")
-        set_planned_month(cursor, latest_month)
-        conn.commit()
-        logger.info(f"📌 Month {latest_month} recorded in planned_execution. Background executor will process it automatically (monitor via: python3 scripts/monitor_executor.py).")
-
-        close_conn()
-        release_planner_lock()
-
-        if selected_type not in ['manual', 'retryable', 'pipeline']:
-            logger.warning(f"Unknown transition type '{selected_type}' for current status {current_status}.")
-
-    # TODO: trigger executor or store plan
-    # TODO: Decide whether to implement quota filler strategy (partial month uploads).
-    # Current pipeline assumes full-month atomicity (399 -> 400).
-
-    close_conn()
+        except KeyboardInterrupt:
+            print("\n\n👋 Pipeline Planner interrupted by user. Exiting cleanly.")
+            logger.info("Pipeline planner interrupted via KeyboardInterrupt.")
+            try:
+                close_conn()
+            except Exception:
+                pass
+            release_planner_lock()
+            break
 
 if __name__ == '__main__':
 

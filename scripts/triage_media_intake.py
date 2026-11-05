@@ -26,6 +26,7 @@ from constants import (
 )
 from utils.logger import setup_logger
 from utils.finder_tags import apply_finder_tag
+from utils.utils import clean_path
 
 import warnings
 import logging
@@ -921,9 +922,9 @@ def find_photos_library_parent(path):
     return None
 
 def triage_intake_folder(target_dir, lacie_dest_root=None, dell_dest_root=None, triage_id=None, dry_run=False, clean_empty=True, photos_library=None, ignore_duplicates=False, delete_duplicates=False):
-    target_dir = os.path.abspath(target_dir)
-    lacie_dest_root = os.path.abspath(lacie_dest_root or TRIAGE_LACIE_DESTINATION_ROOT)
-    dell_dest_root = os.path.abspath(dell_dest_root or TRIAGE_DELL_DESTINATION_ROOT)
+    target_dir = os.path.abspath(clean_path(target_dir))
+    lacie_dest_root = os.path.abspath(clean_path(lacie_dest_root) or TRIAGE_LACIE_DESTINATION_ROOT)
+    dell_dest_root = os.path.abspath(clean_path(dell_dest_root) or TRIAGE_DELL_DESTINATION_ROOT)
     is_photos_library = bool(photos_library)
     if is_photos_library:
         clean_empty = False
@@ -1695,11 +1696,11 @@ def parse_args():
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("target_dir", nargs="?", default=DEFAULT_MEDIA_PREPROCESSING_DIR,
+    parser.add_argument("target_dir", nargs="?", type=clean_path, default=DEFAULT_MEDIA_PREPROCESSING_DIR,
                         help=f"Source intake directory to scan and triage (default: {DEFAULT_MEDIA_PREPROCESSING_DIR})")
-    parser.add_argument("--lacie-dest-dir", "--dest-dir", dest="lacie_dest_dir", default=None,
+    parser.add_argument("--lacie-dest-dir", "--dest-dir", dest="lacie_dest_dir", type=clean_path, default=None,
                         help=f"LaCie base destination directory for Review-Similar and New (default: {TRIAGE_LACIE_DESTINATION_ROOT})")
-    parser.add_argument("--dell-dest-dir", dest="dell_dest_dir", default=None,
+    parser.add_argument("--dell-dest-dir", dest="dell_dest_dir", type=clean_path, default=None,
                         help=f"DELL1TB02 base destination directory for Duplicates (default: {TRIAGE_DELL_DESTINATION_ROOT})")
     parser.add_argument("--triage-id", default=None,
                         help="Custom triage session ID (default: auto-increment integer ID from database)")

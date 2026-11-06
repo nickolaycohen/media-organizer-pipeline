@@ -223,3 +223,15 @@ When recording publications via Action `[3]` or editing via Action `[7]`:
 ### 5. Concurrency Locks & Nightly Backup Window
 * **Locks**: `db/executor.lock` (PID-based) and `db/photos_db_copy.lock.json` prevent concurrent database writes between planner, executor, and background sync services.
 * **Backup Window**: [`constants.is_in_backup_window()`](file:///Users/nickolaycohen/dev/media-organizer-pipeline/constants.py) automatically pauses both executor and planner between **02:55 and 06:15 AM** to allow Carbon Copy Cloner and automated database backups to run without lock contention.
+
+### 6. Device Ownership, Family Membership & Quartile Media Cleanup
+The pipeline maintains a structured registry of camera devices and owners to govern media intake, attribution, and on-device storage cleanup:
+* **Family Membership Flag (`owners.is_family`)**:
+  Distinguishes immediate household members (`is_family = 1`: e.g., Benny, Niki, Cohens, Roberto, Eva) whose physical devices are actively maintained, from external contributors, relatives, or friends (`is_family = 0`: e.g., Ani Ivanova, Bianca, Lee, Nickolay Vassilev, Tedi i Vessi) whose imported media is cataloged for attribution only.
+* **Active Device Tracking (`device_owners.is_active` & `end_date`)**:
+  A device is active if `is_active = 1` and `(end_date IS NULL OR end_date >= date('now'))`. Retired devices (`is_active = 0` or past `end_date`) remain in the registry to map historical ownership periods and explain handoffs.
+* **Quartile Media Cleanup Filtering**:
+  Mode `[C]` partitions assets into 4 quality quartiles based on normalized aesthetic scores (Q1 & Q2 representing the bottom 50% lowest quality). To keep cleanup recommendations actionable:
+  - **Default View (`🟢 Active Family Devices Only`)**: Filters exclusively to currently active devices belonging to family members (`is_family = 1` and `is_active = 1`). External friends' cameras and retired 10-to-20-year-old devices are hidden.
+  - **Historical Toggle (`[T]`)**: Users can toggle between Active Family Devices and All Historical Devices to inspect retired hardware if needed.
+  - **Intake Blacklist Protection**: When an asset is marked as removed from source (`removed_from_source = 1`), [`scripts/triage_media_intake.py`](file:///Users/nickolaycohen/dev/media-organizer-pipeline/scripts/triage_media_intake.py) blacklists it permanently, preventing future phone syncs or backup dumps from re-importing discarded assets.

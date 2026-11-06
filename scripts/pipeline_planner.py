@@ -287,6 +287,32 @@ def ensure_views_exist(cursor, conn=None):
                 cursor.execute("ALTER TABLE curated_moments ADD COLUMN youtube_url TEXT")
             if conn:
                 conn.commit()
+
+        # Ensure is_family column exists on owners table
+        cursor.execute("PRAGMA table_info(owners)")
+        owner_cols = {r[1] for r in cursor.fetchall()}
+        if owner_cols and "is_family" not in owner_cols:
+            cursor.execute("ALTER TABLE owners ADD COLUMN is_family INTEGER DEFAULT 0")
+            family_members = ('Niki', 'Benny', 'Cohens', 'Nickolay C.', 'Roberto', 'Eva', 'Cohens Bulgaria', 'Cohen Bulgaria')
+            placeholders = ','.join('?' for _ in family_members)
+            cursor.execute(f"UPDATE owners SET is_family = 1 WHERE name IN ({placeholders})", family_members)
+            if conn:
+                conn.commit()
+
+        # Ensure is_active column exists on device_owners table
+        cursor.execute("PRAGMA table_info(device_owners)")
+        do_cols = {r[1] for r in cursor.fetchall()}
+        if do_cols and "is_active" not in do_cols:
+            cursor.execute("ALTER TABLE device_owners ADD COLUMN is_active INTEGER DEFAULT 1")
+            cursor.execute("""
+                UPDATE device_owners 
+                SET is_active = CASE 
+                    WHEN (end_date IS NULL OR end_date >= date('now')) THEN 1 
+                    ELSE 0 
+                END
+            """)
+            if conn:
+                conn.commit()
     except Exception as e:
         logger.error(f"Error ensuring views exist: {e}")
 
@@ -4267,34 +4293,56 @@ def manage_device_owners_flow(cursor=None, conn=None):
                 acquire_planner_lock()
                 conn = get_connection()
                 cursor = get_cursor()
-                cursor.execute("SELECT id, name FROM owners ORDER BY name ASC")
+                cursor.execute("SELECT id, name, COALESCE(is_family, 0) FROM owners ORDER BY is_family DESC, name ASC")
                 registered_owners = cursor.fetchall()
                 close_conn()
                 release_planner_lock()
 
-                print("\n" + "=" * 60)
+                print("\n" + "=" * 65)
                 print("👥  REGISTERED OWNERS REGISTRY")
-                print("=" * 60)
-                for o_idx, (o_id, o_name) in enumerate(registered_owners, 1):
-                    print(f"  {o_idx}. {o_name}")
-                print("-" * 60)
-                o_choice = input("Options: [A]dd owner | [R]ename owner | [B]ack: ").strip().lower()
+                print("=" * 65)
+                for o_idx, (o_id, o_name, o_fam) in enumerate(registered_owners, 1):
+                    fam_tag = " [👨‍👩‍👧‍👦 Family]" if o_fam else " [👤 External]"
+                    print(f"  {o_idx:>2}. {o_name:<25} {fam_tag}")
+                print("-" * 65)
+                o_choice = input("Options: [A]dd owner | [R]ename owner | [F] Toggle Family status | [B]ack: ").strip().lower()
                 if o_choice in ('b', ''):
                     break
                 elif o_choice == 'a':
                     new_name = input("Enter new owner name: ").strip()
                     if new_name:
+                        is_fam_in = input(f"Is '{new_name}' an immediate family member? [y/N]: ").strip().lower()
+                        is_fam_val = 1 if is_fam_in in ('y', 'yes') else 0
                         acquire_planner_lock()
                         conn = get_connection()
                         cursor = get_cursor()
                         try:
-                            cursor.execute("INSERT OR IGNORE INTO owners (name) VALUES (?)", (new_name,))
+                            cursor.execute("INSERT OR IGNORE INTO owners (name, is_family) VALUES (?, ?)", (new_name, is_fam_val))
                             conn.commit()
-                            print(f"✅ Added '{new_name}' to owners registry.")
+                            fam_str = "Family member" if is_fam_val else "External owner"
+                            print(f"✅ Added '{new_name}' ({fam_str}) to owners registry.")
                         except Exception as e:
                             print(f"⚠️ Could not add owner: {e}")
                         close_conn()
                         release_planner_lock()
+                elif o_choice == 'f':
+                    f_num = input(f"Enter owner number to toggle Family/External status (1-{len(registered_owners)}): ").strip()
+                    try:
+                        f_idx = int(f_num) - 1
+                        if 0 <= f_idx < len(registered_owners):
+                            tgt_id, tgt_name, tgt_fam = registered_owners[f_idx]
+                            new_fam = 0 if tgt_fam else 1
+                            acquire_planner_lock()
+                            conn = get_connection()
+                            cursor = get_cursor()
+                            cursor.execute("UPDATE owners SET is_family = ? WHERE id = ?", (new_fam, tgt_id))
+                            conn.commit()
+                            status_word = "Family member" if new_fam else "External owner"
+                            print(f"✅ Updated '{tgt_name}' to {status_word}.")
+                            close_conn()
+                            release_planner_lock()
+                    except ValueError:
+                        print("⚠️ Invalid selection.")
                 elif o_choice == 'r':
                     r_num = input(f"Enter owner number to rename (1-{len(registered_owners)}): ").strip()
                     try:
@@ -4332,7 +4380,7 @@ def manage_device_owners_flow(cursor=None, conn=None):
                     conn = get_connection()
                     cursor = get_cursor()
                     cursor.execute("""
-                        SELECT id, owner_name, start_date, end_date, notes 
+                        SELECT id, owner_name, start_date, end_date, notes, COALESCE(is_active, 1) 
                         FROM device_owners 
                         WHERE camera_model = ?
                         ORDER BY COALESCE(start_date, '0000-00-00') ASC, id ASC
@@ -4352,14 +4400,15 @@ def manage_device_owners_flow(cursor=None, conn=None):
                         print("   (No database overrides. Using default fallback)")
                     else:
                         print("Current Ownership Periods:")
-                        for p_idx, (p_id, p_owner, p_start, p_end, p_notes) in enumerate(current_periods, 1):
+                        for p_idx, (p_id, p_owner, p_start, p_end, p_notes, p_act) in enumerate(current_periods, 1):
                             s_text = p_start or "Beginning"
                             e_text = p_end or "Present"
+                            act_tag = " [🟢 Active]" if p_act else " [⚪ Retired]"
                             notes_text = f" [{p_notes}]" if p_notes else ""
-                            print(f"  [{p_idx}] Owner: {p_owner:<16} | Range: {s_text} to {e_text}{notes_text}")
+                            print(f"  [{p_idx}] Owner: {p_owner:<16} | Range: {s_text} to {e_text}{act_tag}{notes_text}")
 
                     print("-" * 80)
-                    print("Options: [A]dd period | [E]dit period | [D]elete period | [C]lear all | [B]ack")
+                    print("Options: [A]dd period | [E]dit period | [T]oggle Active | [D]elete period | [C]lear all | [B]ack")
                     dev_choice = input("Select action: ").strip().lower()
 
                     if dev_choice in ('b', ''):
@@ -4381,24 +4430,52 @@ def manage_device_owners_flow(cursor=None, conn=None):
                         end_date_in = input("Enter end date (YYYY-MM-DD, or leave empty for ongoing/present): ").strip()
                         notes_in = input("Enter optional notes (or leave empty): ").strip()
 
+                        today_str = datetime.now().strftime('%Y-%m-%d')
+                        is_act_val = 1 if (not end_date_in or end_date_in >= today_str) else 0
+
                         acquire_planner_lock()
                         conn = get_connection()
                         cursor = get_cursor()
                         cursor.execute("INSERT OR IGNORE INTO owners (name) VALUES (?)", (owner_name_to_add,))
                         cursor.execute("""
-                            INSERT INTO device_owners (camera_model, owner_name, start_date, end_date, notes)
-                            VALUES (?, ?, ?, ?, ?)
+                            INSERT INTO device_owners (camera_model, owner_name, start_date, end_date, notes, is_active)
+                            VALUES (?, ?, ?, ?, ?, ?)
                         """, (
                             selected_model,
                             owner_name_to_add,
                             start_date_in if start_date_in else None,
                             end_date_in if end_date_in else None,
-                            notes_in if notes_in else None
+                            notes_in if notes_in else None,
+                            is_act_val
                         ))
                         conn.commit()
-                        print(f"✅ Added ownership period: {owner_name_to_add} ({start_date_in or 'Beginning'} -> {end_date_in or 'Present'}) for '{selected_model}'.")
+                        act_label = "Active" if is_act_val else "Retired"
+                        print(f"✅ Added ownership period: {owner_name_to_add} ({start_date_in or 'Beginning'} -> {end_date_in or 'Present'}) [{act_label}] for '{selected_model}'.")
                         close_conn()
                         release_planner_lock()
+
+                    elif dev_choice == 't':
+                        if not current_periods:
+                            print("⚠️ No periods to toggle.")
+                            continue
+                        p_sel = input(f"Enter period number to toggle Active/Retired status (1-{len(current_periods)}): ").strip()
+                        try:
+                            p_idx = int(p_sel) - 1
+                            if 0 <= p_idx < len(current_periods):
+                                tgt_id = current_periods[p_idx][0]
+                                cur_act = current_periods[p_idx][5]
+                                new_act = 0 if cur_act else 1
+                                acquire_planner_lock()
+                                conn = get_connection()
+                                cursor = get_cursor()
+                                cursor.execute("UPDATE device_owners SET is_active = ?, updated_at_utc = datetime('now') WHERE id = ?", (new_act, tgt_id))
+                                conn.commit()
+                                act_label = "Active" if new_act else "Retired"
+                                print(f"✅ Set period #{p_idx + 1} to {act_label}.")
+                                close_conn()
+                                release_planner_lock()
+                        except ValueError:
+                            print("⚠️ Invalid number.")
 
                     elif dev_choice == 'e':
                         if not current_periods:
@@ -4408,7 +4485,7 @@ def manage_device_owners_flow(cursor=None, conn=None):
                         try:
                             p_idx = int(p_sel) - 1
                             if 0 <= p_idx < len(current_periods):
-                                tgt_id, tgt_owner, tgt_start, tgt_end, tgt_notes = current_periods[p_idx]
+                                tgt_id, tgt_owner, tgt_start, tgt_end, tgt_notes, tgt_act = current_periods[p_idx]
                                 new_owner = input(f"Owner name [{tgt_owner}]: ").strip() or tgt_owner
                                 new_start = input(f"Start date (YYYY-MM-DD, or '-' to clear) [{tgt_start or 'None'}]: ").strip()
                                 new_end = input(f"End date (YYYY-MM-DD, or '-' to clear) [{tgt_end or 'None'}]: ").strip()
@@ -4416,15 +4493,18 @@ def manage_device_owners_flow(cursor=None, conn=None):
                                 final_start = None if new_start == '-' else (new_start if new_start else tgt_start)
                                 final_end = None if new_end == '-' else (new_end if new_end else tgt_end)
 
+                                today_str = datetime.now().strftime('%Y-%m-%d')
+                                is_act_val = 1 if (not final_end or final_end >= today_str) else 0
+
                                 acquire_planner_lock()
                                 conn = get_connection()
                                 cursor = get_cursor()
                                 cursor.execute("INSERT OR IGNORE INTO owners (name) VALUES (?)", (new_owner,))
                                 cursor.execute("""
                                     UPDATE device_owners 
-                                    SET owner_name = ?, start_date = ?, end_date = ?, updated_at_utc = datetime('now')
+                                    SET owner_name = ?, start_date = ?, end_date = ?, is_active = ?, updated_at_utc = datetime('now')
                                     WHERE id = ?
-                                """, (new_owner, final_start, final_end, tgt_id))
+                                """, (new_owner, final_start, final_end, is_act_val, tgt_id))
                                 conn.commit()
                                 print(f"✅ Updated ownership period #{p_idx + 1} for '{selected_model}'.")
                                 close_conn()
@@ -4521,7 +4601,9 @@ def display_quartile_cleanup_flow(cursor=None, conn=None):
     and lets the user drill down into any device to view candidates ordered by file size descending,
     with assigned/suggested moments and moment sister assets.
     Allows interactive selection of assets to mark them as removed from source.
+    Defaults to filtering by Active Family Devices only, with a toggle to view all historical/retired devices.
     """
+    filter_active_family = True
     while True:
         # 1. Query device summary grouped by primary owner (excluding already removed assets)
         acquire_planner_lock()
@@ -4530,49 +4612,95 @@ def display_quartile_cleanup_flow(cursor=None, conn=None):
         cursor = get_cursor()
 
         try:
-            cursor.execute("""
-                WITH scored_assets AS (
+            if filter_active_family:
+                cursor.execute("""
+                    WITH scored_assets AS (
+                        SELECT 
+                            COALESCE(zea.ZCAMERAMODEL, 'Unknown') AS camera_model,
+                            COALESCE(do.owner_name, 'Shared/Other') AS primary_owner,
+                            COALESCE(v.score_normalized, 0.0) AS score_normalized,
+                            COALESCE(aaa.ZORIGINALFILESIZE, 0) AS file_size_bytes,
+                            NTILE(4) OVER (
+                                PARTITION BY COALESCE(zea.ZCAMERAMODEL, 'Unknown')
+                                ORDER BY COALESCE(v.score_normalized, 0.0) ASC
+                            ) AS score_quartile
+                        FROM assets a
+                        JOIN ZASSET za ON za.ZUUID = a.asset_id
+                        JOIN ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = za.Z_PK
+                        JOIN ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
+                        JOIN device_owners do ON do.camera_model = zea.ZCAMERAMODEL
+                            AND (do.is_active = 1 AND (do.end_date IS NULL OR do.end_date >= date('now')))
+                            AND (do.start_date IS NULL OR do.start_date <= date(za.ZDATECREATED + 978307200, 'unixepoch'))
+                        JOIN owners o ON o.name = do.owner_name AND o.is_family = 1
+                        LEFT JOIN ranked_assets_view v ON v.asset_id = a.asset_id
+                        WHERE zea.ZCAMERAMODEL IS NOT NULL 
+                          AND zea.ZCAMERAMODEL != ''
+                          AND COALESCE(a.removed_from_source, 0) = 0
+                    )
                     SELECT 
-                        COALESCE(zea.ZCAMERAMODEL, 'Unknown') AS camera_model,
-                        COALESCE(do.owner_name, 'Shared/Other') AS primary_owner,
-                        COALESCE(v.score_normalized, 0.0) AS score_normalized,
-                        COALESCE(aaa.ZORIGINALFILESIZE, 0) AS file_size_bytes,
-                        NTILE(4) OVER (
-                            PARTITION BY COALESCE(zea.ZCAMERAMODEL, 'Unknown')
-                            ORDER BY COALESCE(v.score_normalized, 0.0) ASC
-                        ) AS score_quartile
-                    FROM assets a
-                    LEFT JOIN ZASSET za ON za.ZUUID = a.asset_id
-                    LEFT JOIN ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = za.Z_PK
-                    LEFT JOIN ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
-                    LEFT JOIN device_owners do ON do.camera_model = zea.ZCAMERAMODEL
-                        AND (do.start_date IS NULL OR do.start_date <= date(za.ZDATECREATED + 978307200, 'unixepoch'))
-                        AND (do.end_date IS NULL OR do.end_date >= date(za.ZDATECREATED + 978307200, 'unixepoch'))
-                    LEFT JOIN ranked_assets_view v ON v.asset_id = a.asset_id
-                    WHERE zea.ZCAMERAMODEL IS NOT NULL 
-                      AND zea.ZCAMERAMODEL != ''
-                      AND COALESCE(a.removed_from_source, 0) = 0
-                )
-                SELECT 
-                    primary_owner,
-                    camera_model,
-                    COUNT(CASE WHEN score_quartile IN (1, 2) THEN 1 END) AS low_quality_count,
-                    ROUND(SUM(CASE WHEN score_quartile IN (1, 2) THEN file_size_bytes ELSE 0 END) / 1073741824.0, 2) AS low_quality_gb,
-                    COUNT(*) AS total_assets,
-                    ROUND(SUM(file_size_bytes) / 1073741824.0, 2) AS total_gb,
-                    ROUND(MIN(score_normalized), 4) AS min_score,
-                    ROUND(MAX(CASE WHEN score_quartile = 2 THEN score_normalized END), 4) AS q2_max_score
-                FROM scored_assets
-                GROUP BY primary_owner, camera_model
-                ORDER BY primary_owner ASC, low_quality_gb DESC, low_quality_count DESC;
-            """)
+                        primary_owner,
+                        camera_model,
+                        COUNT(CASE WHEN score_quartile IN (1, 2) THEN 1 END) AS low_quality_count,
+                        ROUND(SUM(CASE WHEN score_quartile IN (1, 2) THEN file_size_bytes ELSE 0 END) / 1073741824.0, 2) AS low_quality_gb,
+                        COUNT(*) AS total_assets,
+                        ROUND(SUM(file_size_bytes) / 1073741824.0, 2) AS total_gb,
+                        ROUND(MIN(score_normalized), 4) AS min_score,
+                        ROUND(MAX(CASE WHEN score_quartile = 2 THEN score_normalized END), 4) AS q2_max_score
+                    FROM scored_assets
+                    GROUP BY primary_owner, camera_model
+                    ORDER BY primary_owner ASC, low_quality_gb DESC, low_quality_count DESC;
+                """)
+            else:
+                cursor.execute("""
+                    WITH scored_assets AS (
+                        SELECT 
+                            COALESCE(zea.ZCAMERAMODEL, 'Unknown') AS camera_model,
+                            COALESCE(do.owner_name, 'Shared/Other') AS primary_owner,
+                            COALESCE(v.score_normalized, 0.0) AS score_normalized,
+                            COALESCE(aaa.ZORIGINALFILESIZE, 0) AS file_size_bytes,
+                            NTILE(4) OVER (
+                                PARTITION BY COALESCE(zea.ZCAMERAMODEL, 'Unknown')
+                                ORDER BY COALESCE(v.score_normalized, 0.0) ASC
+                            ) AS score_quartile
+                        FROM assets a
+                        LEFT JOIN ZASSET za ON za.ZUUID = a.asset_id
+                        LEFT JOIN ZADDITIONALASSETATTRIBUTES aaa ON aaa.ZASSET = za.Z_PK
+                        LEFT JOIN ZEXTENDEDATTRIBUTES zea ON zea.ZASSET = za.Z_PK
+                        LEFT JOIN device_owners do ON do.camera_model = zea.ZCAMERAMODEL
+                            AND (do.start_date IS NULL OR do.start_date <= date(za.ZDATECREATED + 978307200, 'unixepoch'))
+                            AND (do.end_date IS NULL OR do.end_date >= date(za.ZDATECREATED + 978307200, 'unixepoch'))
+                        LEFT JOIN ranked_assets_view v ON v.asset_id = a.asset_id
+                        WHERE zea.ZCAMERAMODEL IS NOT NULL 
+                          AND zea.ZCAMERAMODEL != ''
+                          AND COALESCE(a.removed_from_source, 0) = 0
+                    )
+                    SELECT 
+                        primary_owner,
+                        camera_model,
+                        COUNT(CASE WHEN score_quartile IN (1, 2) THEN 1 END) AS low_quality_count,
+                        ROUND(SUM(CASE WHEN score_quartile IN (1, 2) THEN file_size_bytes ELSE 0 END) / 1073741824.0, 2) AS low_quality_gb,
+                        COUNT(*) AS total_assets,
+                        ROUND(SUM(file_size_bytes) / 1073741824.0, 2) AS total_gb,
+                        ROUND(MIN(score_normalized), 4) AS min_score,
+                        ROUND(MAX(CASE WHEN score_quartile = 2 THEN score_normalized END), 4) AS q2_max_score
+                    FROM scored_assets
+                    GROUP BY primary_owner, camera_model
+                    ORDER BY primary_owner ASC, low_quality_gb DESC, low_quality_count DESC;
+                """)
             summary_rows = cursor.fetchall()
         finally:
             close_conn()
             release_planner_lock()
 
         if not summary_rows:
-            print("\nℹ️  No imported assets found with camera model attributes.")
+            if filter_active_family:
+                print("\nℹ️  No low-quality assets found for active family devices.")
+                toggle_in = input("Options: [T] Toggle filter to show all historical devices | [B]ack to Main Menu [default: B]: ").strip().lower()
+                if toggle_in == 't':
+                    filter_active_family = False
+                    continue
+            else:
+                print("\nℹ️  No imported assets found with camera model attributes.")
             break
 
         # Build clean owner groups
@@ -4619,8 +4747,9 @@ def display_quartile_cleanup_flow(cursor=None, conn=None):
             grand_total_gb += t_gb
 
         # Print Owner-Grouped Overview Table
+        mode_str = "🟢 Active Family Devices Only" if filter_active_family else "⚪ All Devices (Including Retired / External)"
         print("\n" + "=" * 140)
-        print("🧹 Quartile Media Cleanup: Low-Quality Asset Overview by Device (Bottom 2 Quartiles / Lowest 50%)")
+        print(f"🧹 Quartile Media Cleanup: Low-Quality Asset Overview by Device [{mode_str}]")
         print("=" * 140)
         print("Splits imported assets into 4 equal quartiles partitioned by device based on quality/curation scores.")
         print("Q1 & Q2 represent the bottom 50% lowest quality assets. Ordered largest-to-smallest so high storage gains appear first.\n")
@@ -4650,14 +4779,19 @@ def display_quartile_cleanup_flow(cursor=None, conn=None):
             print(f"  💰 Subtotal for {owner_name}: {sub_low_count:,} low-quality files ({sub_low_gb:.2f} GB reclaimable out of {sub_total_gb:.2f} GB total across {sub_total_count:,} assets)\n")
 
         print("=" * 140)
-        print(f"💰 GRAND TOTAL ACROSS ALL DEVICES: {grand_low_count:,} low-quality files ({grand_low_gb:.2f} GB reclaimable out of {grand_total_gb:.2f} GB total across {grand_total_count:,} assets)")
+        print(f"💰 GRAND TOTAL: {grand_low_count:,} low-quality files ({grand_low_gb:.2f} GB reclaimable out of {grand_total_gb:.2f} GB total across {grand_total_count:,} assets)")
         print("=" * 140)
 
         # Device Selection Prompt
-        print("\nOptions: Select device number [1-{}] or device name to view candidate files | [B]ack to Main Menu [default: B]: ".format(device_idx - 1))
+        toggle_label = "Show All Historical Devices" if filter_active_family else "Show Active Family Devices Only"
+        print(f"\nOptions: Select device number [1-{device_idx - 1}] or device name to view candidate files")
+        print(f"         [T] {toggle_label} | [B]ack to Main Menu [default: B]: ")
         choice = input("Enter choice: ").strip()
         if not choice or choice.lower() in ('b', 'back', 'q', 'quit'):
             break
+        elif choice.lower() == 't':
+            filter_active_family = not filter_active_family
+            continue
 
         selected_item = None
         if choice.isdigit() and int(choice) in device_lookup:

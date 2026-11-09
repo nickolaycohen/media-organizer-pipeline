@@ -16,7 +16,7 @@ from utils.utils import get_full_transition_path, human_readable_size
 from google_photos import check_google_quota, authenticate, get_all_favorites
 import argparse
 import sqlite3
-from constants import MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_LOCK_PATH, APPLE_PHOTOS_DB_PATH, LOG_PATH, GOOGLE_PHOTOS_READONLY_SCOPES, GOOGLE_DRIVE_READ_ONLY_SCOPES, PLANNER_REQUIRED_SCOPES, CURATION_THRESHOLD_LOG_PATH, PUBLISHED_MOMENTS_LOG_PATH, SCORING_BREAKDOWN_LOG_PATH, MEDIA_CLEANUP_LOG_PATH, QUARTILE_CLEANUP_LOG_PATH, PUBLISHING_CANDIDATES_LOG_PATH, WEEKLY_MEMORY_LOG_PATH, PUBLISHING_RECOMMENDATIONS_LOG_PATH, MAX_UPLOAD_FILE_SIZE_BYTES, MAX_UPLOAD_FILE_SIZE_MB, BG_SERVICE_PID_PATH
+from constants import MEDIA_ORGANIZER_DB_PATH, APPLE_PHOTOS_DB_LOCK_PATH, APPLE_PHOTOS_DB_PATH, LOG_PATH, GOOGLE_PHOTOS_READONLY_SCOPES, GOOGLE_DRIVE_READ_ONLY_SCOPES, PLANNER_REQUIRED_SCOPES, CURATION_THRESHOLD_LOG_PATH, PUBLISHED_MOMENTS_LOG_PATH, SCORING_BREAKDOWN_LOG_PATH, MEDIA_CLEANUP_LOG_PATH, QUARTILE_CLEANUP_LOG_PATH, PUBLISHING_CANDIDATES_LOG_PATH, WEEKLY_MEMORY_LOG_PATH, PUBLISHING_RECOMMENDATIONS_LOG_PATH, MAX_UPLOAD_FILE_SIZE_BYTES, MAX_UPLOAD_FILE_SIZE_MB, BG_SERVICE_PID_PATH, PLANNER_SKIPPED_MONTHS_TOKEN_PATH, PLANNER_SKIP_COOLDOWN_HOURS
 from constants import ACTIVE_CAMERA_MODELS, DEVICE_OWNER_MAPPING, AESTHETIC_SCORE_WEIGHT, GOOGLE_FAVORITES_WEIGHT, APPLE_SELECTION_WEIGHT, APPLE_FEATURED_WEIGHT
 from db.connections import get_connection, get_cursor, commit, close as close_conn
 from db.queries import get_stage_transitions, get_batch_statuses, get_latest_import_and_month
@@ -40,6 +40,131 @@ def set_planned_month(cursor, month):
     else:
         cursor.execute("INSERT INTO planned_execution (planned_month, active, set_at_utc) VALUES (?, 1, datetime('now'))", (month,))
         logger.info(f"Added month {month} to planned_execution queue.")
+
+
+def load_skipped_months(cooldown_hours=PLANNER_SKIP_COOLDOWN_HOURS):
+    """
+    Loads skipped months from the planner session token file, pruning any entries
+    whose cooldown window (default: 24h) has expired.
+    Returns dict: { month_str: {"skipped_at_utc": str, "expires_at_utc": str, "reason": str, "remaining_hours": float} }
+    """
+    if not os.path.exists(PLANNER_SKIPPED_MONTHS_TOKEN_PATH):
+        return {}
+    try:
+        with open(PLANNER_SKIPPED_MONTHS_TOKEN_PATH, "r") as f:
+            data = json.load(f)
+        raw_skipped = data.get("skipped_months", {}) if isinstance(data, dict) else {}
+    except Exception as e:
+        logger.warning(f"Failed to read skipped months token file: {e}")
+        return {}
+
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    active_skipped = {}
+    pruned = False
+    for m, info in raw_skipped.items():
+        if not isinstance(info, dict):
+            pruned = True
+            continue
+        skipped_str = info.get("skipped_at_utc")
+        expires_str = info.get("expires_at_utc")
+        try:
+            if expires_str:
+                exp_dt = datetime.strptime(expires_str, "%Y-%m-%d %H:%M:%S")
+                rem_seconds = (exp_dt - now_utc).total_seconds()
+            elif skipped_str:
+                sk_dt = datetime.strptime(skipped_str, "%Y-%m-%d %H:%M:%S")
+                exp_dt = sk_dt + timedelta(hours=cooldown_hours)
+                rem_seconds = (exp_dt - now_utc).total_seconds()
+            else:
+                pruned = True
+                continue
+            if rem_seconds > 0:
+                entry = dict(info)
+                entry["remaining_hours"] = rem_seconds / 3600.0
+                active_skipped[m] = entry
+            else:
+                pruned = True
+        except Exception:
+            pruned = True
+
+    if pruned:
+        try:
+            save_payload = {
+                "updated_at_utc": now_utc.strftime("%Y-%m-%d %H:%M:%S"),
+                "skipped_months": {
+                    k: {
+                        "skipped_at_utc": v.get("skipped_at_utc"),
+                        "expires_at_utc": v.get("expires_at_utc"),
+                        "reason": v.get("reason", "user_skipped"),
+                    }
+                    for k, v in active_skipped.items()
+                },
+            }
+            with open(PLANNER_SKIPPED_MONTHS_TOKEN_PATH, "w") as f:
+                json.dump(save_payload, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Failed to prune skipped months token file: {e}")
+
+    return active_skipped
+
+
+def record_skipped_month(month, reason="user_skipped", cooldown_hours=PLANNER_SKIP_COOLDOWN_HOURS):
+    """Records a skipped month in the session token file with a 24h (default) cooldown."""
+    active_skipped = load_skipped_months(cooldown_hours=cooldown_hours)
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    exp_utc = now_utc + timedelta(hours=cooldown_hours)
+    active_skipped[month] = {
+        "skipped_at_utc": now_utc.strftime("%Y-%m-%d %H:%M:%S"),
+        "expires_at_utc": exp_utc.strftime("%Y-%m-%d %H:%M:%S"),
+        "reason": reason,
+    }
+    try:
+        os.makedirs(os.path.dirname(PLANNER_SKIPPED_MONTHS_TOKEN_PATH), exist_ok=True)
+        save_payload = {
+            "updated_at_utc": now_utc.strftime("%Y-%m-%d %H:%M:%S"),
+            "skipped_months": {
+                k: {
+                    "skipped_at_utc": v.get("skipped_at_utc"),
+                    "expires_at_utc": v.get("expires_at_utc"),
+                    "reason": v.get("reason", "user_skipped"),
+                }
+                for k, v in active_skipped.items()
+            },
+        }
+        with open(PLANNER_SKIPPED_MONTHS_TOKEN_PATH, "w") as f:
+            json.dump(save_payload, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Failed to write skipped months token file: {e}")
+
+
+def clear_skipped_months(month=None):
+    """Clears a specific month or all skipped months from the session token file."""
+    if not os.path.exists(PLANNER_SKIPPED_MONTHS_TOKEN_PATH):
+        return
+    try:
+        if month is None:
+            os.remove(PLANNER_SKIPPED_MONTHS_TOKEN_PATH)
+            logger.info("🧹 Cleared all skipped month cooldowns from session token file.")
+        else:
+            active_skipped = load_skipped_months()
+            if month in active_skipped:
+                del active_skipped[month]
+                now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+                save_payload = {
+                    "updated_at_utc": now_utc.strftime("%Y-%m-%d %H:%M:%S"),
+                    "skipped_months": {
+                        k: {
+                            "skipped_at_utc": v.get("skipped_at_utc"),
+                            "expires_at_utc": v.get("expires_at_utc"),
+                            "reason": v.get("reason", "user_skipped"),
+                        }
+                        for k, v in active_skipped.items()
+                    },
+                }
+                with open(PLANNER_SKIPPED_MONTHS_TOKEN_PATH, "w") as f:
+                    json.dump(save_payload, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Failed to clear skipped months token file: {e}")
 
 def is_pid_alive(pid):
     if pid is None:
@@ -617,6 +742,9 @@ def find_closest_existing_moment_album(cursor, asset_id, filename, dt_utc_str, i
                     except ValueError:
                         pass
             time_diff_sec = abs((dt_target - m_dt_obj).total_seconds()) if (dt_target and m_dt_obj) else 99999999
+            is_dated_album = bool(re.match(r'^\d{4}(?:-\d{2})?(?:-\d{2})?\s*-\s*', m_alb))
+            if is_dated_album and time_diff_sec > 14 * 86400:
+                continue
             
             m_num = extract_file_num(m_fn)
             fn_diff = abs(target_num - m_num) if (target_num is not None and m_num is not None) else None
@@ -679,6 +807,9 @@ def find_closest_existing_moment_album(cursor, asset_id, filename, dt_utc_str, i
                     except ValueError:
                         pass
             time_diff_sec = abs((dt_target - m_dt_obj).total_seconds()) if (dt_target and m_dt_obj) else 99999999
+            is_dated_album = bool(re.match(r'^\d{4}(?:-\d{2})?(?:-\d{2})?\s*-\s*', m_alb))
+            if is_dated_album and time_diff_sec > 14 * 86400:
+                continue
             time_diff_h = time_diff_sec / 3600.0
 
             if dist_m < 1000:
@@ -736,6 +867,9 @@ def find_closest_existing_moment_album(cursor, asset_id, filename, dt_utc_str, i
                     except ValueError:
                         pass
             time_diff_sec = abs((dt_target - m_dt_obj).total_seconds()) if (dt_target and m_dt_obj) else 99999999
+            is_dated_album = bool(re.match(r'^\d{4}(?:-\d{2})?(?:-\d{2})?\s*-\s*', m_alb))
+            if is_dated_album and time_diff_sec > 14 * 86400:
+                continue
             time_diff_h = time_diff_sec / 3600.0
 
             score = 15.0 + min(30.0, time_diff_h)
@@ -1998,6 +2132,8 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                 cursor.execute("SELECT DISTINCT album_name FROM moments WHERE parent_folder_name = 'Moments'")
                 valid_moment_albums = {r[0] for r in cursor.fetchall()}
 
+                target_score_floor = historical_min if historical_min > 0.0 else 0.50
+
                 if photos_db_attached:
                     cursor.execute("""
                         SELECT 
@@ -2020,17 +2156,16 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                         LEFT JOIN photos_db.ZASSET a ON a.ZUUID = v.asset_id
                         LEFT JOIN photos_db.ZMOMENT m ON a.ZMOMENT = m.Z_PK
                         WHERE mb.status_code >= '600' AND (v.MomentsAlbumName IS NULL OR v.MomentsAlbumName = '')
-                          AND v.score_normalized > 0.50
+                          AND v.score_normalized > ?
                           AND (a.Z_PK IS NULL OR NOT EXISTS (
                               SELECT 1 FROM photos_db.Z_30ASSETS aa
                               JOIN photos_db.ZGENERICALBUM ga ON aa.Z_30ALBUMS = ga.Z_PK
                               WHERE aa.Z_3ASSETS = a.Z_PK
-                                AND LOWER(ga.ZTITLE) IN ('ignore', 'skippublishing')
+                                AND LOWER(ga.ZTITLE) IN ('ignore', 'skippublishing', 'topscore excluded')
                                 AND ga.ZTRASHEDSTATE = 0
                           ))
                         ORDER BY v.score_normalized DESC
-                        LIMIT 10
-                    """)
+                    """, (target_score_floor,))
                 else:
                     cursor.execute("""
                         SELECT 
@@ -2051,17 +2186,19 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                         LEFT JOIN ZASSET za ON za.ZUUID = v.asset_id
                         LEFT JOIN ZEXTENDEDATTRIBUTES ze ON za.ZEXTENDEDATTRIBUTES = ze.Z_PK
                         WHERE mb.status_code >= '600' AND (v.MomentsAlbumName IS NULL OR v.MomentsAlbumName = '')
-                          AND v.score_normalized > 0.50
+                          AND v.score_normalized > ?
+                          AND NOT EXISTS (
+                              SELECT 1 FROM media_organizer_album_assets moaa
+                              JOIN media_organizer_albums moa ON moa.album_pk = moaa.album_pk
+                              WHERE moaa.asset_id = v.asset_id
+                                AND LOWER(moa.album_name) IN ('ignore', 'skippublishing', 'topscore excluded')
+                          )
                         ORDER BY v.score_normalized DESC
-                        LIMIT 10
-                    """)
+                    """, (target_score_floor,))
 
                 unassigned = cursor.fetchall()
                 if unassigned:
-                    threshold_report.append("==================================================")
-                    threshold_report.append("⚠️  Unassigned High-Rank Assets (Need Moment Naming Decision)")
-                    threshold_report.append("==================================================")
-                    threshold_report.append("The following highly-ranked assets are not assigned to any Moment album in Apple Photos:")
+                    grouped_moments = {}
                     for aid, fname, score, month, date_created, moment_title, moment_subtitle, imp_id, lat, lon, cam_model in unassigned:
                         captured_str = "—"
                         if date_created:
@@ -2082,6 +2219,8 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                             except Exception:
                                 captured_str = date_created[:19]
 
+                        captured_date = captured_str[:10] if captured_str != "—" else (date_created[:10] if date_created else month)
+
                         moment_parts = []
                         if moment_title:
                             moment_parts.append(moment_title.replace('\xa0', ' ').strip())
@@ -2092,24 +2231,106 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                             cursor, aid, fname, date_created, imp_id, lat, lon, cam_model, valid_moment_albums
                         )
 
-                        album_suggestions = []
                         best_album_name = None
+                        best_reason = None
                         if closest_match:
                             best_album_name, best_reason = closest_match
-                            album_suggestions.append(f"Nearest Existing: \"{best_album_name}\" [{best_reason}]")
 
-                        if moment_parts:
-                            captured_date = captured_str[:10] if captured_str != "—" else (date_created[:10] if date_created else month)
-                            suggested_new = f"{captured_date} - {' - '.join(moment_parts)}"
-                            if not best_album_name or best_album_name.lower() != suggested_new.lower():
-                                album_suggestions.append(f"Photos Moment: {suggested_new}")
+                        suggested_new = f"{captured_date} - {' - '.join(moment_parts)}" if moment_parts else None
 
-                        suggested_info = ""
-                        if album_suggestions:
-                            suggested_info = f", {', '.join(album_suggestions)}"
+                        # Determine primary Proposed Moment folder for grouping
+                        is_tight_existing = bool(
+                            best_album_name and (
+                                not suggested_new
+                                or "inside event span" in (best_reason or "")
+                                or "s apart" in (best_reason or "")
+                                or "m apart" in (best_reason or "")
+                                or "h apart" in (best_reason or "")
+                            )
+                        )
+                        if is_tight_existing:
+                            group_folder = best_album_name
+                            group_type = "Existing Moment Album"
+                        elif suggested_new:
+                            group_folder = suggested_new
+                            group_type = "Existing Moment Album" if suggested_new in valid_moment_albums else "Proposed New Moment"
+                        elif best_album_name:
+                            group_folder = best_album_name
+                            group_type = "Existing Moment Album"
+                        else:
+                            group_folder = f"{captured_date} - Uncategorized ({month})"
+                            group_type = "Date Cluster (Needs Moment Name)"
 
-                        threshold_report.append(f" - {fname:<25} (Score: {score:.4f}, Captured: {captured_str}, Month: {month}{suggested_info})")
-                    threshold_report.append("👉 Please consider assigning these assets to the nearest existing album, or creating a corresponding album under 'Media Organizer on LaCie / Moments' in Apple Photos (creating the album is sufficient, no need to place the files inside).\n")
+                        extra_notes = []
+                        if best_album_name:
+                            if group_folder == best_album_name:
+                                extra_notes.append(f"Match: {best_reason}")
+                            else:
+                                extra_notes.append(f"Nearest Existing: \"{best_album_name}\" [{best_reason}]")
+                        if suggested_new and group_folder.lower() != suggested_new.lower():
+                            extra_notes.append(f"Photos Moment: {suggested_new}")
+
+                        if group_folder not in grouped_moments:
+                            grouped_moments[group_folder] = {
+                                "folder": group_folder,
+                                "group_type": group_type,
+                                "max_score": score,
+                                "min_score": score,
+                                "months": set(),
+                                "assets": []
+                            }
+                        grp = grouped_moments[group_folder]
+                        if score > grp["max_score"]:
+                            grp["max_score"] = score
+                        if score < grp["min_score"]:
+                            grp["min_score"] = score
+                        grp["months"].add(month)
+                        grp["assets"].append({
+                            "fname": fname,
+                            "score": score,
+                            "captured_str": captured_str,
+                            "month": month,
+                            "notes": ", ".join(extra_notes)
+                        })
+
+                    sorted_groups = sorted(
+                        grouped_moments.values(),
+                        key=lambda g: (-g["max_score"], -len(g["assets"]), g["folder"])
+                    )
+
+                    threshold_report.append("=" * 115)
+                    threshold_report.append(
+                        f"⚠️  Unassigned High-Rank Assets Above Threshold > {target_score_floor:.4f} "
+                        f"({len(unassigned)} Asset(s) Grouped into {len(sorted_groups)} Proposed Moment Folder(s))"
+                    )
+                    threshold_report.append("=" * 115)
+                    threshold_report.append(
+                        "The following assets exceed the target threshold and are grouped by their proposed Moment album:"
+                    )
+
+                    for g_idx, grp in enumerate(sorted_groups, 1):
+                        months_str = ", ".join(sorted(grp["months"]))
+                        score_span = (
+                            f"{grp['max_score']:.4f}"
+                            if len(grp["assets"]) == 1
+                            else f"{grp['max_score']:.4f} .. {grp['min_score']:.4f}"
+                        )
+                        threshold_report.append(
+                            f"\n[{g_idx:>2}] 📁 {grp['folder']}  [{grp['group_type']}]  "
+                            f"— {len(grp['assets'])} asset(s) | Score: {score_span} | Month(s): {months_str}"
+                        )
+                        threshold_report.append("     " + "-" * 108)
+                        for item in grp["assets"]:
+                            note_suffix = f"  ({item['notes']})" if item["notes"] else ""
+                            threshold_report.append(
+                                f"      • {item['fname']:<28} | Score: {item['score']:.4f} | "
+                                f"Captured: {item['captured_str']} | Month: {item['month']}{note_suffix}"
+                            )
+
+                    threshold_report.append(
+                        "\n👉 Please assign these assets to their existing Moment album or create the proposed Moment album under "
+                        "'Media Organizer on LaCie / Moments' in Apple Photos.\n"
+                    )
 
                 print('\n' + '\n'.join(threshold_report))
                 try:
@@ -5742,11 +5963,21 @@ def run_batch_management_flow(auto_apply):
         cursor.execute("SELECT planned_month FROM planned_execution WHERE active = 1")
         active_planned_set = set(row[0] for row in cursor.fetchall())
 
+        # Load skipped months from session token file (default 24h cooldown)
+        skipped_months_map = load_skipped_months()
+
         logger.info("🔍 Evaluating manual transition candidates...")
         transition_applied = False
         for month, transition in manual_candidates:
             if month in active_planned_set:
                 logger.info(f"  ⏭️ Skipping {month} (already in planned execution queue).")
+                continue
+            if month in skipped_months_map:
+                sk_info = skipped_months_map[month]
+                logger.info(
+                    f"  ⏭️ Skipping {month} (recently skipped at {sk_info.get('skipped_at_utc')} UTC; "
+                    f"{sk_info.get('remaining_hours', 0):.1f}h cooldown remaining)."
+                )
                 continue
             selected_code, selected_prev, selected_desc, selected_type, short_label = transition
             logger.info(f"  Checking {month} ({selected_desc}, status {selected_prev})...")
@@ -5786,6 +6017,7 @@ def run_batch_management_flow(auto_apply):
                 if proceed_input == 'y':
                     cursor.execute("UPDATE month_batches SET status_code = ?, is_bypassed = 0, bypass_timestamp = NULL WHERE month = ?", (selected_code, month))
                     conn.commit()
+                    clear_skipped_months(month)
                     logger.info(f"✅ Month {month} status updated to {selected_code}.")
                     close_conn()
                     release_planner_lock()
@@ -5795,13 +6027,16 @@ def run_batch_management_flow(auto_apply):
                     now_str = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
                     cursor.execute("UPDATE month_batches SET status_code = ?, is_bypassed = 1, bypass_timestamp = ? WHERE month = ?", (selected_code, now_str, month))
                     conn.commit()
+                    clear_skipped_months(month)
                     logger.info(f"✅ Month {month} status updated to {selected_code} (Direct-Rank Bypassed).")
                     close_conn()
                     release_planner_lock()
                     transition_applied = True
                     break
                 else:
-                    logger.info(f"  Skipped manual transition for {month}. Checking next candidate...")
+                    record_skipped_month(month, reason=f"manual:{selected_code}")
+                    skipped_months_map = load_skipped_months()
+                    logger.info(f"  Skipped manual transition for {month} (cooldown recorded for {PLANNER_SKIP_COOLDOWN_HOURS}h). Checking next candidate...")
                     continue
             else:
                 logger.info(f"  Auto-apply enabled; skipping manual task {month} for safety. Checking next candidate...")
@@ -5815,6 +6050,13 @@ def run_batch_management_flow(auto_apply):
         for month, transition in retryable_candidates:
             if month in active_planned_set:
                 logger.info(f"  ⏭️ Skipping {month} (already in planned execution queue).")
+                continue
+            if month in skipped_months_map:
+                sk_info = skipped_months_map[month]
+                logger.info(
+                    f"  ⏭️ Skipping {month} (recently skipped at {sk_info.get('skipped_at_utc')} UTC; "
+                    f"{sk_info.get('remaining_hours', 0):.1f}h cooldown remaining)."
+                )
                 continue
             selected_code, selected_prev, selected_desc, selected_type, short_label = transition
 
@@ -5877,11 +6119,17 @@ def run_batch_management_flow(auto_apply):
                     if proceed_transition:
                         cursor.execute("UPDATE month_batches SET status_code = '400' WHERE month = ?", (month,))
                         conn.commit()
+                        clear_skipped_months(month)
                         logger.info(f"Month {month} updated to 400.")
                         close_conn()
                         release_planner_lock()
                         transition_applied = True
                         break
+                    else:
+                        record_skipped_month(month, reason="retryable:400")
+                        skipped_months_map = load_skipped_months()
+                        logger.info(f"  Skipped transition to 400 for {month} (cooldown recorded for {PLANNER_SKIP_COOLDOWN_HOURS}h). Checking next candidate...")
+                        continue
                 elif staging_folder and free_space >= remaining_to_upload:
                     logger.info(f"🚀 Found {human_readable_size(remaining_to_upload)} left to upload for {month}. "
                                 f"Available space: {human_readable_size(free_space)}. Priority given to finishing this batch.")
@@ -5910,23 +6158,37 @@ def run_batch_management_flow(auto_apply):
 
         if not selected_month:
             logger.info("🔍 Evaluating pipeline transition candidates...")
+            for m, _ in pipeline_candidates:
+                if m in skipped_months_map and m not in active_planned_set:
+                    sk_info = skipped_months_map[m]
+                    logger.info(
+                        f"  ⏭️ Skipping {m} (recently skipped at {sk_info.get('skipped_at_utc')} UTC; "
+                        f"{sk_info.get('remaining_hours', 0):.1f}h cooldown remaining)."
+                    )
             available_pipeline_candidates = [
-                (m, t) for m, t in pipeline_candidates if m not in active_planned_set
+                (m, t) for m, t in pipeline_candidates
+                if m not in active_planned_set and m not in skipped_months_map
             ]
             if not available_pipeline_candidates:
                 if active_planned_set:
                     logger.info(f"All available pipeline candidates are already in the execution queue ({sorted(list(active_planned_set))}).")
+                elif skipped_months_map:
+                    logger.info(f"No other pipeline transitions available (currently in {PLANNER_SKIP_COOLDOWN_HOURS}h cooldown: {sorted(list(skipped_months_map.keys()))}).")
                 else:
                     logger.info("No pipeline transitions available.")
                 close_conn()
                 release_planner_lock()
                 if auto_apply:
                     return "done"
-                action = input("\n--- 📋 Batch Management ---\n[Enter/R] Refresh & re-evaluate batches | [M] Main menu | [Q] Quit Planner: ").strip().lower()
+                clear_opt = f" | [C] Clear {len(skipped_months_map)} skipped month(s)" if skipped_months_map else ""
+                action = input(f"\n--- 📋 Batch Management ---\n[Enter/R] Refresh & re-evaluate batches{clear_opt} | [M] Main menu | [Q] Quit Planner: ").strip().lower()
                 if action in ('q', 'quit', 'exit'):
                     return "quit"
                 elif action == 'm':
                     return "menu"
+                elif action == 'c' and skipped_months_map:
+                    clear_skipped_months()
+                    continue
                 else:
                     continue
             selected_month, selected_transition = available_pipeline_candidates[0]
@@ -5969,31 +6231,43 @@ def run_batch_management_flow(auto_apply):
                         logger.info(f"✅ Verified {batch_asset_count} assets for month '{latest_month}' in Media Organizer DB. Ready for direct export.")
 
                 if not check_active_sources_import_status(cursor, conn, latest_month, auto_apply):
-                    logger.warning(f"Active sources check not confirmed for {latest_month}. Aborting plan recording.")
+                    record_skipped_month(latest_month, reason="active_sources_unconfirmed")
+                    skipped_months_map = load_skipped_months()
+                    logger.warning(f"Active sources check not confirmed for {latest_month} (cooldown recorded for {PLANNER_SKIP_COOLDOWN_HOURS}h). Aborting plan recording.")
                     close_conn()
                     release_planner_lock()
                     if auto_apply:
                         return "done"
-                    action = input("\n[Enter/R] Re-evaluate batches | [M] Main menu | [Q] Quit Planner: ").strip().lower()
+                    clear_opt = f" | [C] Clear {len(skipped_months_map)} skipped month(s)" if skipped_months_map else ""
+                    action = input(f"\n[Enter/R] Re-evaluate batches{clear_opt} | [M] Main menu | [Q] Quit Planner: ").strip().lower()
                     if action in ('q', 'quit', 'exit'):
                         return "quit"
                     elif action == 'm':
                         return "menu"
+                    elif action == 'c' and skipped_months_map:
+                        clear_skipped_months()
+                        continue
                     else:
                         continue
 
                 # --- Check sequencing before recording the plan ---
                 if not verify_sequencing_for_planned_month(cursor, conn, latest_month, auto_apply):
-                    logger.warning(f"Sequencing not confirmed for {latest_month}. Aborting plan recording.")
+                    record_skipped_month(latest_month, reason="sequencing_unconfirmed")
+                    skipped_months_map = load_skipped_months()
+                    logger.warning(f"Sequencing not confirmed for {latest_month} (cooldown recorded for {PLANNER_SKIP_COOLDOWN_HOURS}h). Aborting plan recording.")
                     close_conn()
                     release_planner_lock()
                     if auto_apply:
                         return "done"
-                    action = input("\n[Enter/R] Re-evaluate batches | [M] Main menu | [Q] Quit Planner: ").strip().lower()
+                    clear_opt = f" | [C] Clear {len(skipped_months_map)} skipped month(s)" if skipped_months_map else ""
+                    action = input(f"\n[Enter/R] Re-evaluate batches{clear_opt} | [M] Main menu | [Q] Quit Planner: ").strip().lower()
                     if action in ('q', 'quit', 'exit'):
                         return "quit"
                     elif action == 'm':
                         return "menu"
+                    elif action == 'c' and skipped_months_map:
+                        clear_skipped_months()
+                        continue
                     else:
                         continue
 
@@ -6043,14 +6317,20 @@ def run_batch_management_flow(auto_apply):
             if not auto_apply:
                 proceed = input("Proceed with this plan? [y/N]: ")
                 if proceed.strip().lower() != 'y':
-                    logger.info("Plan cancelled by user.")
+                    record_skipped_month(latest_month, reason=f"pipeline:{selected_code}")
+                    skipped_months_map = load_skipped_months()
+                    logger.info(f"Plan cancelled by user for {latest_month} (cooldown recorded for {PLANNER_SKIP_COOLDOWN_HOURS}h).")
                     close_conn()
                     release_planner_lock()
-                    action = input("\n[Enter/R] Re-evaluate batches | [M] Main menu | [Q] Quit Planner: ").strip().lower()
+                    clear_opt = f" | [C] Clear {len(skipped_months_map)} skipped month(s)" if skipped_months_map else ""
+                    action = input(f"\n[Enter/R] Re-evaluate batches{clear_opt} | [M] Main menu | [Q] Quit Planner: ").strip().lower()
                     if action in ('q', 'quit', 'exit'):
                         return "quit"
                     elif action == 'm':
                         return "menu"
+                    elif action == 'c' and skipped_months_map:
+                        clear_skipped_months()
+                        continue
                     else:
                         continue
 
@@ -6112,14 +6392,20 @@ def run_batch_management_flow(auto_apply):
                     if not auto_apply:
                         partial_confirm = input(f"Proceed with a partial upload of the highest-ranked assets for {latest_month}? [y/N]: ")
                         if partial_confirm.strip().lower() != 'y':
-                            logger.info("Pipeline transition aborted by user.")
+                            record_skipped_month(latest_month, reason="partial_upload_declined")
+                            skipped_months_map = load_skipped_months()
+                            logger.info(f"Pipeline transition aborted by user for {latest_month} (cooldown recorded for {PLANNER_SKIP_COOLDOWN_HOURS}h).")
                             close_conn()
                             release_planner_lock()
-                            action = input("\n[Enter/R] Re-evaluate batches | [M] Main menu | [Q] Quit Planner: ").strip().lower()
+                            clear_opt = f" | [C] Clear {len(skipped_months_map)} skipped month(s)" if skipped_months_map else ""
+                            action = input(f"\n[Enter/R] Re-evaluate batches{clear_opt} | [M] Main menu | [Q] Quit Planner: ").strip().lower()
                             if action in ('q', 'quit', 'exit'):
                                 return "quit"
                             elif action == 'm':
                                 return "menu"
+                            elif action == 'c' and skipped_months_map:
+                                clear_skipped_months()
+                                continue
                             else:
                                 continue
                         logger.info("User confirmed partial upload. Proceeding with plan...")
@@ -6133,6 +6419,8 @@ def run_batch_management_flow(auto_apply):
             logger.info("🚀 Queuing planned steps for background executor...")
             set_planned_month(cursor, latest_month)
             conn.commit()
+            clear_skipped_months(latest_month)
+            skipped_months_map = load_skipped_months()
             logger.info(f"📌 Month {latest_month} recorded in planned_execution. Background executor will process it automatically (monitor via: python3 scripts/monitor_executor.py).")
 
             close_conn()
@@ -6144,11 +6432,15 @@ def run_batch_management_flow(auto_apply):
             if auto_apply:
                 return "done"
 
-            action = input("\n--- 📋 Batch Management ---\n[Enter/R] Plan another batch / refresh | [M] Main menu | [Q] Quit Planner: ").strip().lower()
+            clear_opt = f" | [C] Clear {len(skipped_months_map)} skipped month(s)" if skipped_months_map else ""
+            action = input(f"\n--- 📋 Batch Management ---\n[Enter/R] Plan another batch / refresh{clear_opt} | [M] Main menu | [Q] Quit Planner: ").strip().lower()
             if action in ('q', 'quit', 'exit'):
                 return "quit"
             elif action == 'm':
                 return "menu"
+            elif action == 'c' and skipped_months_map:
+                clear_skipped_months()
+                continue
             else:
                 continue
 

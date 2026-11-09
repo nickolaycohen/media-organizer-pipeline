@@ -34,3 +34,4 @@ def run(conn):
 
     conn.commit()
     print("✅ Migration 061 complete: Family and active device flags configured.")
+

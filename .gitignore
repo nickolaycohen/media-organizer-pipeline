@@ -22,4 +22,5 @@ db/media_organizer.db-wal
 backups
 *.lock
 db/*.lock
+db/planner_skipped_months.json
 reports/*.csv

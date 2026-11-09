@@ -58,6 +58,8 @@ APPLE_PHOTOS_DB_COPY_PATH = "/Volumes/Macintosh HD/Users/nickolaycohen/Photos Li
 APPLE_PHOTOS_DB_MARKER = APPLE_PHOTOS_DB_COPY_PATH + ".lastcopy"
 APPLE_PHOTOS_DB_LOCK_PATH = APPLE_PHOTOS_DB_COPY_PATH + ".lock"
 BG_SERVICE_PID_PATH = APPLE_PHOTOS_DB_COPY_PATH + ".service.pid"
+PLANNER_SKIPPED_MONTHS_TOKEN_PATH = os.path.abspath(os.path.join(BASE_DIR, '../db/planner_skipped_months.json'))
+PLANNER_SKIP_COOLDOWN_HOURS = 24
 
 
 # Scoring Weights

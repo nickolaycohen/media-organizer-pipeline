@@ -31,6 +31,9 @@ MOMENTS_EXPORT_DIR = TO_BE_CURATED_DIR
 DEFAULT_MEDIA_PREPROCESSING_DIR = '/Volumes/LaCie/Storage/Priority 4/Media Preprocessing'
 TRIAGE_INTAKE_FOLDER_NAME = 'TriageMediaIntake'
 TRIAGE_DESTINATION_ROOT = os.path.join(DEFAULT_MEDIA_PREPROCESSING_DIR, TRIAGE_INTAKE_FOLDER_NAME)
+MANAGED_INTAKE_FOLDER_NAME = 'ManagedIntake'
+MANAGED_INTAKE_ROOT = os.path.join(DEFAULT_MEDIA_PREPROCESSING_DIR, MANAGED_INTAKE_FOLDER_NAME)
+PRIVATE_STAGING_ROOT = '/Volumes/LaCie/Storage/Priority 4/ToBeImportedToMBP Personal PhotoLIbrary'
 
 # Multi-Drive Triage Roots
 # DELL1TB02: Non-backed up cold storage (Priority 3) and disposable duplicates (Priority 4)

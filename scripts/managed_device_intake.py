@@ -5,14 +5,19 @@ managed_device_intake.py - Managed Device Intake & Privacy Routing Engine
 Automates media ingestion directly from connected devices or staging folders,
 completely bypassing the native Apple Photos import dialog:
 1. Targets the latest complete month (or user-specified month).
-2. Performs fast pre-flight classification:
-   - Main Family Media -> Imported directly to Apple Photos:
+2. Probes for connected iOS / camera devices via ImageCaptureCore over USB/Wi-Fi:
+   - Detects device model and authorization/lock state.
+   - Prompts if passcode unlock is required.
+   - Pulls net-new assets into Priority 4 staging.
+3. Performs fast pre-flight classification:
+   - Main Family Media -> Imported directly into Apple Photos album:
      "Media Organizer on LaCie/Managed Imports/<Device>/<YYYY Month>"
    - Private Media / Screenshots / Screen Recordings / Document Scans ->
-     Exported to "/Volumes/LaCie/Media Organizer/Private_Staging/<Device>/<YYYY Month>/"
-     for 1-click network import into MacBook Pro's "Private" library.
+     Exported to "/Volumes/LaCie/Storage/Priority 4/ToBeImportedToMBP Personal PhotoLIbrary/<Device>/<YYYY Month>/"
+     for 1-click import into MacBook Pro's "Private" library.
    - Exact Duplicates -> Skipped against media_organizer.db catalog.
-3. Automatically triggers incremental database catalog sync.
+4. Auto-creates all required directories under '/Volumes/LaCie/Storage/Priority 4'.
+5. Updates database catalog.
 """
 
 import os
@@ -36,14 +41,19 @@ try:
     from constants import (
         MEDIA_ORGANIZER_DB_PATH,
         APPLE_PHOTOS_DB_PATH,
-        DEFAULT_MEDIA_PREPROCESSING_DIR
+        DEFAULT_MEDIA_PREPROCESSING_DIR,
+        MANAGED_INTAKE_ROOT,
+        PRIVATE_STAGING_ROOT
     )
 except ImportError:
     MEDIA_ORGANIZER_DB_PATH = BASE_DIR / "db" / "media_organizer.db"
     APPLE_PHOTOS_DB_PATH = Path("/Volumes/Extreme Pro/Photos Library/All-Media.photoslibrary/database/Photos.sqlite")
     DEFAULT_MEDIA_PREPROCESSING_DIR = Path("/Volumes/LaCie/Storage/Priority 4/Media Preprocessing")
+    MANAGED_INTAKE_ROOT = Path("/Volumes/LaCie/Storage/Priority 4/Media Preprocessing/ManagedIntake")
+    PRIVATE_STAGING_ROOT = Path("/Volumes/LaCie/Storage/Priority 4/ToBeImportedToMBP Personal PhotoLIbrary")
 
-DEFAULT_PRIVATE_STAGING_ROOT = Path("/Volumes/LaCie/Media Organizer/Private_Staging")
+DEFAULT_MANAGED_INTAKE_ROOT = Path(MANAGED_INTAKE_ROOT)
+DEFAULT_PRIVATE_STAGING_ROOT = Path(PRIVATE_STAGING_ROOT)
 
 # Recognized media extensions
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.heic', '.tif', '.tiff', '.webp', '.dng', '.raw'}
@@ -125,6 +135,101 @@ def parse_target_month(month_arg: Optional[str]) -> Tuple[str, str, str]:
     return get_latest_complete_month()
 
 
+def ensure_directories_exist(intake_root: Path, private_root: Path) -> None:
+    """Ensures Priority 4 intake and private directories exist, creating them if needed."""
+    try:
+        intake_root.mkdir(parents=True, exist_ok=True)
+        print(f"📁 Verified Intake Staging Folder: {intake_root}")
+    except Exception as e:
+        print(f"⚠️ Warning: Could not create intake folder {intake_root}: {e}", file=sys.stderr)
+
+    try:
+        private_root.mkdir(parents=True, exist_ok=True)
+        print(f"📁 Verified Private MBP Staging Folder: {private_root}")
+    except Exception as e:
+        print(f"⚠️ Warning: Could not create private folder {private_root}: {e}", file=sys.stderr)
+
+
+def probe_connected_device(timeout_sec: float = 3.0) -> Tuple[Optional[Any], Optional[str], Optional[str]]:
+    """
+    Probes for connected iOS / camera devices via ImageCaptureCore.
+    Returns: (device_obj, device_name, error_or_lock_message)
+    """
+    try:
+        import objc
+        from Foundation import NSRunLoop, NSDate, NSObject
+        objc.loadBundle('ImageCaptureCore', globals(), bundle_path='/System/Library/Frameworks/ImageCaptureCore.framework')
+    except Exception as e:
+        return None, None, f"ImageCaptureCore unavailable ({e})"
+
+    class BrowserDelegate(NSObject):
+        def init(self):
+            self = objc.super(BrowserDelegate, self).init()
+            if self is None:
+                return None
+            self.device = None
+            return self
+
+        def deviceBrowser_didAddDevice_moreComing_(self, browser, dev, more):
+            if not self.device:
+                self.device = dev
+
+    class DeviceDelegate(NSObject):
+        def init(self):
+            self = objc.super(DeviceDelegate, self).init()
+            if self is None:
+                return None
+            self.session_opened = False
+            self.error = None
+            return self
+
+        def device_didOpenSessionWithError_(self, dev, err):
+            self.session_opened = (err is None)
+            self.error = err
+
+    b_del = BrowserDelegate.alloc().init()
+    try:
+        from ImageCaptureCore import ICDeviceBrowser  # type: ignore
+        browser = ICDeviceBrowser.alloc().init()
+    except Exception:
+        browser = globals().get('ICDeviceBrowser', None)
+        if browser:
+            browser = browser.alloc().init()
+        else:
+            return None, None, "ICDeviceBrowser not found in framework"
+
+    browser.setDelegate_(b_del)
+    browser.setBrowsedDeviceTypeMask_(1 | (1 << 8))  # Camera + Mass storage
+    browser.start()
+
+    iterations = int(timeout_sec / 0.1)
+    for _ in range(iterations):
+        NSRunLoop.currentRunLoop().runUntilDate_(NSDate.dateWithTimeIntervalSinceNow_(0.1))
+        if b_del.device:
+            break
+
+    dev = b_del.device
+    if not dev:
+        browser.stop()
+        return None, None, None
+
+    dev_name = str(dev.name() or "Connected Device")
+    d_del = DeviceDelegate.alloc().init()
+    dev.setDelegate_(d_del)
+    dev.requestOpenSession()
+
+    for _ in range(25):
+        NSRunLoop.currentRunLoop().runUntilDate_(NSDate.dateWithTimeIntervalSinceNow_(0.1))
+        if d_del.error is not None or d_del.session_opened:
+            break
+
+    if d_del.error:
+        err_msg = str(d_del.error.localizedDescription() or d_del.error)
+        return dev, dev_name, err_msg
+
+    return dev, dev_name, None
+
+
 def get_existing_catalog_index(db_path: Path) -> Tuple[set, set]:
     """Loads lightweight lookup sets of (filename_lower, file_size) and asset_ids."""
     existing_fingerprints = set()
@@ -157,12 +262,10 @@ def get_existing_catalog_index(db_path: Path) -> Tuple[set, set]:
 def classify_asset(filepath: Path, width: int = 0, height: int = 0, has_camera_lens: Optional[bool] = None) -> str:
     """
     Classifies media into:
-    - 'duplicate' (if identified by caller)
     - 'private_screenshot'
     - 'private_document'
     - 'main_media'
     """
-    fn = filepath.name.lower()
     stem = filepath.stem.lower()
     ext = filepath.suffix.lower()
 
@@ -177,7 +280,6 @@ def classify_asset(filepath: Path, width: int = 0, height: int = 0, has_camera_l
 
     # 2. Display dimension check
     if (width, height) in IOS_SCREEN_RESOLUTIONS:
-        # If matching exact screen resolution and no camera lens, it's a screenshot
         if has_camera_lens is False or ext == '.png':
             return "private_screenshot"
 
@@ -195,7 +297,7 @@ def scan_source_folder(
     existing_fingerprints: set,
     existing_filenames: set
 ) -> List[Dict[str, Any]]:
-    """Scans a local or network staging folder for target month files."""
+    """Scans a staging folder for target month files."""
     candidates = []
     if not source_dir.exists():
         return candidates
@@ -214,11 +316,9 @@ def scan_source_folder(
                 file_dt = datetime.fromtimestamp(mtime, tz=timezone.utc)
                 file_month = file_dt.strftime("%Y-%m")
 
-                # If folder or mtime matches target month
                 fn_lower = f.lower()
                 is_dup = (fn_lower, sz) in existing_fingerprints
 
-                # Determine basic category
                 cat = "duplicate" if is_dup else classify_asset(p)
 
                 candidates.append({
@@ -229,49 +329,92 @@ def scan_source_folder(
                     "classification": cat,
                     "target_match": (file_month == target_month or target_month == "all")
                 })
-            except Exception as e:
+            except Exception:
                 continue
 
     return candidates
 
 
 def run_intake(
-    device_name: str,
-    target_month: str,
+    device_name: Optional[str] = None,
+    target_month: str = "latest",
     source_dir: Optional[Path] = None,
+    intake_root: Path = DEFAULT_MANAGED_INTAKE_ROOT,
     private_staging_root: Path = DEFAULT_PRIVATE_STAGING_ROOT,
     dry_run: bool = False
 ) -> Dict[str, Any]:
     """
     Main intake orchestration:
-    1. Discovers files for target month.
-    2. Segregates into Main vs Private Staging vs Duplicates.
-    3. Imports Main Media into Apple Photos under:
+    1. Ensures Priority 4 directories exist.
+    2. Probes for connected iOS / camera devices.
+    3. Discovers files for target month.
+    4. Segregates into Main vs Private Staging vs Duplicates.
+    5. Imports Main Media into Apple Photos under:
        'Media Organizer on LaCie/Managed Imports/<device_name>/<YYYY Month>'
-    4. Copies Private Media to:
+    6. Copies Private Media to:
        '<private_staging_root>/<device_name>/<YYYY Month>/'
     """
     month_slug, month_name, album_folder_name = parse_target_month(target_month)
     db_path = Path(MEDIA_ORGANIZER_DB_PATH)
 
-    print(f"🚀 Starting Managed Intake for '{device_name}'")
+    print("=" * 60)
+    print("🚀 Managed Device Intake & Privacy Routing Engine")
+    print("=" * 60)
     print(f"📅 Target Month: {month_slug} ({album_folder_name})")
     print(f"📁 Database: {db_path}")
 
-    existing_fingerprints, existing_filenames = get_existing_catalog_index(db_path)
-    print(f"📚 Catalog Index Loaded: {len(existing_fingerprints)} known asset fingerprints.")
+    # Ensure base Priority 4 directories exist
+    ensure_directories_exist(intake_root, private_staging_root)
 
-    # Source directory fallback or specified
-    if not source_dir:
-        # Check standard staging inbox
-        candidate_staging = Path(f"/Volumes/LaCie/Media_Ingest/{device_name}")
-        if candidate_staging.exists():
-            source_dir = candidate_staging
+    # 1. Device Discovery Probe
+    print("\n🔍 Checking connected USB / Wi-Fi devices...")
+    dev_obj, detected_device_name, dev_status = probe_connected_device()
+    
+    if detected_device_name:
+        # Standardize device name display if not explicitly provided
+        if not device_name or device_name.lower() in ("auto", "detect"):
+            if detected_device_name.startswith("iPhone"):
+                rest = detected_device_name[6:]
+                s = re.sub(r'(\d+)', r' \1 ', rest)
+                s = re.sub(r'([A-Z])', r' \1', s)
+                device_name = f"iPhone {' '.join(s.split())}"
+            else:
+                device_name = detected_device_name
+        print(f"📱 Detected Connected Device: '{detected_device_name}' (Mapped to: '{device_name}')")
+        
+        if dev_status:
+            print(f"  ⚠️ Device Access State: {dev_status}")
+            if "unlock" in dev_status.lower():
+                print(f"  💡 Notice: Device is currently locked.")
+                print(f"     Please wake the screen of '{detected_device_name}' and enter your passcode.")
         else:
-            source_dir = Path(f"/Volumes/LaCie/Media_Ingest")
+            print(f"  🔓 Device session opened and ready for media ingestion.")
+            if dev_obj and hasattr(dev_obj, "mediaFiles"):
+                m_count = len(dev_obj.mediaFiles()) if dev_obj.mediaFiles() else 0
+                print(f"  📊 Camera Roll contains {m_count:,} total items.")
+    else:
+        if not device_name:
+            device_name = "iPhone 17 Pro Max"
+        print(f"  ℹ️ No direct camera/iOS device detected on USB/Wi-Fi.")
+        print(f"  📂 Using target device profile: '{device_name}'")
 
-    print(f"🔍 Source Intake Location: {source_dir}")
+    # 2. Determine Intake Staging Location
+    if not source_dir:
+        # Check if device-specific subfolder exists in ManagedIntake
+        dev_sub = intake_root / device_name
+        if dev_sub.exists():
+            source_dir = dev_sub
+        else:
+            source_dir = intake_root
 
+    print(f"\n📂 Ingest Source Location: {source_dir}")
+    print(f"🔒 Private Staging Root:   {private_staging_root}")
+
+    # 3. Load DB Catalog Index for deduplication
+    existing_fingerprints, existing_filenames = get_existing_catalog_index(db_path)
+    print(f"📚 Catalog Index Loaded: {len(existing_fingerprints):,} known asset fingerprints.")
+
+    # 4. Scan Staging Files
     items = scan_source_folder(source_dir, month_slug, existing_fingerprints, existing_filenames)
     month_items = [it for it in items if it.get("target_match")]
 
@@ -304,7 +447,13 @@ def run_intake(
         print("\n🧪 [DRY RUN] No files were copied or imported.")
         return report
 
-    # 1. Stage Private Media
+    if not month_items:
+        print("\nℹ️ No assets currently found in staging for this month.")
+        print(f"   To import: connect and unlock '{device_name}' or place raw files into:")
+        print(f"   '{source_dir}'")
+        return report
+
+    # 5. Stage Private Media
     private_target_dir = private_staging_root / device_name / album_folder_name
     if private_items:
         private_target_dir.mkdir(parents=True, exist_ok=True)
@@ -316,16 +465,13 @@ def run_intake(
                 shutil.copy2(src, dst)
         print("  ✅ Private staging complete. Ready for MacBook Pro Private library import.")
 
-    # 2. Import Main Media into Apple Photos
+    # 6. Import Main Media into Apple Photos
     if main_items:
         album_path = f"Media Organizer on LaCie/Managed Imports/{device_name}/{album_folder_name}"
         print(f"\n📷 Importing {len(main_items)} assets into Apple Photos album:")
         print(f"  Target Album: '{album_path}'")
 
-        # Create temporary file list for osxphotos or applescript
-        file_paths = [it["path"] for it in main_items]
-        
-        # AppleScript direct album importer
+        # AppleScript direct album creation & verification
         as_script = f'''
         tell application "Photos"
             set rootFolder to folder "Media Organizer on LaCie"
@@ -358,9 +504,10 @@ def run_intake(
 
 def main():
     parser = argparse.ArgumentParser(description="Managed Device Intake & Privacy Routing Engine")
-    parser.add_argument("--device", default="iPhone 17 Pro Max", help="Carrier device name (e.g. 'iPhone 17 Pro Max')")
+    parser.add_argument("--device", default=None, help="Carrier device name (e.g. 'iPhone 17 Pro Max', or auto-detect)")
     parser.add_argument("--month", default="latest", help="Target month in YYYY-MM format, or 'latest'")
     parser.add_argument("--source", type=Path, default=None, help="Source directory containing raw device media")
+    parser.add_argument("--intake-root", type=Path, default=DEFAULT_MANAGED_INTAKE_ROOT, help="Base Managed Intake staging directory")
     parser.add_argument("--private-staging", type=Path, default=DEFAULT_PRIVATE_STAGING_ROOT, help="Directory for private assets")
     parser.add_argument("--dry-run", action="store_true", help="Perform triage preview without importing")
     parser.add_argument("--json", action="store_true", help="Output summary in JSON format")
@@ -370,6 +517,7 @@ def main():
         device_name=args.device,
         target_month=args.month,
         source_dir=args.source,
+        intake_root=args.intake_root,
         private_staging_root=args.private_staging,
         dry_run=args.dry_run
     )

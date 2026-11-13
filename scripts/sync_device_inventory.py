@@ -91,13 +91,17 @@ def resolve_camera_model(folder_name: str, known_models: Set[str]) -> Optional[s
     return None
 
 
+def _norm_ext(name: str) -> str:
+    ext = os.path.splitext(name)[1].lower()
+    return ".jpg" if ext == ".jpeg" else ext
+
+
 def _build_asset_lookup(conn: sqlite3.Connection) -> Tuple[
     Set[str],
     Dict[Tuple[str, int], List[Tuple[str, str]]],
-    Dict[str, List[Tuple[str, str, int, int]]],
-    Dict[Tuple[int, int], List[Tuple[str, str]]]
+    Dict[Tuple[int, int], List[Tuple[str, str, Set[str]]]]
 ]:
-    """Loads active catalog assets into fast lookup maps."""
+    """Loads active catalog assets into fast exact-size lookup maps."""
     cur = conn.cursor()
     cur.execute("""
         SELECT
@@ -117,26 +121,25 @@ def _build_asset_lookup(conn: sqlite3.Connection) -> Tuple[
 
     known_models: Set[str] = set()
     by_fn_sz: Dict[Tuple[str, int], List[Tuple[str, str]]] = {}
-    by_fn: Dict[str, List[Tuple[str, str, int, int]]] = {}
-    by_sz_kind: Dict[Tuple[int, int], List[Tuple[str, str]]] = {}
+    by_sz_kind: Dict[Tuple[int, int], List[Tuple[str, str, Set[str]]]] = {}
 
     for aid, ofn, aofn, zfn, sz, dev, kind in cur.fetchall():
         if dev and dev != "Unknown":
             known_models.add(dev)
         names = {n for n in (ofn, aofn, zfn) if n}
+        exts = {_norm_ext(n) for n in names if _norm_ext(n)}
         for n in names:
-            by_fn.setdefault(n, []).append((aid, dev, sz, kind))
             if sz:
                 by_fn_sz.setdefault((n, sz), []).append((aid, dev))
-        if sz and sz > 50000:
-            by_sz_kind.setdefault((sz, kind), []).append((aid, dev))
+        if sz and sz > 100000:
+            by_sz_kind.setdefault((sz, kind), []).append((aid, dev, exts))
 
     cur.execute("SELECT DISTINCT camera_model FROM device_owners WHERE camera_model IS NOT NULL")
     for (m,) in cur.fetchall():
         if m:
             known_models.add(m)
 
-    return known_models, by_fn_sz, by_fn, by_sz_kind
+    return known_models, by_fn_sz, by_sz_kind
 
 
 def _pick_preferred(candidates: List[Tuple[str, ...]], target_model: str) -> str:
@@ -161,7 +164,7 @@ def sync_intake_to_db(
     conn.execute("PRAGMA busy_timeout = 30000")
     try:
         ensure_device_inventory_schema(conn)
-        known_models, by_fn_sz, by_fn, by_sz_kind = _build_asset_lookup(conn)
+        known_models, by_fn_sz, by_sz_kind = _build_asset_lookup(conn)
 
         now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         results: List[Dict[str, Any]] = []
@@ -204,6 +207,7 @@ def sync_intake_to_db(
             for orig_name, fn_lower, sz, fn_stripped, kind in media_files_info:
                 aid = None
                 tier = None
+                dev_ext = _norm_ext(fn_lower)
 
                 if (fn_lower, sz) in by_fn_sz:
                     aid = _pick_preferred(by_fn_sz[(fn_lower, sz)], camera_model)
@@ -212,18 +216,10 @@ def sync_intake_to_db(
                     aid = _pick_preferred(by_fn_sz[(fn_stripped, sz)], camera_model)
                     tier = "stripped_name_size"
                 elif (sz, kind) in by_sz_kind and len(by_sz_kind[(sz, kind)]) == 1:
-                    aid = by_sz_kind[(sz, kind)][0][0]
-                    tier = "unique_size_kind"
-                else:
-                    cands = by_fn.get(fn_lower) or by_fn.get(fn_stripped)
-                    if cands:
-                        dev_cands = [c for c in cands if c[1] == camera_model]
-                        if dev_cands:
-                            aid = dev_cands[0][0]
-                            tier = "name_device"
-                        elif len(cands) == 1:
-                            aid = cands[0][0]
-                            tier = "name_unique"
+                    cand_aid, cand_dev, cand_exts = by_sz_kind[(sz, kind)][0]
+                    if cand_dev == camera_model or dev_ext in cand_exts:
+                        aid = cand_aid
+                        tier = "unique_size_kind"
 
                 if aid:
                     # Keep highest-confidence entry per asset_id

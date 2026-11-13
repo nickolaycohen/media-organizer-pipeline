@@ -230,6 +230,111 @@ def probe_connected_device(timeout_sec: float = 3.0) -> Tuple[Optional[Any], Opt
     return dev, dev_name, None
 
 
+def download_device_assets_for_month(
+    dev: Any,
+    target_month: str,
+    dest_dir: Path,
+    existing_fingerprints: set,
+    dry_run: bool = False
+) -> int:
+    """
+    Downloads assets matching target_month from connected device into dest_dir.
+    Returns count of downloaded assets.
+    """
+    try:
+        import objc
+        from Foundation import NSRunLoop, NSDate, NSObject, NSURL, NSDictionary
+
+        class DownloadDelegate(NSObject):
+            def init(self):
+                self = objc.super(DownloadDelegate, self).init()
+                if self is None:
+                    return None
+                self.downloaded = False
+                self.error = None
+                return self
+
+            def didDownloadFile_error_options_contextInfo_(self, file, err, opts, ctx):
+                self.downloaded = True
+                self.error = err
+
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        media_files = dev.mediaFiles() if hasattr(dev, "mediaFiles") else []
+        if not media_files:
+            return 0
+
+        dest_url = NSURL.fileURLWithPath_isDirectory_(str(dest_dir), True)
+        download_opts = NSDictionary.dictionaryWithObjects_forKeys_(
+            [dest_url, True],
+            ['downloadsDirectoryURL', 'overwrite']
+        )
+
+        month_candidates = []
+        for f in media_files:
+            try:
+                fn = str(f.name())
+                ext = Path(fn).suffix.lower()
+                if ext not in ALL_MEDIA_EXTS:
+                    continue
+
+                sz = int(f.fileSize()) if hasattr(f, "fileSize") else 0
+                c_date = f.creationDate() if hasattr(f, "creationDate") else None
+
+                file_month = None
+                if c_date:
+                    ts = c_date.timeIntervalSince1970()
+                    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+                    file_month = dt.strftime("%Y-%m")
+
+                if target_month != "all" and file_month != target_month:
+                    continue
+
+                fn_lower = fn.lower()
+                is_dup = (fn_lower, sz) in existing_fingerprints
+                if is_dup:
+                    continue
+
+                month_candidates.append((f, fn, sz))
+            except Exception:
+                continue
+
+        print(f"\n📲 Discovered {len(month_candidates)} new assets on device for {target_month}.")
+        if dry_run or not month_candidates:
+            return len(month_candidates)
+
+        success_count = 0
+        for f, fn, sz in month_candidates:
+            dest_file = dest_dir / fn
+            if dest_file.exists() and dest_file.stat().st_size == sz:
+                success_count += 1
+                continue
+
+            dl_del = DownloadDelegate.alloc().init()
+            dev.requestDownloadFile_options_downloadDelegate_didDownloadSelector_contextInfo_(
+                f,
+                download_opts,
+                dl_del,
+                'didDownloadFile:error:options:contextInfo:',
+                0
+            )
+
+            for _ in range(300):
+                NSRunLoop.currentRunLoop().runUntilDate_(NSDate.dateWithTimeIntervalSinceNow_(0.1))
+                if dl_del.downloaded:
+                    break
+
+            if dl_del.error:
+                print(f"  ⚠️ Error downloading {fn}: {dl_del.error.localizedDescription() or dl_del.error}")
+            else:
+                success_count += 1
+                print(f"  ⬇️ Downloaded: {fn} ({sz / (1024*1024):.1f} MB)")
+
+        return success_count
+    except Exception as e:
+        print(f"⚠️ Error pulling device media: {e}", file=sys.stderr)
+        return 0
+
+
 def get_existing_catalog_index(db_path: Path) -> Tuple[set, set]:
     """Loads lightweight lookup sets of (filename_lower, file_size) and asset_ids."""
     existing_fingerprints = set()
@@ -366,12 +471,15 @@ def run_intake(
     # Ensure base Priority 4 directories exist
     ensure_directories_exist(intake_root, private_staging_root)
 
-    # 1. Device Discovery Probe
+    # 1. Load DB Catalog Index for deduplication
+    existing_fingerprints, existing_filenames = get_existing_catalog_index(db_path)
+    print(f"📚 Catalog Index Loaded: {len(existing_fingerprints):,} known asset fingerprints.")
+
+    # 2. Device Discovery Probe
     print("\n🔍 Checking connected USB / Wi-Fi devices...")
     dev_obj, detected_device_name, dev_status = probe_connected_device()
     
     if detected_device_name:
-        # Standardize device name display if not explicitly provided
         if not device_name or device_name.lower() in ("auto", "detect"):
             if detected_device_name.startswith("iPhone"):
                 rest = detected_device_name[6:]
@@ -388,31 +496,37 @@ def run_intake(
                 print(f"  💡 Notice: Device is currently locked.")
                 print(f"     Please wake the screen of '{detected_device_name}' and enter your passcode.")
         else:
-            print(f"  🔓 Device session opened and ready for media ingestion.")
+            print(f"  🔓 Device session opened and authorized.")
             if dev_obj and hasattr(dev_obj, "mediaFiles"):
                 m_count = len(dev_obj.mediaFiles()) if dev_obj.mediaFiles() else 0
                 print(f"  📊 Camera Roll contains {m_count:,} total items.")
+                target_stage_dir = intake_root / device_name / album_folder_name
+                download_device_assets_for_month(
+                    dev=dev_obj,
+                    target_month=month_slug,
+                    dest_dir=target_stage_dir,
+                    existing_fingerprints=existing_fingerprints,
+                    dry_run=dry_run
+                )
     else:
         if not device_name:
             device_name = "iPhone 17 Pro Max"
         print(f"  ℹ️ No direct camera/iOS device detected on USB/Wi-Fi.")
         print(f"  📂 Using target device profile: '{device_name}'")
 
-    # 2. Determine Intake Staging Location
+    # 3. Determine Intake Staging Location
     if not source_dir:
-        # Check if device-specific subfolder exists in ManagedIntake
+        dev_month_sub = intake_root / device_name / album_folder_name
         dev_sub = intake_root / device_name
-        if dev_sub.exists():
+        if dev_month_sub.exists():
+            source_dir = dev_month_sub
+        elif dev_sub.exists():
             source_dir = dev_sub
         else:
             source_dir = intake_root
 
     print(f"\n📂 Ingest Source Location: {source_dir}")
     print(f"🔒 Private Staging Root:   {private_staging_root}")
-
-    # 3. Load DB Catalog Index for deduplication
-    existing_fingerprints, existing_filenames = get_existing_catalog_index(db_path)
-    print(f"📚 Catalog Index Loaded: {len(existing_fingerprints):,} known asset fingerprints.")
 
     # 4. Scan Staging Files
     items = scan_source_folder(source_dir, month_slug, existing_fingerprints, existing_filenames)
@@ -471,7 +585,6 @@ def run_intake(
         print(f"\n📷 Importing {len(main_items)} assets into Apple Photos album:")
         print(f"  Target Album: '{album_path}'")
 
-        # AppleScript direct album creation & verification
         as_script = f'''
         tell application "Photos"
             set rootFolder to folder "Media Organizer on LaCie"

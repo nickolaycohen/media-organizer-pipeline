@@ -396,6 +396,32 @@ def classify_asset(filepath: Path, width: int = 0, height: int = 0, has_camera_l
     return "main_media"
 
 
+def extract_media_capture_month(filepath: Path) -> Optional[str]:
+    """Extracts YYYY-MM capture date from EXIF or fallback to file birthtime/mtime."""
+    ext = filepath.suffix.lower()
+    try:
+        if ext in ('.jpg', '.jpeg', '.tiff', '.webp', '.heic', '.dng'):
+            from PIL import Image
+            with Image.open(filepath) as img:
+                exif = img.getexif()
+                if exif:
+                    # 36867 = DateTimeOriginal, 306 = DateTime
+                    dto = exif.get(36867) or exif.get(306)
+                    if dto and isinstance(dto, str):
+                        parts = dto.split(" ")[0].split(":")
+                        if len(parts) >= 2 and len(parts[0]) == 4:
+                            return f"{parts[0]}-{parts[1]}"
+    except Exception:
+        pass
+
+    try:
+        stat = filepath.stat()
+        ts = getattr(stat, 'st_birthtime', stat.st_mtime)
+        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m")
+    except Exception:
+        return None
+
+
 def scan_source_folder(
     source_dir: Path,
     target_month: str,
@@ -417,14 +443,15 @@ def scan_source_folder(
             try:
                 stat = p.stat()
                 sz = stat.st_size
-                mtime = stat.st_mtime
-                file_dt = datetime.fromtimestamp(mtime, tz=timezone.utc)
-                file_month = file_dt.strftime("%Y-%m")
+                file_month = extract_media_capture_month(p) or target_month
 
                 fn_lower = f.lower()
                 is_dup = (fn_lower, sz) in existing_fingerprints
 
                 cat = "duplicate" if is_dup else classify_asset(p)
+
+                # Match if month matches, or if target is 'all', or if placed directly into this folder
+                is_target = (file_month == target_month or target_month in ("all", "latest"))
 
                 candidates.append({
                     "path": str(p),
@@ -432,7 +459,7 @@ def scan_source_folder(
                     "size_bytes": sz,
                     "month": file_month,
                     "classification": cat,
-                    "target_match": (file_month == target_month or target_month == "all")
+                    "target_match": is_target
                 })
             except Exception:
                 continue
@@ -611,6 +638,31 @@ def run_intake(
             print(f"  ✅ Verified Photos destination album exists: {res.stdout.strip()}")
         except subprocess.CalledProcessError as e:
             print(f"  ⚠️ Warning setting up Apple Photos album: {e.stderr}", file=sys.stderr)
+
+        # Batch import files into target album in chunks
+        chunk_size = 25
+        imported_count = 0
+        for i in range(0, len(main_items), chunk_size):
+            chunk = main_items[i:i + chunk_size]
+            posix_items = ", ".join([f'(POSIX file "{it["path"]}") as alias' for it in chunk])
+
+            as_import = f'''
+            tell application "Photos"
+                set rootFolder to folder "Media Organizer on LaCie"
+                set managedFolder to folder "Managed Imports" of rootFolder
+                set devFolder to folder "{device_name}" of managedFolder
+                set targetAlbum to album "{album_folder_name}" of devFolder
+                
+                set fileList to {{{posix_items}}}
+                import fileList into targetAlbum skip check duplicates true
+            end tell
+            '''
+            try:
+                subprocess.run(["osascript", "-e", as_import], capture_output=True, text=True, check=True)
+                imported_count += len(chunk)
+                print(f"  📥 Imported {imported_count}/{len(main_items)} assets into '{album_path}'")
+            except subprocess.CalledProcessError as err:
+                print(f"  ⚠️ Warning importing chunk {i//chunk_size + 1}: {err.stderr}", file=sys.stderr)
 
     return report
 

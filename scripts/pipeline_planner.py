@@ -2058,6 +2058,37 @@ def run_memory_publishing_flow(cursor=None, conn=None):
         except Exception as e:
             logger.warning(f"Error checking/cleaning stale publications: {e}")
 
+        # Pre-deduplication & Comparison (Media Intake approach) BEFORE generating Proposed Moment groups
+        try:
+            from dedup_unassigned_moments import analyze_unassigned_duplicates, apply_ignore_to_assets
+            dedup_report = analyze_unassigned_duplicates(threshold=historical_min if historical_min > 0 else None)
+            dup_items = dedup_report.get("duplicates") or []
+            if dup_items:
+                print("\n" + "=" * 95)
+                print(
+                    f"🧹 Media-Intake Dedup Check: Found {len(dup_items)} duplicate(s) among unassigned "
+                    f"high-rank assets ({dedup_report.get('reclaimable_bytes', 0) / 1048576.0:.1f} MB)"
+                )
+                print("=" * 95)
+                for d_idx, d in enumerate(dup_items[:20], 1):
+                    mom_tag = f" [Moment: {d['keeper_moment']}]" if d.get("keeper_moment") else ""
+                    print(
+                        f"  {d_idx:>2}. {d['duplicate_filename']} ({d['duplicate_size_mb']:.2f} MB, sc={d['duplicate_score']:.4f}) "
+                        f"--[{d['match_tier']} {d['similarity_pct']:.1f}%]--> KEEP {d['keeper_filename']}{mom_tag}"
+                    )
+                if len(dup_items) > 20:
+                    print(f"  ... and {len(dup_items) - 20} more duplicate(s).")
+                if sys.stdin and sys.stdin.isatty():
+                    ans = input(f"\nAdd these {len(dup_items)} duplicate(s) to 'Ignore' folder before Proposed Moment grouping? [y/N]: ").strip().lower()
+                    if ans in ('y', 'yes'):
+                        apply_res = apply_ignore_to_assets([d["duplicate_asset_id"] for d in dup_items])
+                        print(
+                            f"✅ Added {apply_res.get('requested', 0)} duplicate(s) to '{apply_res.get('ignore_album_path', 'Ignore')}' "
+                            f"(Photos={apply_res.get('photos_added', 0)}, DB={apply_res.get('db_updated', 0)})."
+                        )
+        except Exception as e:
+            logger.warning(f"Media-Intake dedup pre-check skipped: {e}")
+
         # Fetch the cutoff threshold score (dynamically on each loop iteration, excluding Ignore folder items)
         cutoff_score = 0.0
         if photos_db_attached:
@@ -2074,6 +2105,12 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                             AND LOWER(ga.ZTITLE) IN ('ignore', 'skippublishing', 'topscore excluded')
                             AND ga.ZTRASHEDSTATE = 0
                       ))
+                      AND NOT EXISTS (
+                          SELECT 1 FROM media_organizer_album_assets moaa
+                          JOIN media_organizer_albums moa ON moa.album_pk = moaa.album_pk
+                          WHERE moaa.asset_id = v.asset_id
+                            AND LOWER(moa.album_name) IN ('ignore', 'skippublishing', 'topscore excluded')
+                      )
                     ORDER BY v.score_normalized DESC LIMIT 1
                 """)
                 row = cursor.fetchone()
@@ -2164,6 +2201,12 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                                 AND LOWER(ga.ZTITLE) IN ('ignore', 'skippublishing', 'topscore excluded')
                                 AND ga.ZTRASHEDSTATE = 0
                           ))
+                          AND NOT EXISTS (
+                              SELECT 1 FROM media_organizer_album_assets moaa
+                              JOIN media_organizer_albums moa ON moa.album_pk = moaa.album_pk
+                              WHERE moaa.asset_id = v.asset_id
+                                AND LOWER(moa.album_name) IN ('ignore', 'skippublishing', 'topscore excluded')
+                          )
                         ORDER BY v.score_normalized DESC
                     """, (target_score_floor,))
                 else:

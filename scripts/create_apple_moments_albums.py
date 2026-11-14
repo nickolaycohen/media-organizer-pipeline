@@ -408,19 +408,6 @@ def main():
     
     logger.info(f"Using effective cutoff threshold: {effective_threshold:.4f}")
 
-    # Check filesystem folder existence for each unique album name
-    album_folder_exists = {}
-    for r in rows:
-        album_name = r[1]
-        if album_name and album_name not in album_folder_exists:
-            safe_moment_name = "".join([c for c in album_name if c.isalnum() or c in (' ', '-', '_')]).strip()
-            folder_path = os.path.join(MOMENTS_EXPORT_DIR, safe_moment_name)
-            album_folder_exists[album_name] = os.path.exists(folder_path)
-
-    # Fetch all curated moment names from DB to determine which moments are active in curation
-    cursor.execute("SELECT moment_name FROM curated_moments")
-    curated_moments = {row[0] for row in cursor.fetchall()}
-
     # Group all qualified assets by suggested Moment name
     album_candidates = {}
     for r in rows:
@@ -478,39 +465,50 @@ def main():
                 continue
             expected_uuids.add(asset_id)
 
-        # Determine sync trigger
-        folder_exists = album_folder_exists.get(album_name, False)
-        is_being_curated = album_name in curated_moments
-        content_mismatch = (expected_uuids != to_be_curated_uuids)
+        # Determine sync trigger solely from Apple Photos album diff and DB tracking
+        to_add = expected_uuids - to_be_curated_uuids
+        to_remove = to_be_curated_uuids - expected_uuids
+        content_mismatch = bool(to_add or to_remove)
         missing_db_exports = any(db_exported_id is None for asset_id, moment_name, score, db_exported_id in candidates if asset_id in expected_uuids)
 
         # Optimization: Do not sync empty albums if they are already empty in Apple Photos
         if len(expected_uuids) == 0 and len(to_be_curated_uuids) == 0:
             continue
 
-        if not folder_exists or is_being_curated or content_mismatch or missing_db_exports:
-            albums_to_sync.append(album_name)
-            sync_jobs[album_name] = {
-                'expected_uuids': expected_uuids,
-                'skipped_already_curated': skipped_already_curated,
-                'skipped_rejected': skipped_rejected,
-                'min_curated_score': min_curated_score,
-                'folder_exists': folder_exists
-            }
+        if not content_mismatch:
+            # Apple Photos already has the exact expected assets; only backfill moment_exports if missing in DB
+            if missing_db_exports and expected_uuids:
+                export_data = [(aid, album_name, 'to_be_curated') for aid in sorted(expected_uuids)]
+                cursor.executemany("""
+                    INSERT OR REPLACE INTO moment_exports (asset_id, album_name, curation_stage, exported_at_utc)
+                    VALUES (?, ?, ?, datetime('now'))
+                """, export_data)
+                conn.commit()
+                logger.info(f"  📝 Backfilled {len(export_data)} DB export records for already-synced album '{album_name}'.")
+            continue
+
+        albums_to_sync.append(album_name)
+        sync_jobs[album_name] = {
+            'expected_uuids': expected_uuids,
+            'to_add': to_add,
+            'to_remove': to_remove,
+            'album_exists': (album_name in to_be_curated_map),
+            'skipped_already_curated': skipped_already_curated,
+            'skipped_rejected': skipped_rejected,
+            'min_curated_score': min_curated_score,
+        }
 
     if not albums_to_sync:
         logger.info("🏁 Apple Photos is fully in sync. No albums require updates.")
     else:
-        # Log albums that are being re-exported because their folder is missing on the filesystem
-        reexport_albums = [name for name, job in sync_jobs.items() if not job['folder_exists']]
-        if reexport_albums:
-            logger.info(f"Re-exporting assets for albums because their folders do not exist on the filesystem: {', '.join(reexport_albums)}")
-
         logger.info(f"Syncing {len(albums_to_sync)} albums to Apple Photos...")
 
         for album_name in albums_to_sync:
             job = sync_jobs[album_name]
             expected_uuids = job['expected_uuids']
+            to_add = job['to_add']
+            to_remove = job['to_remove']
+            album_exists = job['album_exists']
             skipped_already_curated = job['skipped_already_curated']
             skipped_rejected = job['skipped_rejected']
             min_curated_score = job['min_curated_score']
@@ -524,9 +522,64 @@ def main():
 
             safe_album_name = album_name.replace('"', '\\"')
             sorted_expected_uuids = sorted(list(expected_uuids))
-            ids_string = ",".join([f'"{aid}"' for aid in sorted_expected_uuids])
-            
-            # AppleScript to create hierarchy and add assets by ID (no re-import)
+
+            if len(sorted_expected_uuids) == 0:
+                # Expected set became empty (e.g., all items moved to Curated/SkipPublishing): delete album without recreating
+                script = f'''
+                tell application "Photos"
+                    set topFolderName to "Media Organizer on LaCie"
+                    set subFolderName to "ToBeCurated"
+                    set targetAlbumName to "{safe_album_name}"
+                    if exists folder topFolderName then
+                        set topFolder to folder topFolderName
+                        if exists folder subFolderName of topFolder then
+                            set exportFolder to folder subFolderName of topFolder
+                            if exists album targetAlbumName of exportFolder then
+                                set oldAlbum to album targetAlbumName of exportFolder
+                                delete album id (id of oldAlbum)
+                            end if
+                        end if
+                    end if
+                end tell
+                '''
+                run_applescript(script)
+                cursor.execute("""
+                    DELETE FROM moment_exports
+                    WHERE album_name = ? AND curation_stage = 'to_be_curated'
+                """, (album_name,))
+                conn.commit()
+                logger.info(f"  🗑️ Removed empty ToBeCurated album: {album_name}")
+                continue
+
+            incremental_only = bool(album_exists and not to_remove and to_add)
+            sorted_add_uuids = sorted(list(to_add))
+            full_ids_string = ",".join([f'"{aid}"' for aid in sorted_expected_uuids])
+            add_ids_string = ",".join([f'"{aid}"' for aid in sorted_add_uuids])
+
+            if incremental_only:
+                logger.info(f"  ➕ Incrementally adding {len(sorted_add_uuids)} new asset(s) to existing album '{album_name}' (keeping {len(expected_uuids) - len(sorted_add_uuids)} already present).")
+                album_setup_block = f'''
+                if exists album targetAlbumName of exportFolder then
+                    set targetAlbum to album targetAlbumName of exportFolder
+                    set assetIds to {{{add_ids_string}}}
+                else
+                    make new album named targetAlbumName at exportFolder
+                    set targetAlbum to album targetAlbumName of exportFolder
+                    set assetIds to {{{full_ids_string}}}
+                end if
+                '''
+            else:
+                album_setup_block = f'''
+                if exists album targetAlbumName of exportFolder then
+                    set oldAlbum to album targetAlbumName of exportFolder
+                    delete album id (id of oldAlbum)
+                end if
+                make new album named targetAlbumName at exportFolder
+                set targetAlbum to album targetAlbumName of exportFolder
+                set assetIds to {{{full_ids_string}}}
+                '''
+
+            # AppleScript to create/update hierarchy and add missing assets by ID (no re-import)
             script = f'''
             property debugLogPath : "/Users/nickolaycohen/dev/media-organizer-pipeline/logs/applescript_execution.log"
             tell application "Photos"
@@ -544,14 +597,8 @@ def main():
                 end if
                 set exportFolder to folder subFolderName of topFolder
                 
-                if exists album targetAlbumName of exportFolder then
-                    set oldAlbum to album targetAlbumName of exportFolder
-                    delete album id (id of oldAlbum)
-                end if
-                make new album named targetAlbumName at exportFolder
-                set targetAlbum to album targetAlbumName of exportFolder
+                {album_setup_block}
                 
-                set assetIds to {{{ids_string}}}
                 set assetsToAdd to {{}}
                 repeat with anId in assetIds
                     try
@@ -585,14 +632,21 @@ def main():
 
             '''
             run_applescript(script)
-            logger.info(f"  ✅ Sync complete for album: {album_name} ({len(sorted_expected_uuids)} assets)")
+            synced_label = f"+{len(sorted_add_uuids)} new / {len(sorted_expected_uuids)} total" if incremental_only else f"{len(sorted_expected_uuids)} assets"
+            logger.info(f"  ✅ Sync complete for album: {album_name} ({synced_label})")
             
-            # Record the export in the database
+            # Record the export in the database and prune any removed to_be_curated rows for this album
             export_data = [(aid, album_name, 'to_be_curated') for aid in sorted_expected_uuids]
             cursor.executemany("""
                 INSERT OR REPLACE INTO moment_exports (asset_id, album_name, curation_stage, exported_at_utc)
                 VALUES (?, ?, ?, datetime('now'))
             """, export_data)
+            placeholders = ",".join("?" for _ in sorted_expected_uuids)
+            cursor.execute(f"""
+                DELETE FROM moment_exports
+                WHERE album_name = ? AND curation_stage = 'to_be_curated'
+                  AND asset_id NOT IN ({placeholders})
+            """, [album_name, *sorted_expected_uuids])
             conn.commit()
 
     # Clean up empty albums/folders in Apple Photos and filesystem

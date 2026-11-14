@@ -149,7 +149,7 @@ def merge_directories(
     source_dir,
     dest_dir,
     mode="move",
-    collision_strategy="rename",
+    collision_strategy="overwrite",
     dry_run=False,
     clean_empty=True
 ):
@@ -425,8 +425,8 @@ Examples:
     mode_group.add_argument("--copy", dest="mode", action="store_const", const="copy",
                             help="Copy files from source to destination (leaves source intact)")
 
-    parser.add_argument("--on-collision", choices=["rename", "overwrite", "skip", "newer"], default="rename",
-                        help="Collision resolution for non-identical files (default: rename with _dupX)")
+    parser.add_argument("--on-collision", choices=["rename", "overwrite", "skip", "newer"], default="overwrite",
+                        help="Collision resolution for non-identical files (default: overwrite existing destination file)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Simulate the merge process without transferring files or deleting directories")
     parser.add_argument("--no-clean", action="store_true",

@@ -327,25 +327,32 @@ def analyze_unassigned_duplicates(
         r[0]: r[1]
         for r in cur.execute("SELECT asset_id, phash FROM asset_phash_cache WHERE phash IS NOT NULL").fetchall()
     }
-    hash_obj_cache: dict[str, object | None] = {}
+    hash_int_cache: dict[str, int | None] = {}
     new_hashes_to_persist: list[tuple[str, str, int, str]] = []
 
-    def get_phash(info: dict):
+    def get_phash_int(info: dict) -> int | None:
         aid = info["asset_id"]
-        if aid in hash_obj_cache:
-            return hash_obj_cache[aid]
-        if aid in cached_hashes_db and HAS_IMAGEHASH:
+        if aid in hash_int_cache:
+            return hash_int_cache[aid]
+        if aid in cached_hashes_db:
             try:
-                obj = imagehash.hex_to_hash(cached_hashes_db[aid])
-                hash_obj_cache[aid] = obj
-                return obj
+                val = int(cached_hashes_db[aid], 16)
+                hash_int_cache[aid] = val
+                return val
             except Exception:
                 pass
-        h_obj, h_hex = compute_asset_phash(aid, info["zdir"], info["zfilename"])
-        hash_obj_cache[aid] = h_obj
-        if h_hex:
-            new_hashes_to_persist.append((aid, info["zfilename"], info["size"], h_hex))
-        return h_obj
+        if HAS_IMAGEHASH:
+            _, h_hex = compute_asset_phash(aid, info["zdir"], info["zfilename"])
+            if h_hex:
+                new_hashes_to_persist.append((aid, info["zfilename"], info["size"], h_hex))
+                try:
+                    val = int(h_hex, 16)
+                    hash_int_cache[aid] = val
+                    return val
+                except Exception:
+                    pass
+        hash_int_cache[aid] = None
+        return None
 
     uf = _UnionFind(pool_map.keys())
     edge_meta: dict[tuple[str, str], dict] = {}
@@ -398,19 +405,19 @@ def analyze_unassigned_duplicates(
                     record_match(aid, cid, "Tier 2: Format/Quality Pair", 0, 99.0)
                 matched_metadata_tier = True
 
-        # Visual perceptual hash check for images (covers renamed copies like IMG_8026 (1).JPG vs IMG_8027.HEIC)
-        if use_phash and HAS_IMAGEHASH and me["kind"] == 0 and not matched_metadata_tier:
-            my_h = get_phash(me)
+        # Visual perceptual hash check for images (works from cached DB hashes even without PIL/imagehash)
+        if use_phash and me["kind"] == 0 and not matched_metadata_tier and (HAS_IMAGEHASH or cached_hashes_db):
+            my_h = get_phash_int(me)
             if my_h is not None:
                 near_cands = sorted(
                     [c for c in cands if c["asset_id"] != aid and abs(c["unix_ts"] - me["unix_ts"]) <= 86400],
                     key=lambda x: abs(x["unix_ts"] - me["unix_ts"]),
                 )[:40]
                 for c in near_cands:
-                    ch = get_phash(c)
+                    ch = get_phash_int(c)
                     if ch is None:
                         continue
-                    dist = int(my_h - ch)
+                    dist = (my_h ^ ch).bit_count()
                     if dist <= PHASH_MAX_HAMMING_DIST:
                         sim = max(0.0, 1.0 - (dist / 64.0)) * 100.0
                         record_match(aid, c["asset_id"], "Tier 2.5: Visual pHash", dist, sim)

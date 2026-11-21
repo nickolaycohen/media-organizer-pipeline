@@ -41,16 +41,20 @@ def authenticate(scopes=None, force_refresh=False):
 
     creds = None
 
+    # Ensure any interactive OAuth flow always requests all pipeline scopes so a single
+    # helper script never overwrites token.json with a partial subset of scopes.
+    full_oauth_scopes = list(dict.fromkeys(list(PLANNER_REQUIRED_SCOPES) + list(scopes)))
+
     # Check for existing token and validate its scopes
     if os.path.exists(TOKEN_FILE):
         try:
             # Load credentials from file without specifying scopes first
             loaded_creds = Credentials.from_authorized_user_file(TOKEN_FILE)
             # Verify that all requested scopes are present in the token.
-            if all(scope in loaded_creds.scopes for scope in scopes):
+            if loaded_creds.scopes and all(scope in loaded_creds.scopes for scope in scopes):
                 creds = loaded_creds
             else:
-                missing = [s for s in scopes if s not in loaded_creds.scopes]
+                missing = [s for s in scopes if s not in (loaded_creds.scopes or [])]
                 logger.warning(f"[Google Photos] Token missing required scopes: {missing}. Re-authenticating.")
                 if os.path.exists(TOKEN_FILE):
                     os.remove(TOKEN_FILE)
@@ -73,11 +77,11 @@ def authenticate(scopes=None, force_refresh=False):
                 logger.error(f"Refresh error: {e}")
                 if os.path.exists(TOKEN_FILE):
                     os.remove(TOKEN_FILE)
-                flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_FILE, scopes)
+                flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_FILE, full_oauth_scopes)
                 creds = flow.run_local_server(port=0, access_type='offline', prompt='consent')
         else:
             logger.info("[Google Photos] No valid credentials found. Starting new authentication flow.")
-            flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_FILE, scopes)
+            flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_FILE, full_oauth_scopes)
             creds = flow.run_local_server(port=0, access_type='offline', prompt='consent')
         with open(TOKEN_FILE, 'w') as token:
             token.write(creds.to_json())

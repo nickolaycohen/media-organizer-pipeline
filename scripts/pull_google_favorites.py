@@ -8,7 +8,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
-from constants import LOG_PATH, MEDIA_ORGANIZER_DB_PATH, GOOGLE_PHOTOS_EDIT_ACCESS_SCOPES
+from constants import LOG_PATH, MEDIA_ORGANIZER_DB_PATH, PLANNER_REQUIRED_SCOPES
 from google_photos import create_or_get_album, get_all_favorites, authenticate
 from utils.logger import setup_logger
 from db.connections import get_connection, get_cursor, commit, close as close_conn
@@ -53,8 +53,8 @@ def main():
     # --- Single, Consolidated Authentication ---
     # This script needs to create albums and read the entire library.
     # Authenticate once with a scope that covers all required actions.
-    logger.info("Authenticating with edit access for all operations...")
-    creds = authenticate(scopes=GOOGLE_PHOTOS_EDIT_ACCESS_SCOPES)
+    logger.info("Authenticating with full planner scopes (edit + readonly)...")
+    creds = authenticate(scopes=PLANNER_REQUIRED_SCOPES)
     if not creds:
         logger.error("Authentication failed. Cannot proceed.")
         sys.exit(1)
@@ -180,8 +180,8 @@ def run_retroactive(creds):
 
 if __name__ == "__main__":
     if "--retroactive" in sys.argv:
-        logger.info("Authenticating with edit access for retroactive operations...")
-        creds = authenticate(scopes=GOOGLE_PHOTOS_EDIT_ACCESS_SCOPES)
+        logger.info("Authenticating with full planner scopes for retroactive operations...")
+        creds = authenticate(scopes=PLANNER_REQUIRED_SCOPES)
         if not creds:
             logger.error("Authentication failed. Cannot proceed.")
             sys.exit(1)

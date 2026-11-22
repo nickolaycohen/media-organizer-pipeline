@@ -12,7 +12,7 @@ from constants import LOG_PATH, MEDIA_ORGANIZER_DB_PATH, PLANNER_REQUIRED_SCOPES
 from google_photos import create_or_get_album, get_all_favorites, authenticate
 from utils.logger import setup_logger
 from db.connections import get_connection, get_cursor, commit, close as close_conn
-from db.queries import get_planned_month
+from db.queries import get_planned_month, check_apple_month_selection_album, should_skip_month_selection_check
 
 MODULE_TAG = 'pull_google_favorites'
 logger = setup_logger(LOG_PATH, MODULE_TAG)
@@ -49,16 +49,7 @@ def get_album_items(creds, album_id):
 
 
 def main():
-
-    # --- Single, Consolidated Authentication ---
-    # This script needs to create albums and read the entire library.
-    # Authenticate once with a scope that covers all required actions.
-    logger.info("Authenticating with full planner scopes (edit + readonly)...")
-    creds = authenticate(scopes=PLANNER_REQUIRED_SCOPES)
-    if not creds:
-        logger.error("Authentication failed. Cannot proceed.")
-        sys.exit(1)
-
+    skip_month_selection_flag = "--skip-month-selection-check" in sys.argv
     conn = get_connection()
     cursor = get_cursor()
 
@@ -67,6 +58,43 @@ def main():
         logger.error("No active planned batch found. Please run the planner first.")
         close_conn()
         return
+
+    # Pre-flight check: verify batch has its album populated under Apple Photos Month Selection
+    ms_status = check_apple_month_selection_album(cursor, album_month)
+    if ms_status["ready"]:
+        logger.info(
+            f"✅ Verified Apple Photos Month Selection album '{ms_status['matched_album_name']}' "
+            f"({ms_status['asset_count']} asset(s)) for batch {album_month}."
+        )
+    else:
+        allow_override = skip_month_selection_flag or should_skip_month_selection_check(cursor, album_month)
+        reason = (
+            f"album '{ms_status['matched_album_name']}' exists under 'Apple Photos Month Selection' but has 0 assets"
+            if ms_status["exists"]
+            else f"no album named '{ms_status['expected_album']}' found under 'Apple Photos Month Selection'"
+        )
+        if allow_override:
+            logger.warning(
+                f"⚠️ Apple Photos Month Selection check bypassed/overridden for {album_month} ({reason}). Proceeding with Google Favorites pull."
+            )
+        else:
+            logger.error(
+                f"❌ Blocked Google Favorites pull for {album_month}: {reason}. "
+                f"Create/populate '{ms_status['expected_album']}' under 'Apple Photos Month Selection' in Apple Photos, "
+                f"or re-run with --skip-month-selection-check."
+            )
+            close_conn()
+            sys.exit(1)
+
+    # --- Single, Consolidated Authentication ---
+    # This script needs to create albums and read the entire library.
+    # Authenticate once with a scope that covers all required actions.
+    logger.info("Authenticating with full planner scopes (edit + readonly)...")
+    creds = authenticate(scopes=PLANNER_REQUIRED_SCOPES)
+    if not creds:
+        logger.error("Authentication failed. Cannot proceed.")
+        close_conn()
+        sys.exit(1)
 
     album_title = f"Currently Curating - {album_month}"
     album_id = create_or_get_album(creds, album_title)

@@ -6326,6 +6326,38 @@ def run_batch_management_flow(auto_apply):
             is_byp = row_byp[0] if row_byp else 0
 
             if is_favorites_pull:
+                from db.queries import check_apple_month_selection_album
+                ms_info = check_apple_month_selection_album(cursor, latest_month)
+                if ms_info.get("ready"):
+                    logger.info(
+                        f"✅ Apple Photos Month Selection ready: '{ms_info['matched_album_name']}' "
+                        f"({ms_info['asset_count']} asset(s))."
+                    )
+                elif is_byp:
+                    logger.info(
+                        f"ℹ️ Apple Photos Month Selection album '{ms_info['expected_album']}' not populated "
+                        f"({ms_info['status']}); proceeding in Direct-Rank Bypass mode."
+                    )
+                else:
+                    if ms_info.get("exists"):
+                        logger.warning(
+                            f"⚠️ Apple Photos Month Selection album '{ms_info['matched_album_name']}' for {latest_month} "
+                            f"exists but has 0 assets."
+                        )
+                    else:
+                        logger.warning(
+                            f"⚠️ Apple Photos Month Selection album '{ms_info['expected_album']}' for {latest_month} "
+                            f"was not found under 'Apple Photos Month Selection'."
+                        )
+                    if auto_apply:
+                        logger.warning(
+                            f"⏭️ Auto-apply skipping {latest_month}: Apple Photos Month Selection check failed ({ms_info['status']})."
+                        )
+                        record_skipped_month(latest_month, reason="missing_apple_month_selection")
+                        close_conn()
+                        release_planner_lock()
+                        return "done"
+
                 if is_byp:
                     logger.info(f"ℹ️ Batch {latest_month} is running in Direct-Rank Bypass mode (no remote favorites expected).")
                 else:

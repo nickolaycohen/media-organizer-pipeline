@@ -2614,7 +2614,10 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                        (SELECT 1 FROM moment_exports me WHERE me.asset_id = v.asset_id AND me.curation_stage = 'curated') as is_curated,
                        (SELECT album_name FROM moment_exports me WHERE me.asset_id = v.asset_id ORDER BY exported_at_utc DESC LIMIT 1) as exported_album_name,
                        ast.curated_album,
-                       (SELECT 1 FROM publications p WHERE p.asset_uuid = v.asset_id LIMIT 1) as is_published
+                       (SELECT 1 FROM publications p
+                        LEFT JOIN curated_moments cm ON TRIM(LOWER(cm.moment_name)) = TRIM(LOWER(p.moment_name))
+                        WHERE p.asset_uuid = v.asset_id AND LOWER(COALESCE(cm.memory_stage, '')) != 'deleted'
+                        LIMIT 1) as is_published
                 FROM ranked_assets_view v
                 JOIN assets ast ON v.asset_id = ast.asset_id
                 JOIN month_batches mb ON v.month = mb.month
@@ -2639,7 +2642,10 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                        (SELECT 1 FROM moment_exports me WHERE me.asset_id = v.asset_id AND me.curation_stage = 'curated') as is_curated,
                        (SELECT album_name FROM moment_exports me WHERE me.asset_id = v.asset_id ORDER BY exported_at_utc DESC LIMIT 1) as exported_album_name,
                        ast.curated_album,
-                       (SELECT 1 FROM publications p WHERE p.asset_uuid = v.asset_id LIMIT 1) as is_published
+                       (SELECT 1 FROM publications p
+                        LEFT JOIN curated_moments cm ON TRIM(LOWER(cm.moment_name)) = TRIM(LOWER(p.moment_name))
+                        WHERE p.asset_uuid = v.asset_id AND LOWER(COALESCE(cm.memory_stage, '')) != 'deleted'
+                        LIMIT 1) as is_published
                 FROM ranked_assets_view v
                 JOIN assets ast ON v.asset_id = ast.asset_id
                 JOIN month_batches mb ON v.month = mb.month
@@ -3286,7 +3292,12 @@ def run_memory_publishing_flow(cursor=None, conn=None):
         # Display Weekly Memory Publishing Recommendations (only if all M200/M300 curation & export moments are complete)
         published_assets_by_moment = {}
         if not has_pending_curation:
-            cursor.execute("SELECT asset_uuid, moment_name FROM publications")
+            cursor.execute("""
+                SELECT p.asset_uuid, p.moment_name
+                FROM publications p
+                LEFT JOIN curated_moments cm ON TRIM(LOWER(cm.moment_name)) = TRIM(LOWER(p.moment_name))
+                WHERE LOWER(COALESCE(cm.memory_stage, '')) != 'deleted'
+            """)
             for aid, mom_name in cursor.fetchall():
                 if mom_name not in published_assets_by_moment:
                     published_assets_by_moment[mom_name] = set()
@@ -3508,7 +3519,11 @@ def run_memory_publishing_flow(cursor=None, conn=None):
                     JOIN ranked_assets_view v ON me.asset_id = v.asset_id 
                     WHERE (me.album_name = ? OR me.album_name = ?)
                       AND me.curation_stage = 'curated'
-                      AND me.asset_id NOT IN (SELECT asset_uuid FROM publications)
+                      AND me.asset_id NOT IN (
+                          SELECT p.asset_uuid FROM publications p
+                          LEFT JOIN curated_moments cm ON TRIM(LOWER(cm.moment_name)) = TRIM(LOWER(p.moment_name))
+                          WHERE LOWER(COALESCE(cm.memory_stage, '')) != 'deleted'
+                      )
                     ORDER BY v.score_normalized DESC
                 """, (m['name'], m['name'].strip()))
                 all_curated_pending = [r for r in cursor.fetchall() if r[0] not in skipped_asset_ids]

@@ -15,6 +15,7 @@ import json
 import re
 import socket
 import errno
+import signal
 import sqlite3
 from uuid import uuid4
 import time
@@ -28,6 +29,86 @@ from db.connections import get_connection, get_cursor, commit, close as close_co
 
 LOCK_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), "../db/executor.lock"))
 BACKUP_LOCK_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), "../db/backup.lock"))
+PAUSED_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), "../db/executor.paused"))
+STOP_AFTER_STEP_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), "../db/executor.stop_after_step"))
+
+
+class GracefulShutdownInterrupt(Exception):
+    """Raised when SIGTERM/SIGINT or stop-after-step requests a clean shutdown."""
+
+
+_shutdown_event = threading.Event()
+_active_child_lock = threading.Lock()
+_active_child_proc = None
+
+
+def _handle_shutdown_signal(signum, _frame):
+    if not _shutdown_event.is_set():
+        try:
+            sig_name = signal.Signals(signum).name
+        except Exception:
+            sig_name = str(signum)
+        print(f"\n🛑 Received {sig_name} — initiating graceful executor shutdown...", flush=True)
+        _shutdown_event.set()
+
+
+def _terminate_active_child():
+    """Forward SIGINT -> SIGTERM -> SIGKILL gracefully to any active child subprocess."""
+    with _active_child_lock:
+        proc = _active_child_proc
+    if not proc or proc.poll() is not None:
+        return
+    for sig, wait_s in ((signal.SIGINT, 8.0), (signal.SIGTERM, 5.0)):
+        try:
+            proc.send_signal(sig)
+        except OSError:
+            return
+        deadline = time.time() + wait_s
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                return
+            time.sleep(0.2)
+    try:
+        proc.kill()
+        proc.wait(timeout=2.0)
+    except Exception:
+        pass
+
+
+def _sleep_interruptible(seconds: float) -> None:
+    """Sleep in short slices and raise GracefulShutdownInterrupt if shutdown is signaled."""
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if _shutdown_event.is_set():
+            raise GracefulShutdownInterrupt("Interrupted during wait loop")
+        time.sleep(min(0.5, max(0.0, deadline - time.time())))
+
+
+def _check_stop_after_step(context_label: str) -> None:
+    """Stop cleanly between steps/batches if executor.stop_after_step sentinel exists."""
+    if _shutdown_event.is_set():
+        raise GracefulShutdownInterrupt(f"Shutdown signaled after {context_label}")
+    if os.path.exists(STOP_AFTER_STEP_FILE):
+        try:
+            os.remove(STOP_AFTER_STEP_FILE)
+        except OSError:
+            pass
+        try:
+            os.makedirs(os.path.dirname(PAUSED_FILE), exist_ok=True)
+            with open(PAUSED_FILE, "w", encoding="utf-8") as pf:
+                json.dump(
+                    {
+                        "paused_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                        "reason": "stop_after_step",
+                        "completed_step": context_label,
+                    },
+                    pf,
+                    indent=2,
+                )
+        except OSError:
+            pass
+        logger.info(f"⏸️ Graceful stop-after-step requested; stopping cleanly after '{context_label}' and pausing auto-cron.")
+        raise GracefulShutdownInterrupt(f"Stop after step '{context_label}'")
 
 class ExecutorState:
     def __init__(self):
@@ -275,10 +356,9 @@ def write_lock_file(status, pid, started_at_utc=None, latest_successful_refresh_
 
 def acquire_db_lock():
     while True:
-        # Check if a database backup is actively in progress
         if os.path.exists(BACKUP_LOCK_FILE):
             logger.info("ℹ️ Database backup is currently in progress (db/backup.lock). Waiting for backup completion...")
-            time.sleep(3)
+            _sleep_interruptible(3)
             continue
 
         lock = read_lock_file()
@@ -292,7 +372,7 @@ def acquire_db_lock():
             if status in ["refreshing", "planner_active"]:
                 if is_pid_alive(lock_pid):
                     logger.info(f"ℹ️ Database copy is currently locked by {status} (PID: {lock_pid}). Waiting for lock release...")
-                    time.sleep(10)
+                    _sleep_interruptible(10)
                     continue
                 else:
                     logger.warning(f"⚠️ Found stale {status} lock file from dead PID {lock_pid}. Overriding lock.")
@@ -421,12 +501,14 @@ def run_regular_steps(bootstrap_steps, steps, from_index, to_index, dry_run, mon
         if is_in_backup_window():
             logger.info(f"⏸️ Current time ({datetime.now().strftime('%H:%M:%S')}) is inside nightly backup window (02:55 - 06:15). Pausing before next step '{step.label}'...")
             while is_in_backup_window():
-                time.sleep(30)
+                _sleep_interruptible(30)
             logger.info(f"🌅 Outside backup window ({datetime.now().strftime('%H:%M:%S')}). Resuming step '{step.label}'!")
 
         if not run_step(step, dry_run, month, command):
             logger.error(f"❌ Pipeline execution halted. Session ID: {session_id}")
             sys.exit(1)
+
+        _check_stop_after_step(step.label)
 
 def log_execution(conn, label, status, batch_month_id=None):
     cursor = conn.cursor()
@@ -472,8 +554,25 @@ def run_step(step: PipelineStep, dry_run=False, month=None, command=None):
         return True
         
     try:
+        global _active_child_proc
         cmd_to_run = command if command else step.command
-        subprocess.run(cmd_to_run, check=True)
+        proc = subprocess.Popen(cmd_to_run)
+        with _active_child_lock:
+            _active_child_proc = proc
+        try:
+            while proc.poll() is None:
+                if _shutdown_event.is_set():
+                    _terminate_active_child()
+                    raise GracefulShutdownInterrupt(f"Gracefully interrupted step '{step.label}'")
+                time.sleep(0.25)
+            if _shutdown_event.is_set():
+                raise GracefulShutdownInterrupt(f"Gracefully interrupted step '{step.label}'")
+            if proc.returncode != 0:
+                raise subprocess.CalledProcessError(proc.returncode, cmd_to_run)
+        finally:
+            with _active_child_lock:
+                if _active_child_proc is proc:
+                    _active_child_proc = None
         logger.info(f"✅ Completed: {step.label}")
         
         acquire_db_lock()
@@ -569,6 +668,9 @@ def run_step(step: PipelineStep, dry_run=False, month=None, command=None):
         close_conn()
         release_db_lock()
         return True
+    except GracefulShutdownInterrupt:
+        logger.info(f"🛑 Gracefully stopped during step '{step.label}' (batch status preserved for clean resume).")
+        raise
     except subprocess.CalledProcessError as e:
         logger.error(f"❌ Failed: {step.label} with error: {e}")
         
@@ -652,6 +754,13 @@ def get_pipeline_steps(script_dir, use_mock_data=False):
 
 
 def main(args):
+    signal.signal(signal.SIGTERM, _handle_shutdown_signal)
+    signal.signal(signal.SIGINT, _handle_shutdown_signal)
+
+    if args.cron and os.path.exists(PAUSED_FILE):
+        logger.info("⏸️ Executor auto-cron is paused (db/executor.paused present). Skipping cron launch.")
+        return
+
     acquire_lock(is_cron=args.cron)
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -663,88 +772,99 @@ def main(args):
         # PipelineStep("1.1 Detect Gaps", "000", ["python3", os.path.join(SCRIPT_DIR, "generate_month_batches.py")]),
     ]
 
-    steps = get_pipeline_steps(SCRIPT_DIR, use_mock_data=args.mock_steps)
+    try:
+        steps = get_pipeline_steps(SCRIPT_DIR, use_mock_data=args.mock_steps)
 
-    all_steps = bootstrap_steps.copy()
-    all_steps.extend(steps)
+        all_steps = bootstrap_steps.copy()
+        all_steps.extend(steps)
 
-    from_index, to_index = 0, len(all_steps)
-    executed_count = 0
-    processed_dry_run_ids = set()
+        from_index, to_index = 0, len(all_steps)
+        executed_count = 0
+        processed_dry_run_ids = set()
 
-    # Start background status heartbeat thread (reports every 60 seconds / 1 minute)
-    status_thread = threading.Thread(target=status_reporter_worker, args=(60,), daemon=True)
-    status_thread.start()
+        # Start background status heartbeat thread (reports every 60 seconds / 1 minute)
+        status_thread = threading.Thread(target=status_reporter_worker, args=(60,), daemon=True)
+        status_thread.start()
 
-    while True:
-        # Check if we are inside the nightly backup window (02:55 - 06:15)
-        if is_in_backup_window():
-            logger.info(f"⏸️ Current time ({datetime.now().strftime('%H:%M:%S')}) is inside nightly backup window (02:55 - 06:15). Pausing executor queue...")
-            while is_in_backup_window():
-                time.sleep(30)
-            logger.info(f"🌅 Outside backup window ({datetime.now().strftime('%H:%M:%S')}). Resuming execution queue!")
+        while True:
+            _check_stop_after_step("queue_loop")
 
-        # Check for active planned executions in queue
-        acquire_db_lock()
-        conn = get_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, planned_month FROM planned_execution WHERE active = 1 ORDER BY id ASC")
-        planned_rows = cursor.fetchall()
-        close_conn()
-        release_db_lock()
+            # Check if we are inside the nightly backup window (02:55 - 06:15)
+            if is_in_backup_window():
+                logger.info(f"⏸️ Current time ({datetime.now().strftime('%H:%M:%S')}) is inside nightly backup window (02:55 - 06:15). Pausing executor queue...")
+                while is_in_backup_window():
+                    _sleep_interruptible(30)
+                logger.info(f"🌅 Outside backup window ({datetime.now().strftime('%H:%M:%S')}). Resuming execution queue!")
 
-        if args.dry_run:
-            planned_rows = [r for r in planned_rows if r[0] not in processed_dry_run_ids]
-
-        if not planned_rows:
-            if executed_count == 0:
-                if args.cron:
-                    logger.info("No active planned execution found in queue. Exiting silently.")
-                    sys.exit(0)
-                else:
-                    logger.error("🚫 No active planned execution found in queue. Please run pipeline_planner first.")
-                    sys.exit(1)
-            else:
-                logger.info(f"🎉 Completed all queued planned execution(s) (Total executed: {executed_count}).")
-                break
-
-        total_pending = len(planned_rows)
-        plan_id, month = planned_rows[0]
-        executed_count += 1
-
-        with executor_state.lock:
-            executor_state.current_month = month
-            executor_state.current_plan_id = plan_id
-            executor_state.batch_start_time = time.time()
-            executor_state.executed_count = executed_count
-
-        logger.info(f"\n{'='*60}\n🚀 [Batch #{executed_count} | {total_pending} pending in queue] Starting execution for planned batch: {month} (Queue ID: {plan_id})\n{'='*60}")
-        
-        run_bootstrap_steps(bootstrap_steps, from_index, to_index, args.dry_run, None, month)
-        run_regular_steps(bootstrap_steps, steps, from_index, to_index, args.dry_run, month)
-
-        # Mark this specific planned execution as inactive upon successful completion
-        if not args.dry_run:
+            # Check for active planned executions in queue
             acquire_db_lock()
             conn = get_connection()
             cursor = conn.cursor()
-            cursor.execute("UPDATE planned_execution SET active = 0 WHERE id = ?", (plan_id,))
-            conn.commit()
+            cursor.execute("SELECT id, planned_month FROM planned_execution WHERE active = 1 ORDER BY id ASC")
+            planned_rows = cursor.fetchall()
             close_conn()
             release_db_lock()
-            logger.info(f"✅ Planned execution for {month} (Queue ID: {plan_id}) completed and marked as inactive.")
-        else:
-            processed_dry_run_ids.add(plan_id)
-            logger.info(f"[Dry Run] Simulated completion for planned batch {month} (Queue ID: {plan_id}).")
 
+            if args.dry_run:
+                planned_rows = [r for r in planned_rows if r[0] not in processed_dry_run_ids]
+
+            if not planned_rows:
+                if executed_count == 0:
+                    if args.cron:
+                        logger.info("No active planned execution found in queue. Exiting silently.")
+                        return
+                    else:
+                        logger.error("🚫 No active planned execution found in queue. Please run pipeline_planner first.")
+                        sys.exit(1)
+                else:
+                    logger.info(f"🎉 Completed all queued planned execution(s) (Total executed: {executed_count}).")
+                    break
+
+            total_pending = len(planned_rows)
+            plan_id, month = planned_rows[0]
+            executed_count += 1
+
+            with executor_state.lock:
+                executor_state.current_month = month
+                executor_state.current_plan_id = plan_id
+                executor_state.batch_start_time = time.time()
+                executor_state.executed_count = executed_count
+
+            logger.info(f"\n{'='*60}\n🚀 [Batch #{executed_count} | {total_pending} pending in queue] Starting execution for planned batch: {month} (Queue ID: {plan_id})\n{'='*60}")
+            
+            run_bootstrap_steps(bootstrap_steps, from_index, to_index, args.dry_run, None, month)
+            run_regular_steps(bootstrap_steps, steps, from_index, to_index, args.dry_run, month)
+
+            # Mark this specific planned execution as inactive upon successful completion
+            if not args.dry_run:
+                acquire_db_lock()
+                conn = get_connection()
+                cursor = conn.cursor()
+                cursor.execute("UPDATE planned_execution SET active = 0 WHERE id = ?", (plan_id,))
+                conn.commit()
+                close_conn()
+                release_db_lock()
+                logger.info(f"✅ Planned execution for {month} (Queue ID: {plan_id}) completed and marked as inactive.")
+            else:
+                processed_dry_run_ids.add(plan_id)
+                logger.info(f"[Dry Run] Simulated completion for planned batch {month} (Queue ID: {plan_id}).")
+
+            with executor_state.lock:
+                executor_state.current_month = None
+                executor_state.current_step_label = None
+
+            logger.info("🔍 Checking execution queue for remaining or newly scheduled batches...")
+    except GracefulShutdownInterrupt as exc:
+        logger.info(f"🛑 Pipeline executor stopped cleanly: {exc}")
+    finally:
         with executor_state.lock:
-            executor_state.current_month = None
-            executor_state.current_step_label = None
-
-        logger.info("🔍 Checking execution queue for remaining or newly scheduled batches...")
-
-    with executor_state.lock:
-        executor_state.running = False
+            executor_state.running = False
+        _terminate_active_child()
+        try:
+            release_db_lock()
+        except Exception:
+            pass
+        release_lock()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Execute the media organizer pipeline.")

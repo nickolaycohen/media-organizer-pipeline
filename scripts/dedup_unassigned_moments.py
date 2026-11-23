@@ -630,15 +630,28 @@ def apply_ignore_to_assets(asset_ids: list[str], db_path: str = MEDIA_ORGANIZER_
         ).fetchone()
         if not exists:
             cur.execute(
-                "INSERT INTO media_organizer_album_assets (album_pk, asset_id) VALUES (?, ?)",
-                (ignore_album_pk, aid),
+                """
+                INSERT INTO media_organizer_album_assets
+                    (album_pk, asset_id, original_filename, date_created_utc, synced_at_utc)
+                SELECT ?, ?, a.original_filename, a.date_created_utc, datetime('now')
+                FROM assets a
+                WHERE a.asset_id = ?
+                LIMIT 1
+                """,
+                (ignore_album_pk, aid, aid),
             )
+            if cur.rowcount == 0:
+                cur.execute(
+                    "INSERT INTO media_organizer_album_assets (album_pk, asset_id, synced_at_utc) VALUES (?, ?, datetime('now'))",
+                    (ignore_album_pk, aid),
+                )
             db_inserted += 1
 
     cur.execute(
         """
         UPDATE media_organizer_albums
-        SET asset_count = (SELECT COUNT(*) FROM media_organizer_album_assets WHERE album_pk = ?)
+        SET asset_count = (SELECT COUNT(*) FROM media_organizer_album_assets WHERE album_pk = ?),
+            synced_at_utc = datetime('now')
         WHERE album_pk = ?
         """,
         (ignore_album_pk, ignore_album_pk),

@@ -243,10 +243,10 @@ def sync_assets(media_cursor, logger):
         ORDER BY a.ZTITLE;
     ''')
 
-    # Ensure moments table exists and clear it before repopulating
+    # Ensure moments table exists and clear All-Media entries while preserving Media Organizer (album_pk < 0) moments
     media_cursor.execute("CREATE TABLE IF NOT EXISTS moments (album_pk INTEGER, album_name TEXT, parent_folder_pk INTEGER, parent_folder_name TEXT)")
-    logger.info("Clearing existing moments entries...")
-    media_cursor.execute("DELETE FROM moments;")
+    logger.info("Clearing existing All-Media moments entries (preserving organizer moments)...")
+    media_cursor.execute("DELETE FROM moments WHERE COALESCE(album_pk, 0) >= 0;")
 
     logger.info("Populating moments from Apple Photos DB...")
     media_cursor.execute('''
@@ -274,6 +274,31 @@ def sync_assets(media_cursor, logger):
     try:
         from scripts.reconstruct_apple_albums import sync_album_backup_from_cursor
         sync_album_backup_from_cursor(media_cursor, logger)
+        # Re-apply MomentsAlbumName from writable Media Organizer ('organizer'-scoped) albums so read-only All-Media never overwrites promoted moments
+        media_cursor.execute("""
+            UPDATE assets
+            SET MomentsAlbumName = (
+                SELECT moa.album_name
+                FROM media_organizer_album_assets moaa
+                JOIN media_organizer_albums moa ON moa.album_pk = moaa.album_pk
+                WHERE moaa.asset_id = assets.asset_id
+                  AND COALESCE(moa.library_scope, 'all_media') = 'organizer'
+                  AND moa.is_folder = 0
+                  AND LOWER(COALESCE(moa.parent_folder_name, '')) IN ('moments', 'curated', 'tobecurated', 'memories', 'generic moments')
+                ORDER BY CASE
+                    WHEN LOWER(moa.album_name) IN ('ignore', 'skippublishing') THEN 1
+                    ELSE 0
+                END ASC, moa.album_pk ASC
+                LIMIT 1
+            )
+            WHERE asset_id IN (
+                SELECT moaa.asset_id
+                FROM media_organizer_album_assets moaa
+                JOIN media_organizer_albums moa ON moa.album_pk = moaa.album_pk
+                WHERE COALESCE(moa.library_scope, 'all_media') = 'organizer'
+                  AND moa.is_folder = 0
+            )
+        """)
         commit()
     except Exception as e:
         logger.warning(f"Could not update album backup in media_organizer.db: {e}")

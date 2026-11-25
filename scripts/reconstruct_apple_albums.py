@@ -92,9 +92,13 @@ def sync_album_backup_from_cursor(cursor, logger):
             depth               INTEGER NOT NULL,
             zkind               INTEGER NOT NULL,
             asset_count         INTEGER DEFAULT 0,
-            synced_at_utc       TEXT NOT NULL
+            synced_at_utc       TEXT NOT NULL,
+            library_scope       TEXT DEFAULT 'all_media'
         )
     """)
+    moa_cols = {r[1] for r in cursor.execute("PRAGMA table_info(media_organizer_albums)").fetchall()}
+    if "library_scope" not in moa_cols:
+        cursor.execute("ALTER TABLE media_organizer_albums ADD COLUMN library_scope TEXT DEFAULT 'all_media'")
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS media_organizer_album_assets (
             album_pk            INTEGER NOT NULL,
@@ -161,13 +165,13 @@ def sync_album_backup_from_cursor(cursor, logger):
         logger.warning(f"⚠️ No albums found under '{ROOT_FOLDER_NAME}' in source database.")
         return False
 
-    # Replace albums backup
-    cursor.execute("DELETE FROM media_organizer_albums")
+    # Replace All-Media albums backup while preserving Media Organizer ('organizer'-scoped) albums
+    cursor.execute("DELETE FROM media_organizer_albums WHERE COALESCE(library_scope, 'all_media') != 'organizer'")
     cursor.executemany("""
-        INSERT INTO media_organizer_albums (
+        INSERT OR REPLACE INTO media_organizer_albums (
             album_pk, album_name, parent_folder_pk, parent_folder_name,
-            full_path, is_folder, depth, zkind, asset_count, synced_at_utc
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            full_path, is_folder, depth, zkind, asset_count, synced_at_utc, library_scope
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'all_media')
     """, albums_data)
 
     # 2. Fetch all asset memberships for user albums (zkind = 2)
@@ -211,10 +215,15 @@ def sync_album_backup_from_cursor(cursor, logger):
     cursor.execute(query_assets, (ROOT_FOLDER_NAME, now_utc))
     assets_data = cursor.fetchall()
 
-    # Replace assets backup
-    cursor.execute("DELETE FROM media_organizer_album_assets")
+    # Replace All-Media album asset memberships while preserving 'organizer'-scoped album memberships
+    cursor.execute("""
+        DELETE FROM media_organizer_album_assets
+        WHERE album_pk NOT IN (
+            SELECT album_pk FROM media_organizer_albums WHERE COALESCE(library_scope, 'all_media') = 'organizer'
+        )
+    """)
     cursor.executemany("""
-        INSERT INTO media_organizer_album_assets (
+        INSERT OR REPLACE INTO media_organizer_album_assets (
             album_pk, asset_id, original_filename, date_created_utc, synced_at_utc
         ) VALUES (?, ?, ?, ?, ?)
     """, assets_data)

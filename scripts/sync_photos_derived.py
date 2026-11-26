@@ -285,10 +285,8 @@ def sync_assets(media_cursor, logger):
                   AND COALESCE(moa.library_scope, 'all_media') = 'organizer'
                   AND moa.is_folder = 0
                   AND LOWER(COALESCE(moa.parent_folder_name, '')) IN ('moments', 'curated', 'tobecurated', 'memories', 'generic moments')
-                ORDER BY CASE
-                    WHEN LOWER(moa.album_name) IN ('ignore', 'skippublishing') THEN 1
-                    ELSE 0
-                END ASC, moa.album_pk ASC
+                  AND LOWER(TRIM(COALESCE(moa.album_name, ''))) NOT IN ('ignore', 'skippublishing', 'topscore excluded', 'highrated assets')
+                ORDER BY moa.album_pk ASC
                 LIMIT 1
             )
             WHERE asset_id IN (
@@ -297,7 +295,35 @@ def sync_assets(media_cursor, logger):
                 JOIN media_organizer_albums moa ON moa.album_pk = moaa.album_pk
                 WHERE COALESCE(moa.library_scope, 'all_media') = 'organizer'
                   AND moa.is_folder = 0
+                  AND LOWER(TRIM(COALESCE(moa.album_name, ''))) NOT IN ('ignore', 'skippublishing', 'topscore excluded', 'highrated assets')
             )
+        """)
+        # Also preserve MomentsAlbumName for unselected / Highrated event assets tagged under a Media Organizer Moment
+        media_cursor.execute("""
+            UPDATE assets
+            SET MomentsAlbumName = (
+                SELECT mt.moment_name
+                FROM moment_tags mt
+                WHERE mt.asset_id = assets.asset_id
+                  AND TRIM(COALESCE(mt.moment_name, '')) != ''
+                  AND EXISTS (
+                      SELECT 1 FROM media_organizer_albums moa
+                      WHERE COALESCE(moa.library_scope, 'all_media') = 'organizer'
+                        AND moa.is_folder = 0
+                        AND LOWER(TRIM(moa.album_name)) = LOWER(TRIM(mt.moment_name))
+                  )
+                ORDER BY mt.id DESC
+                LIMIT 1
+            )
+            WHERE (COALESCE(TRIM(MomentsAlbumName), '') = '' OR LOWER(TRIM(MomentsAlbumName)) = 'highrated assets')
+              AND EXISTS (
+                  SELECT 1 FROM moment_tags mt
+                  JOIN media_organizer_albums moa
+                    ON COALESCE(moa.library_scope, 'all_media') = 'organizer'
+                   AND moa.is_folder = 0
+                   AND LOWER(TRIM(moa.album_name)) = LOWER(TRIM(mt.moment_name))
+                  WHERE mt.asset_id = assets.asset_id
+              )
         """)
         commit()
     except Exception as e:
